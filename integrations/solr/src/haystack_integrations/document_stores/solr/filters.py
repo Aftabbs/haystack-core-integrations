@@ -4,6 +4,7 @@
 
 """Translation of Haystack filters into Solr filter query (`fq`) clauses."""
 
+import math
 from datetime import datetime
 from typing import Any
 
@@ -28,6 +29,15 @@ _RANGE_TEMPLATES = {
     ">=": "[{value} TO *]",
     "<": "[* TO {value}}}",
     "<=": "[* TO {value}]",
+}
+
+# Range templates for the plong field when querying with a numeric value.
+# The int boundary is always exact, so closed brackets are used on both sides.
+_INT_RANGE_FORMATS = {
+    ">=": "[{value} TO *]",
+    ">": "[{value} TO *]",   # boundary is already shifted to next int
+    "<=": "[* TO {value}]",
+    "<": "[* TO {value}]",   # boundary is already shifted to previous int
 }
 
 
@@ -72,6 +82,37 @@ def _resolve_field(field: str, value: Any) -> str:
     return meta_field_name(normalized, type_code_for_value(value))
 
 
+def _is_numeric(value: Any) -> bool:
+    """Return True for int or float values (bool is excluded because it subclasses int)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _int_range_boundary(value: float, operator: str) -> int:
+    """
+    Convert a float filter value to the equivalent closed-bracket integer boundary.
+
+    Solr's plong field rejects float literals, so range queries must use an integer bound.
+    The int boundary is shifted so that the closed-bracket template produces the same
+    set of matching integers as the original operator would.
+
+    Examples::
+
+        >= 4.2  ->  5   ([5 TO *]  covers all ints >= 5, i.e. > 4.2)
+        >  4.0  ->  5   ([5 TO *]  covers all ints > 4.0)
+        <  4.2  ->  4   ([* TO 4]  covers all ints < 4.2)
+        <= 4.0  ->  4   ([* TO 4]  covers all ints <= 4.0)
+    """
+    fv = float(value)
+    if operator == ">=":
+        return math.ceil(fv)
+    if operator == ">":
+        return math.floor(fv) + 1
+    if operator == "<=":
+        return math.floor(fv)
+    # operator == "<"
+    return math.ceil(fv) - 1
+
+
 def _negate(clause: str) -> str:
     """
     Wrap `clause` in a negation that is valid in every position.
@@ -107,6 +148,21 @@ def _equality_clause(field: str, value: Any) -> str:
             return _negate(_existence_clause(field))
         solr_field = _resolve_field(field, value)
         return "(" + " AND ".join(f"{solr_field}:{_format_value(element)}" for element in value) + ")"
+    normalized = _normalize_field_name(field)
+    if _is_numeric(value) and normalized not in _SPECIAL_FIELDS:
+        # Numeric metadata may be stored in either the plong (int) or pdouble (float) field.
+        # Query both so that e.g. `score == 5` also matches documents where `score` was stored
+        # as the float 5.0, and `score == 5.0` also matches an int-stored 5.
+        d_field = meta_field_name(normalized, "d")
+        float_val = float(value)
+        d_clause = f"{d_field}:{_format_value(float_val)}"
+        if float_val == math.floor(float_val):
+            # Whole number: could also be stored as a plong.
+            int_val = int(float_val)
+            l_field = meta_field_name(normalized, "l")
+            l_clause = f"{l_field}:{_format_value(int_val)}"
+            return f"({l_clause} OR {d_clause})"
+        return d_clause
     return f"{_resolve_field(field, value)}:{_format_value(value)}"
 
 
@@ -129,6 +185,21 @@ def _range_clause(field: str, operator: str, value: Any) -> str:
         msg = f"Filter value can't be of type bool using operator {operator!r}"
         raise FilterError(msg)
 
+    normalized = _normalize_field_name(field)
+    if _is_numeric(value) and normalized not in _SPECIAL_FIELDS:
+        # Numeric metadata may be stored in either the plong (int) or pdouble (float) field.
+        # Query both so that e.g. `rating >= 4` also matches documents with float-stored 4.5,
+        # and `rating < 4.2` also matches documents with int-stored 3 or 4.
+        #
+        # Solr's plong field rejects float literals in range boundaries, so the int boundary is
+        # adjusted to the nearest integer that produces the same set of matching longs.
+        int_boundary = _int_range_boundary(float(value), operator)
+        l_field = meta_field_name(normalized, "l")
+        d_field = meta_field_name(normalized, "d")
+        l_clause = f"{l_field}:{_INT_RANGE_FORMATS[operator].format(value=_format_value(int_boundary))}"
+        d_clause = f"{d_field}:{_RANGE_TEMPLATES[operator].format(value=_format_value(value))}"
+        return f"({l_clause} OR {d_clause})"
+
     solr_field = _resolve_field(field, value)
     return f"{solr_field}:{_RANGE_TEMPLATES[operator].format(value=_format_value(value))}"
 
@@ -141,11 +212,25 @@ def _in_clause(field: str, operator: str, value: Any) -> str:
     if not value:
         return _MATCH_NONE
 
+    normalized = _normalize_field_name(field)
     grouped: dict[str, list[Any]] = {}
     for element in value:
         if element is None:
             continue
-        grouped.setdefault(_resolve_field(field, element), []).append(element)
+        if _is_numeric(element) and normalized not in _SPECIAL_FIELDS:
+            # Numeric elements may be stored in either the plong or pdouble field.
+            # Add each element to both groups so that an int filter value also matches float-stored
+            # equivalents and vice versa (e.g. `in [4, 5]` finds both int-stored 4 and float-stored 5.0).
+            float_val = float(element)
+            if float_val == math.floor(float_val):
+                # Whole number: include in the plong group.
+                int_val = int(float_val)
+                l_field = meta_field_name(normalized, "l")
+                grouped.setdefault(l_field, []).append(int_val)
+            d_field = meta_field_name(normalized, "d")
+            grouped.setdefault(d_field, []).append(float_val)
+        else:
+            grouped.setdefault(_resolve_field(field, element), []).append(element)
     if not grouped:
         # A list of nothing but nulls can only match documents that have no value for the field.
         return _negate(_existence_clause(field))
