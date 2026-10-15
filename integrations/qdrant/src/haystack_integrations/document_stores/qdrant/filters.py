@@ -135,6 +135,14 @@ def _build_comparison_condition(operator: str, key: str, value: Any) -> models.C
 
 
 def _build_eq_condition(key: str, value: models.ValueVariants) -> models.Condition:
+    # MatchValue does not accept float and only matches int payloads (not float payloads).
+    # A closed Range(gte=v, lte=v) is evaluated numerically and matches both int and float
+    # payloads on the Qdrant server.  Ints > 2**53 lose precision as float64, so those keep
+    # MatchValue for exact equality.
+    if isinstance(value, float) or (
+        isinstance(value, int) and not isinstance(value, bool) and abs(value) <= 2**53
+    ):
+        return models.FieldCondition(key=key, range=models.Range(gte=value, lte=value))
     return models.FieldCondition(key=key, match=models.MatchValue(value=value))
 
 

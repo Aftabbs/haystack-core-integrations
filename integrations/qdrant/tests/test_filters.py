@@ -73,6 +73,57 @@ class TestConvertFiltersToQdrantUnit:
         assert isinstance(qdrant_filter, models.Filter)
         assert len(qdrant_filter.must) == 2
 
+    @pytest.mark.parametrize("value", [1.5, 0.0, -3.14, 1e10])
+    def test_eq_float_uses_range(self, value):
+        qdrant_filter = convert_filters_to_qdrant({"operator": "==", "field": "meta.score", "value": value})
+        assert isinstance(qdrant_filter, models.Filter)
+        cond = qdrant_filter.must[0]
+        assert isinstance(cond, models.FieldCondition)
+        assert cond.range is not None
+        assert cond.range.gte == value
+        assert cond.range.lte == value
+        assert cond.match is None
+
+    @pytest.mark.parametrize("value", [0, 42, -7, 2**53])
+    def test_eq_small_int_uses_range(self, value):
+        qdrant_filter = convert_filters_to_qdrant({"operator": "==", "field": "meta.count", "value": value})
+        assert isinstance(qdrant_filter, models.Filter)
+        cond = qdrant_filter.must[0]
+        assert isinstance(cond, models.FieldCondition)
+        assert cond.range is not None
+        assert cond.range.gte == value
+        assert cond.range.lte == value
+
+    def test_eq_large_int_uses_match_value(self):
+        large_int = 2**60
+        qdrant_filter = convert_filters_to_qdrant({"operator": "==", "field": "meta.big", "value": large_int})
+        assert isinstance(qdrant_filter, models.Filter)
+        cond = qdrant_filter.must[0]
+        assert isinstance(cond, models.FieldCondition)
+        assert cond.match is not None
+        assert cond.match.value == large_int
+        assert cond.range is None
+
+    @pytest.mark.parametrize("value", ["hello", "world"])
+    def test_eq_string_uses_match_value(self, value):
+        qdrant_filter = convert_filters_to_qdrant({"operator": "==", "field": "meta.name", "value": value})
+        assert isinstance(qdrant_filter, models.Filter)
+        cond = qdrant_filter.must[0]
+        assert isinstance(cond, models.FieldCondition)
+        assert cond.match is not None
+        assert cond.match.value == value
+        assert cond.range is None
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_eq_bool_uses_match_value(self, value):
+        qdrant_filter = convert_filters_to_qdrant({"operator": "==", "field": "meta.active", "value": value})
+        assert isinstance(qdrant_filter, models.Filter)
+        cond = qdrant_filter.must[0]
+        assert isinstance(cond, models.FieldCondition)
+        assert cond.match is not None
+        assert cond.match.value == value
+        assert cond.range is None
+
 
 def test_is_datetime_string():
     assert is_datetime_string("2024-01-01T00:00:00") is True
