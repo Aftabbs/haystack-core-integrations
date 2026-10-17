@@ -1,5 +1,104 @@
 # Changelog
 
+## [integrations/opensearch-v8.3.0] - 2026-10-08
+
+### 🚀 Features
+
+- `OpenSearchDocumentStore` emulating offset with cursor (#3692)
+
+### 🐛 Bug Fixes
+
+- `OpenSearchDocumentStore` adding filter to unique metadata values (#3754)
+- Standardize license files (#3771)
+- *(elasticsearch,opensearch)* Keep every bound when merging same-field ranges (#3984)
+- OpenSearch fixing painless script code injection (#4067)
+
+### 🧪 Testing
+
+- `OpenSearchDocumentStore` removing duplicated tests already covered by haystack Mixin tests (#3780)
+- Elastisearch/OpenSearch - explicitly set the embedding model in Hybrid Retriever tests (#4053)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+### 🧹 Chores
+
+- Re-standardize READMEs (#3768)
+- Drop redundant deserialize_secrets_inplace calls in integrations requiring haystack-ai>=2.23 (#4058)
+
+
+## [integrations/opensearch-v8.2.1] - 2026-08-03
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- `OpensearchDocumentStore` match search_term against metadata field value, not content (#3647)
+- *(opensearch)* Don't merge same-field ranges under OR (#3589)
+
+
+## [integrations/opensearch-v8.2.0] - 2026-07-22
+
+### 🚀 Features
+
+- Opensearch - add methods to close resources (#3640)
+
+### 🐛 Bug Fixes
+
+- Adapt optimum, ragas, elasticsearch, opensearch to APIs removed in Haystack 3.0 (#3538)
+
+### 🚜 Refactor
+
+- Elasticsearch - split sync/async paths (#3633)
+
+### 📚 Documentation
+
+- Replace old haystack core imports with haystack_integrations paths (#3545)
+
+
+## [integrations/opensearch-v8.1.2] - 2026-06-24
+
+### 🐛 Bug Fixes
+
+- Serialize OpenSearchBM25Retriever all_terms_must_match (#3454)
+
+
+## [integrations/opensearch-v8.1.1] - 2026-05-20
+
+### 🐛 Bug Fixes
+
+- Support aliases in all OpenSearchDocumentStore methods (#3336)
+
+
+## [integrations/opensearch-v8.1.0] - 2026-05-20
+
+### 🐛 Bug Fixes
+
+- _ensure_index_exists for aliases in OpenSearch (#3335)
+
+
+## [integrations/opensearch-v8.0.0] - 2026-04-29
+
+### 🚀 Features
+
+- [**breaking**] Change default fuzziness from AUTO to 0 in OpenSearch retrievers (#3198)
+
+### 🚜 Refactor
+
+- *(opensearch)* Use async DocumentStore mixin tests (#3224)
+
+### 🧪 Testing
+
+- Opensearch - add unit tests (#3182)
+
+
+## [integrations/opensearch-v7.2.1] - 2026-04-13
+
+### 🐛 Bug Fixes
+
+- *(opensearch)* Pass positional args to transport.perform_request for ddtrace compatibility (#3132)
+
+
 ## [integrations/opensearch-v7.2.0] - 2026-04-10
 
 ### 🚀 Features
@@ -272,6 +371,13 @@
 
 ## [integrations/opensearch-v3.0.0] - 2025-03-11
 
+
+### 🌀 Miscellaneous
+
+- Chore: OpenSearch - pin haystack and remove dataframe checks (#1513)
+
+## [integrations/opensearch-v2.2.0] - 2025-03-07
+
 ### 🐛 Bug Fixes
 
 - OpenSearchDocumentStore depends on async opensearch-py (#1438)
@@ -284,10 +390,6 @@
 
 - Remove Python 3.8 support (#1421)
 
-### 🌀 Miscellaneous
-
-- Chore: OpenSearch - pin haystack and remove dataframe checks (#1513)
-
 ## [integrations/opensearch-v2.1.0] - 2025-02-18
 
 ### 🚀 Features
@@ -297,10 +399,6 @@
 
 ## [integrations/opensearch-v2.0.0] - 2025-02-14
 
-### 🚀 Features
-
-- Add Secret handling in OpenSearchDocumentStore (#1288)
-
 ### 🧹 Chores
 
 - Inherit from `FilterDocumentsTestWithDataframe` in Document Stores (#1290)
@@ -309,6 +407,13 @@
 ### 🌀 Miscellaneous
 
 - Chore: OpenSearch - manually fix changelog (#1299)
+
+## [integrations/opensearch-v1.3.0] - 2025-01-16
+
+### 🚀 Features
+
+- Add Secret handling in OpenSearchDocumentStore (#1288)
+
 
 ## [integrations/opensearch-v1.2.0] - 2024-12-12
 
@@ -323,6 +428,17 @@
 
 - Efficient knn filtering support for OpenSearch (#1134)
 
+### ⚙️ CI
+
+- Adopt uv as installer (#1142)
+
+### 🧹 Chores
+
+- Update changelog after removing legacy filters (#1083)
+- Update ruff linting scripts and settings (#1105)
+
+## [integrations/opensearch-v1.0.0] - 2024-09-12
+
 ### 📚 Documentation
 
 - Update opensearch retriever docstrings (#1035)
@@ -331,15 +447,9 @@
 
 - Do not retry tests in `hatch run test` command (#954)
 
-### ⚙️ CI
-
-- Adopt uv as installer (#1142)
-
 ### 🧹 Chores
 
 - OpenSearch - remove legacy filter support (#1067)
-- Update changelog after removing legacy filters (#1083)
-- Update ruff linting scripts and settings (#1105)
 
 ### 🌀 Miscellaneous
 
@@ -356,14 +466,16 @@
 
 ## [integrations/opensearch-v0.8.1] - 2024-07-15
 
+### 🐛 Bug Fixes
+
+- `OpenSearch` - Fallback to default filter policy when deserializing retrievers without the init parameter (#895)
+
+## [integrations/opensearch-v0.8.0] - 2024-07-15
+
 ### 🚀 Features
 
 - Add raise_on_failure param to OpenSearch retrievers (#852)
 - Add filter_policy to opensearch integration (#822)
-
-### 🐛 Bug Fixes
-
-- `OpenSearch` - Fallback to default filter policy when deserializing retrievers without the init parameter (#895)
 
 ### 🧹 Chores
 
@@ -385,11 +497,43 @@
 
 ### 🚀 Features
 
-- Defer the database connection to when it's needed (#753)
-- Improve `OpenSearchDocumentStore.__init__` arguments (#739)
-- Return_embeddings flag for opensearch (#784)
 - Add create_index option to OpenSearchDocumentStore (#840)
 - Add custom_query param to OpenSearch retrievers (#841)
+
+### ⚙️ CI
+
+- Retry tests to reduce flakyness (#836)
+
+### 🌀 Miscellaneous
+
+- Ci: install `pytest-rerunfailures` where needed; add retry config to `test-cov` script (#845)
+
+## [integrations/opensearch-v0.6.0] - 2024-06-07
+
+### 🚀 Features
+
+- Return_embeddings flag for opensearch (#784)
+
+
+## [integrations/opensearch-v0.5.0] - 2024-05-30
+
+### 🚀 Features
+
+- Improve `OpenSearchDocumentStore.__init__` arguments (#739)
+
+
+## [integrations/opensearch-v0.4.0] - 2024-05-24
+
+### 🚀 Features
+
+- Defer the database connection to when it's needed (#753)
+
+### 🌀 Miscellaneous
+
+- Chore: add license classifiers (#680)
+- Chore: change the pydoc renderer class (#718)
+
+## [integrations/opensearch-v0.3.0] - 2024-04-04
 
 ### 🐛 Bug Fixes
 
@@ -402,10 +546,6 @@
 - Small consistency improvements (#536)
 - Disable-class-def (#556)
 
-### ⚙️ CI
-
-- Retry tests to reduce flakyness (#836)
-
 ### 🌀 Miscellaneous
 
 - Generate API docs (#324)
@@ -414,9 +554,6 @@
 - Fix opensearch errors bulk write (#594)
 - Remove references to Python 3.7 (#601)
 - [Elasticsearch] fix: Filters not working with metadata that contain a space or capitalization (#639)
-- Chore: add license classifiers (#680)
-- Chore: change the pydoc renderer class (#718)
-- Ci: install `pytest-rerunfailures` where needed; add retry config to `test-cov` script (#845)
 
 ## [integrations/opensearch-v0.2.0] - 2024-01-17
 

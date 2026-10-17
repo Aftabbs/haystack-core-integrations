@@ -51,17 +51,16 @@ def test_to_dict():
                     "embedding_dimension": 768,
                     "metadata_fields": {},
                     "vector_search_configuration": {
-                        "profiles": [
-                            {"name": "default-vector-config", "algorithm_configuration_name": "cosine-algorithm-config"}
-                        ],
+                        "profiles": [{"name": "default-vector-config", "algorithm": "cosine-algorithm-config"}],
                         "algorithms": [
                             {
                                 "name": "cosine-algorithm-config",
+                                "hnswParameters": {"metric": "cosine"},
                                 "kind": "hnsw",
-                                "parameters": {"m": 4, "ef_construction": 400, "ef_search": 500, "metric": "cosine"},
                             }
                         ],
                     },
+                    "include_search_metadata": False,
                     "hosts": "some fake host",
                 },
             },
@@ -100,6 +99,16 @@ def test_from_dict():
     assert retriever._filters == {}
     assert retriever._top_k == 10
     assert retriever._filter_policy == FilterPolicy.REPLACE
+
+
+def test_close():
+    mock_store = Mock(spec=AzureAISearchDocumentStore)
+    retriever = AzureAISearchEmbeddingRetriever(document_store=mock_store)
+
+    retriever.close()
+
+    mock_store.close.assert_called_once()
+    assert retriever._document_store is mock_store
 
 
 def test_run():
@@ -160,6 +169,19 @@ def test_run_time_params():
     assert len(res["documents"]) == 1
     assert res["documents"][0].content == "Test doc"
     assert res["documents"][0].embedding == [0.1, 0.2]
+
+
+def test_init_raises_on_invalid_document_store():
+    with pytest.raises(Exception, match="document_store must be an instance of AzureAISearchDocumentStore"):
+        AzureAISearchEmbeddingRetriever(document_store=object())
+
+
+def test_run_raises_runtime_error_when_retrieval_fails():
+    mock_store = Mock(spec=AzureAISearchDocumentStore)
+    mock_store._embedding_retrieval.side_effect = RuntimeError("boom")
+    retriever = AzureAISearchEmbeddingRetriever(document_store=mock_store)
+    with pytest.raises(RuntimeError, match="embedding retrieval process"):
+        retriever.run(query_embedding=[0.1, 0.2])
 
 
 @pytest.mark.skipif(

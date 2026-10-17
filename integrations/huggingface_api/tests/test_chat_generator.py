@@ -1,0 +1,1722 @@
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import os
+from datetime import UTC, datetime
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
+import pytest
+from haystack import Pipeline
+from haystack.dataclasses import ChatMessage, ImageContent, ReasoningContent, StreamingChunk, ToolCall
+from haystack.tools import Tool
+from haystack.tools.toolset import Toolset
+from haystack.utils.auth import Secret
+from huggingface_hub import (
+    ChatCompletionInputStreamOptions,
+    ChatCompletionOutput,
+    ChatCompletionOutputComplete,
+    ChatCompletionOutputFunctionDefinition,
+    ChatCompletionOutputMessage,
+    ChatCompletionOutputToolCall,
+    ChatCompletionOutputUsage,
+    ChatCompletionStreamOutput,
+    ChatCompletionStreamOutputChoice,
+    ChatCompletionStreamOutputDelta,
+    ChatCompletionStreamOutputUsage,
+)
+from huggingface_hub.errors import RepositoryNotFoundError
+
+from haystack_integrations.common.huggingface_api.utils import HFGenerationAPIType
+from haystack_integrations.components.generators.huggingface_api.chat.chat_generator import (
+    HuggingFaceAPIChatGenerator,
+    _convert_chat_completion_stream_output_to_streaming_chunk,
+    _convert_hfapi_tool_calls,
+    _convert_tools_to_hfapi_tools,
+    _resolve_schema_refs,
+)
+
+
+@pytest.fixture
+def chat_messages():
+    return [
+        ChatMessage.from_system("You are a helpful assistant speaking A2 level of English"),
+        ChatMessage.from_user("Tell me about Berlin"),
+    ]
+
+
+def get_weather(city: str) -> dict[str, Any]:
+    weather_info = {
+        "Berlin": {"weather": "mostly sunny", "temperature": 7, "unit": "celsius"},
+        "Paris": {"weather": "mostly cloudy", "temperature": 8, "unit": "celsius"},
+        "Rome": {"weather": "sunny", "temperature": 14, "unit": "celsius"},
+    }
+    return weather_info.get(city, {"weather": "unknown", "temperature": 0, "unit": "celsius"})
+
+
+@pytest.fixture
+def tools():
+    weather_tool = Tool(
+        name="weather",
+        description="useful to determine the weather in a given location",
+        parameters={"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+        function=get_weather,
+    )
+    return [weather_tool]
+
+
+@pytest.fixture
+def mock_check_valid_model():
+    with (
+        patch(
+            "haystack_integrations.components.generators.huggingface_api.chat.chat_generator._check_valid_model",
+            MagicMock(return_value=None),
+        ) as mock,
+        patch(
+            "haystack_integrations.components.generators.huggingface_api.chat.chat_generator._check_valid_model_async",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        yield mock
+
+
+@pytest.fixture
+def mock_chat_completion():
+    # https://huggingface.co/docs/huggingface_hub/package_reference/inference_client#huggingface_hub.InferenceClient.chat_completion.example
+
+    with patch("huggingface_hub.InferenceClient.chat_completion", autospec=True) as mock_chat_completion:
+        completion = ChatCompletionOutput(
+            choices=[
+                ChatCompletionOutputComplete(
+                    finish_reason="eos_token",
+                    index=0,
+                    message=ChatCompletionOutputMessage(content="The capital of France is Paris.", role="assistant"),
+                )
+            ],
+            id="some_id",
+            model="some_model",
+            system_fingerprint="some_fingerprint",
+            usage=ChatCompletionOutputUsage(completion_tokens=8, prompt_tokens=17, total_tokens=25),
+            created=1710498360,
+        )
+
+        mock_chat_completion.return_value = completion
+        yield mock_chat_completion
+
+
+@pytest.fixture
+def mock_chat_completion_async():
+    with patch("huggingface_hub.AsyncInferenceClient.chat_completion", autospec=True) as mock_chat_completion:
+        completion = ChatCompletionOutput(
+            choices=[
+                ChatCompletionOutputComplete(
+                    finish_reason="eos_token",
+                    index=0,
+                    message=ChatCompletionOutputMessage(content="The capital of France is Paris.", role="assistant"),
+                )
+            ],
+            id="some_id",
+            model="some_model",
+            system_fingerprint="some_fingerprint",
+            usage=ChatCompletionOutputUsage(completion_tokens=8, prompt_tokens=17, total_tokens=25),
+            created=1710498360,
+        )
+
+        # Use AsyncMock to properly mock the async method
+        mock_chat_completion.return_value = completion
+        mock_chat_completion.__call__ = AsyncMock(return_value=completion)
+
+        yield mock_chat_completion
+
+
+# used to test serialization of streaming_callback
+def streaming_callback_handler(x):
+    return x
+
+
+class TestInitializationAndSerialization:
+    def test_init_invalid_api_type(self):
+        with pytest.raises(ValueError):
+            HuggingFaceAPIChatGenerator(api_type="invalid_api_type", api_params={})
+
+    def test_init_serverless(self):
+        model = "HuggingFaceH4/zephyr-7b-alpha"
+        generation_kwargs = {"temperature": 0.6}
+        stop_words = ["stop"]
+        streaming_callback = None
+
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": model},
+            token=None,
+            generation_kwargs=generation_kwargs,
+            stop_words=stop_words,
+            streaming_callback=streaming_callback,
+        )
+
+        assert generator.api_type == HFGenerationAPIType.SERVERLESS_INFERENCE_API
+        assert generator.api_params == {"model": model}
+        assert generator.generation_kwargs == {**generation_kwargs, "stop": ["stop"], "max_tokens": 512}
+        assert generator.streaming_callback == streaming_callback
+        assert generator.tools is None
+
+        assert generator._client is None
+        assert generator._async_client is None
+
+    def test_init_serverless_with_tools(self, tools):
+        model = "HuggingFaceH4/zephyr-7b-alpha"
+        generation_kwargs = {"temperature": 0.6}
+        stop_words = ["stop"]
+        streaming_callback = None
+
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": model},
+            token=None,
+            generation_kwargs=generation_kwargs,
+            stop_words=stop_words,
+            streaming_callback=streaming_callback,
+            tools=tools,
+        )
+
+        assert generator.api_type == HFGenerationAPIType.SERVERLESS_INFERENCE_API
+        assert generator.api_params == {"model": model}
+        assert generator.generation_kwargs == {**generation_kwargs, "stop": ["stop"], "max_tokens": 512}
+        assert generator.streaming_callback == streaming_callback
+        assert generator.tools == tools
+
+        assert generator._client is None
+        assert generator._async_client is None
+
+    def test_init_serverless_no_model(self):
+        with pytest.raises(ValueError):
+            HuggingFaceAPIChatGenerator(
+                api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API, api_params={"param": "irrelevant"}
+            )
+
+    def test_init_tgi(self):
+        url = "https://some_model.com"
+        generation_kwargs = {"temperature": 0.6}
+        stop_words = ["stop"]
+        streaming_callback = None
+
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.TEXT_GENERATION_INFERENCE,
+            api_params={"url": url},
+            token=None,
+            generation_kwargs=generation_kwargs,
+            stop_words=stop_words,
+            streaming_callback=streaming_callback,
+        )
+
+        assert generator.api_type == HFGenerationAPIType.TEXT_GENERATION_INFERENCE
+        assert generator.api_params == {"url": url}
+        assert generator.generation_kwargs == {**generation_kwargs, "stop": ["stop"], "max_tokens": 512}
+        assert generator.streaming_callback == streaming_callback
+        assert generator.tools is None
+
+        assert generator._client is None
+        assert generator._async_client is None
+
+    def test_init_tgi_invalid_url(self):
+        with pytest.raises(ValueError):
+            HuggingFaceAPIChatGenerator(
+                api_type=HFGenerationAPIType.TEXT_GENERATION_INFERENCE, api_params={"url": "invalid_url"}
+            )
+
+    def test_init_tgi_no_url(self):
+        with pytest.raises(ValueError):
+            HuggingFaceAPIChatGenerator(
+                api_type=HFGenerationAPIType.TEXT_GENERATION_INFERENCE, api_params={"param": "irrelevant"}
+            )
+
+    def test_init_fail_with_duplicate_tool_names(self, tools):
+        duplicate_tools = [tools[0], tools[0]]
+        with pytest.raises(ValueError):
+            HuggingFaceAPIChatGenerator(
+                api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+                api_params={"model": "irrelevant"},
+                tools=duplicate_tools,
+            )
+
+    def test_init_fail_with_tools_and_streaming(self, tools):
+        with pytest.raises(ValueError):
+            HuggingFaceAPIChatGenerator(
+                api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+                api_params={"model": "irrelevant"},
+                tools=tools,
+                streaming_callback=streaming_callback_handler,
+            )
+
+    def test_to_dict(self):
+        tool = Tool(name="name", description="description", parameters={"x": {"type": "string"}}, function=print)
+
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "HuggingFaceH4/zephyr-7b-beta"},
+            generation_kwargs={"temperature": 0.6},
+            stop_words=["stop", "words"],
+            tools=[tool],
+        )
+
+        result = generator.to_dict()
+        init_params = result["init_parameters"]
+
+        assert init_params["api_type"] == "serverless_inference_api"
+        assert init_params["api_params"] == {"model": "HuggingFaceH4/zephyr-7b-beta"}
+        assert init_params["token"] == {"env_vars": ["HF_API_TOKEN", "HF_TOKEN"], "strict": False, "type": "env_var"}
+        assert init_params["generation_kwargs"] == {"temperature": 0.6, "stop": ["stop", "words"], "max_tokens": 512}
+        assert init_params["streaming_callback"] is None
+
+        # deserializing the serialized component must reproduce the original tool
+        loaded = HuggingFaceAPIChatGenerator.from_dict(result)
+        assert loaded.tools == [tool]
+
+    def test_from_dict(self):
+        tool = Tool(name="name", description="description", parameters={"x": {"type": "string"}}, function=print)
+
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "HuggingFaceH4/zephyr-7b-beta"},
+            token=Secret.from_env_var("ENV_VAR", strict=False),
+            generation_kwargs={"temperature": 0.6},
+            stop_words=["stop", "words"],
+            tools=[tool],
+        )
+        result = generator.to_dict()
+
+        # now deserialize, call from_dict
+        generator_2 = HuggingFaceAPIChatGenerator.from_dict(result)
+        assert generator_2.api_type == HFGenerationAPIType.SERVERLESS_INFERENCE_API
+        assert generator_2.api_params == {"model": "HuggingFaceH4/zephyr-7b-beta"}
+        assert generator_2.token == Secret.from_env_var("ENV_VAR", strict=False)
+        assert generator_2.generation_kwargs == {"temperature": 0.6, "stop": ["stop", "words"], "max_tokens": 512}
+        assert generator_2.streaming_callback is None
+        assert generator_2.tools == [tool]
+
+    def test_serde_in_pipeline(self):
+        tool = Tool(name="name", description="description", parameters={"x": {"type": "string"}}, function=print)
+
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "HuggingFaceH4/zephyr-7b-beta"},
+            token=Secret.from_env_var("ENV_VAR", strict=False),
+            generation_kwargs={"temperature": 0.6},
+            stop_words=["stop", "words"],
+            tools=[tool],
+        )
+
+        pipeline = Pipeline()
+        pipeline.add_component("generator", generator)
+
+        pipeline_dict = pipeline.to_dict()
+
+        # the Tool serialization format is owned by haystack-ai and varies across its versions; the
+        # dumps/loads round-trip below covers the tools, so exclude them from the pinned-dict comparison
+        tools_entries = pipeline_dict["components"]["generator"]["init_parameters"].pop("tools")
+        assert len(tools_entries) == 1
+        assert pipeline_dict == {
+            "metadata": {},
+            "max_runs_per_component": 100,
+            "connection_type_validation": True,
+            "components": {
+                "generator": {
+                    "type": "haystack_integrations.components.generators.huggingface_api.chat.chat_generator"
+                    ".HuggingFaceAPIChatGenerator",
+                    "init_parameters": {
+                        "api_type": "serverless_inference_api",
+                        "api_params": {"model": "HuggingFaceH4/zephyr-7b-beta"},
+                        "token": {"type": "env_var", "env_vars": ["ENV_VAR"], "strict": False},
+                        "generation_kwargs": {"temperature": 0.6, "stop": ["stop", "words"], "max_tokens": 512},
+                        "streaming_callback": None,
+                    },
+                }
+            },
+            "connections": [],
+        }
+
+        pipeline_yaml = pipeline.dumps()
+
+        new_pipeline = Pipeline.loads(pipeline_yaml)
+        assert new_pipeline == pipeline
+
+
+class TestComponentLifecycle:
+    def test_key_resolved_at_warm_up_not_init(self, monkeypatch):
+        monkeypatch.delenv("MISSING_HF_TOKEN", raising=False)
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.TEXT_GENERATION_INFERENCE,
+            api_params={"url": "https://example.com"},
+            token=Secret.from_env_var("MISSING_HF_TOKEN"),
+        )
+
+        with pytest.raises(ValueError, match="MISSING_HF_TOKEN"):
+            generator.warm_up()
+
+    def test_invalid_model_is_checked_at_warm_up(self, mock_check_valid_model):
+        mock_check_valid_model.side_effect = RepositoryNotFoundError("Invalid model id", response=MagicMock())
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API, api_params={"model": "invalid_model_id"}
+        )
+        with pytest.raises(RepositoryNotFoundError):
+            generator.warm_up()
+
+    @patch("haystack_integrations.components.generators.huggingface_api.chat.chat_generator.InferenceClient")
+    def test_sync_lifecycle(self, mock_client_cls):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.TEXT_GENERATION_INFERENCE,
+            api_params={"url": "https://example.com"},
+            token=Secret.from_token("test-token"),
+        )
+        client = mock_client_cls.return_value
+
+        generator.warm_up()
+        assert generator._client is client
+        assert generator._async_client is None
+
+        generator.close()
+        client.close.assert_called_once_with()
+        assert generator._client is None
+
+        generator.warm_up()
+        assert mock_client_cls.call_count == 2
+
+    @pytest.mark.asyncio
+    @patch("haystack_integrations.components.generators.huggingface_api.chat.chat_generator.AsyncInferenceClient")
+    async def test_async_lifecycle(self, mock_client_cls):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.TEXT_GENERATION_INFERENCE,
+            api_params={"url": "https://example.com"},
+            token=Secret.from_token("test-token"),
+        )
+        client = MagicMock(close=AsyncMock())
+        mock_client_cls.return_value = client
+
+        await generator.warm_up_async()
+        assert generator._async_client is client
+        assert generator._client is None
+
+        await generator.close_async()
+        client.close.assert_awaited_once_with()
+        assert generator._async_client is None
+
+        await generator.warm_up_async()
+        assert mock_client_cls.call_count == 2
+
+    @patch("haystack_integrations.components.generators.huggingface_api.chat.chat_generator.InferenceClient")
+    def test_warm_up_is_idempotent(self, mock_client_cls):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.TEXT_GENERATION_INFERENCE,
+            api_params={"url": "https://example.com"},
+            token=None,
+        )
+        generator.warm_up()
+        generator.warm_up()
+        mock_client_cls.assert_called_once_with(model="https://example.com", token=None)
+
+    @pytest.mark.asyncio
+    @patch("haystack_integrations.components.generators.huggingface_api.chat.chat_generator.AsyncInferenceClient")
+    async def test_warm_up_async_is_idempotent(self, mock_client_cls):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.TEXT_GENERATION_INFERENCE,
+            api_params={"url": "https://example.com"},
+            token=None,
+        )
+        await generator.warm_up_async()
+        await generator.warm_up_async()
+        mock_client_cls.assert_called_once_with(model="https://example.com", token=None)
+
+    @pytest.mark.asyncio
+    async def test_close_is_safe_without_warm_up(self):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.TEXT_GENERATION_INFERENCE,
+            api_params={"url": "https://example.com"},
+            token=None,
+        )
+        generator.close()
+        await generator.close_async()
+        assert generator._client is None
+        assert generator._async_client is None
+
+    @pytest.mark.asyncio
+    @patch("haystack_integrations.components.generators.huggingface_api.chat.chat_generator.AsyncInferenceClient")
+    @patch("haystack_integrations.components.generators.huggingface_api.chat.chat_generator.InferenceClient")
+    async def test_close_and_close_async_are_independent(self, mock_sync_cls, mock_async_cls):
+        sync_client = mock_sync_cls.return_value
+        async_client = MagicMock(close=AsyncMock())
+        mock_async_cls.return_value = async_client
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.TEXT_GENERATION_INFERENCE,
+            api_params={"url": "https://example.com"},
+            token=None,
+        )
+        generator.warm_up()
+        await generator.warm_up_async()
+
+        generator.close()
+        assert generator._client is None
+        assert generator._async_client is async_client
+        async_client.close.assert_not_awaited()
+
+        await generator.close_async()
+        assert generator._async_client is None
+        sync_client.close.assert_called_once_with()
+
+
+class TestRun:
+    def test_run(self, mock_check_valid_model, mock_chat_completion, chat_messages):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+            generation_kwargs={"temperature": 0.6},
+            stop_words=["stop", "words"],
+            streaming_callback=None,
+        )
+
+        response = generator.run(messages=chat_messages)
+
+        # check kwargs passed to chat_completion
+        _, kwargs = mock_chat_completion.call_args
+        hf_messages = [
+            {"role": "system", "content": "You are a helpful assistant speaking A2 level of English"},
+            {"role": "user", "content": "Tell me about Berlin"},
+        ]
+        assert kwargs == {
+            "temperature": 0.6,
+            "stop": ["stop", "words"],
+            "max_tokens": 512,
+            "tools": None,
+            "messages": hf_messages,
+        }
+
+        assert isinstance(response, dict)
+        assert "replies" in response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) == 1
+        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+
+    def test_run_with_generation_kwargs(self, mock_check_valid_model, mock_chat_completion, chat_messages):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+            generation_kwargs={"max_tokens": 100, "temperature": 0.5},
+        )
+
+        generator.run(messages=chat_messages, generation_kwargs={"temperature": 0.9})
+
+        _, kwargs = mock_chat_completion.call_args
+        assert kwargs["max_tokens"] == 100
+        assert kwargs["temperature"] == 0.9
+
+    def test_run_with_string_input(self, mock_check_valid_model, mock_chat_completion):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+        )
+        response = generator.run("What's the capital of France?")
+
+        _, kwargs = mock_chat_completion.call_args
+        assert kwargs["messages"] == [{"role": "user", "content": "What's the capital of France?"}]
+
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) == 1
+        assert isinstance(response["replies"][0], ChatMessage)
+
+    def test_run_with_streaming_callback(self, mock_check_valid_model, mock_chat_completion, chat_messages):
+        streaming_call_count = 0
+
+        # Define the streaming callback function
+        def streaming_callback_fn(chunk: StreamingChunk):
+            nonlocal streaming_call_count
+            streaming_call_count += 1
+            assert isinstance(chunk, StreamingChunk)
+
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+            streaming_callback=streaming_callback_fn,
+        )
+
+        # Create a fake streamed response
+        # self needed here, don't remove
+        def mock_iter(self):
+            yield ChatCompletionStreamOutput(
+                choices=[
+                    ChatCompletionStreamOutputChoice(
+                        delta=ChatCompletionStreamOutputDelta(content="The", role="assistant"),
+                        index=0,
+                        finish_reason=None,
+                    )
+                ],
+                id="some_id",
+                model="some_model",
+                system_fingerprint="some_fingerprint",
+                created=1710498504,
+            )
+
+            yield ChatCompletionStreamOutput(
+                choices=[
+                    ChatCompletionStreamOutputChoice(
+                        delta=ChatCompletionStreamOutputDelta(content=None, role=None), index=0, finish_reason="length"
+                    )
+                ],
+                id="some_id",
+                model="some_model",
+                system_fingerprint="some_fingerprint",
+                created=1710498504,
+            )
+
+        mock_response = Mock(__iter__=mock_iter)
+        mock_chat_completion.return_value = mock_response
+
+        # Generate text response with streaming callback
+        response = generator.run(chat_messages)
+
+        # check kwargs passed to text_generation
+        _, kwargs = mock_chat_completion.call_args
+        assert kwargs == {
+            "stop": [],
+            "stream": True,
+            "max_tokens": 512,
+            "stream_options": ChatCompletionInputStreamOptions(include_usage=True),
+        }
+
+        # Assert that the streaming callback was called twice
+        assert streaming_call_count == 2
+
+        # Assert that the response contains the generated replies
+        assert "replies" in response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) > 0
+        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+
+    def test_run_with_streaming_callback_in_run_method(
+        self, mock_check_valid_model, mock_chat_completion, chat_messages
+    ):
+        streaming_call_count = 0
+
+        # Define the streaming callback function
+        def streaming_callback_fn(chunk: StreamingChunk):
+            nonlocal streaming_call_count
+            streaming_call_count += 1
+            assert isinstance(chunk, StreamingChunk)
+
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+        )
+
+        # Create a fake streamed response
+        # self needed here, don't remove
+        def mock_iter(self):
+            yield ChatCompletionStreamOutput(
+                choices=[
+                    ChatCompletionStreamOutputChoice(
+                        delta=ChatCompletionStreamOutputDelta(content="The", role="assistant"),
+                        index=0,
+                        finish_reason=None,
+                    )
+                ],
+                id="some_id",
+                model="some_model",
+                system_fingerprint="some_fingerprint",
+                created=1710498504,
+            )
+
+            yield ChatCompletionStreamOutput(
+                choices=[
+                    ChatCompletionStreamOutputChoice(
+                        delta=ChatCompletionStreamOutputDelta(content=None, role=None), index=0, finish_reason="length"
+                    )
+                ],
+                id="some_id",
+                model="some_model",
+                system_fingerprint="some_fingerprint",
+                created=1710498504,
+            )
+
+        mock_response = Mock(__iter__=mock_iter)
+        mock_chat_completion.return_value = mock_response
+
+        # Generate text response with streaming callback
+        response = generator.run(chat_messages, streaming_callback=streaming_callback_fn)
+
+        # check kwargs passed to text_generation
+        _, kwargs = mock_chat_completion.call_args
+        assert kwargs == {
+            "stop": [],
+            "stream": True,
+            "max_tokens": 512,
+            "stream_options": ChatCompletionInputStreamOptions(include_usage=True),
+        }
+
+        # Assert that the streaming callback was called twice
+        assert streaming_call_count == 2
+
+        # Assert that the response contains the generated replies
+        assert "replies" in response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) > 0
+        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+
+    def test_run_fail_with_tools_and_streaming(self, tools, mock_check_valid_model):
+        component = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+            streaming_callback=streaming_callback_handler,
+        )
+
+        with pytest.raises(ValueError):
+            message = ChatMessage.from_user("irrelevant")
+            component.run([message], tools=tools)
+
+    def test_run_with_tools(self, mock_check_valid_model, tools):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-3.1-70B-Instruct"},
+            tools=tools,
+        )
+
+        with patch("huggingface_hub.InferenceClient.chat_completion", autospec=True) as mock_chat_completion:
+            completion = ChatCompletionOutput(
+                choices=[
+                    ChatCompletionOutputComplete(
+                        finish_reason="stop",
+                        index=0,
+                        message=ChatCompletionOutputMessage(
+                            role="assistant",
+                            content=None,
+                            tool_calls=[
+                                ChatCompletionOutputToolCall(
+                                    function=ChatCompletionOutputFunctionDefinition(
+                                        arguments={"city": "Paris"}, name="weather", description=None
+                                    ),
+                                    id="0",
+                                    type="function",
+                                )
+                            ],
+                        ),
+                        logprobs=None,
+                    )
+                ],
+                created=1729074760,
+                id="",
+                model="meta-llama/Llama-3.1-70B-Instruct",
+                system_fingerprint="2.3.2-dev0-sha-28bb7ae",
+                usage=ChatCompletionOutputUsage(completion_tokens=30, prompt_tokens=426, total_tokens=456),
+            )
+            mock_chat_completion.return_value = completion
+
+            messages = [ChatMessage.from_user("What is the weather in Paris?")]
+            response = generator.run(messages=messages)
+
+        assert isinstance(response, dict)
+        assert "replies" in response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) == 1
+        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+        assert response["replies"][0].tool_calls[0].tool_name == "weather"
+        assert response["replies"][0].tool_calls[0].arguments == {"city": "Paris"}
+        assert response["replies"][0].tool_calls[0].id == "0"
+        assert response["replies"][0].meta == {
+            "finish_reason": "tool_calls",
+            "index": 0,
+            "model": "meta-llama/Llama-3.1-70B-Instruct",
+            "usage": {"completion_tokens": 30, "prompt_tokens": 426},
+        }
+
+    def test_convert_hfapi_tool_calls_empty(self):
+        hfapi_tool_calls = None
+        tool_calls = _convert_hfapi_tool_calls(hfapi_tool_calls)
+        assert len(tool_calls) == 0
+
+        hfapi_tool_calls = []
+        tool_calls = _convert_hfapi_tool_calls(hfapi_tool_calls)
+        assert len(tool_calls) == 0
+
+    def test_convert_hfapi_tool_calls_dict_arguments(self):
+        hfapi_tool_calls = [
+            ChatCompletionOutputToolCall(
+                function=ChatCompletionOutputFunctionDefinition(
+                    arguments={"city": "Paris"}, name="weather", description=None
+                ),
+                id="0",
+                type="function",
+            )
+        ]
+        tool_calls = _convert_hfapi_tool_calls(hfapi_tool_calls)
+        assert len(tool_calls) == 1
+        assert tool_calls[0].tool_name == "weather"
+        assert tool_calls[0].arguments == {"city": "Paris"}
+        assert tool_calls[0].id == "0"
+
+    def test_convert_hfapi_tool_calls_str_arguments(self):
+        hfapi_tool_calls = [
+            ChatCompletionOutputToolCall(
+                function=ChatCompletionOutputFunctionDefinition(
+                    arguments='{"city": "Paris"}', name="weather", description=None
+                ),
+                id="0",
+                type="function",
+            )
+        ]
+        tool_calls = _convert_hfapi_tool_calls(hfapi_tool_calls)
+        assert len(tool_calls) == 1
+        assert tool_calls[0].tool_name == "weather"
+        assert tool_calls[0].arguments == {"city": "Paris"}
+        assert tool_calls[0].id == "0"
+
+    def test_convert_hfapi_tool_calls_invalid_str_arguments(self):
+        hfapi_tool_calls = [
+            ChatCompletionOutputToolCall(
+                function=ChatCompletionOutputFunctionDefinition(
+                    arguments="not a valid JSON string", name="weather", description=None
+                ),
+                id="0",
+                type="function",
+            )
+        ]
+        tool_calls = _convert_hfapi_tool_calls(hfapi_tool_calls)
+        assert len(tool_calls) == 0
+
+    def test_convert_hfapi_tool_calls_invalid_type_arguments(self):
+        hfapi_tool_calls = [
+            ChatCompletionOutputToolCall(
+                function=ChatCompletionOutputFunctionDefinition(
+                    arguments=["this", "is", "a", "list"], name="weather", description=None
+                ),
+                id="0",
+                type="function",
+            )
+        ]
+        tool_calls = _convert_hfapi_tool_calls(hfapi_tool_calls)
+        assert len(tool_calls) == 0
+
+    @pytest.mark.parametrize(
+        "hf_stream_output, expected_stream_chunk, dummy_previous_chunks",
+        [
+            (
+                ChatCompletionStreamOutput(
+                    choices=[
+                        ChatCompletionStreamOutputChoice(
+                            delta=ChatCompletionStreamOutputDelta(role="assistant", content=" Paris"), index=0
+                        )
+                    ],
+                    created=1748339326,
+                    id="",
+                    model="microsoft/Phi-3.5-mini-instruct",
+                    system_fingerprint="3.2.1-sha-4d28897",
+                ),
+                StreamingChunk(
+                    content=" Paris",
+                    meta={
+                        "received_at": "2025-05-27T12:14:28.228852",
+                        "model": "microsoft/Phi-3.5-mini-instruct",
+                        "finish_reason": None,
+                    },
+                    index=0,
+                    start=True,
+                ),
+                [],
+            ),
+            (
+                ChatCompletionStreamOutput(
+                    choices=[
+                        ChatCompletionStreamOutputChoice(
+                            delta=ChatCompletionStreamOutputDelta(role="assistant", content=""),
+                            index=0,
+                            finish_reason="stop",
+                        )
+                    ],
+                    created=1748339326,
+                    id="",
+                    model="microsoft/Phi-3.5-mini-instruct",
+                    system_fingerprint="3.2.1-sha-4d28897",
+                ),
+                StreamingChunk(
+                    content="",
+                    meta={
+                        "received_at": "2025-05-27T12:14:28.228852",
+                        "model": "microsoft/Phi-3.5-mini-instruct",
+                        "finish_reason": "stop",
+                    },
+                    finish_reason="stop",
+                ),
+                [0],
+            ),
+            (
+                ChatCompletionStreamOutput(
+                    choices=[],
+                    created=1748339326,
+                    id="",
+                    model="microsoft/Phi-3.5-mini-instruct",
+                    system_fingerprint="3.2.1-sha-4d28897",
+                    usage=ChatCompletionStreamOutputUsage(completion_tokens=2, prompt_tokens=21, total_tokens=23),
+                ),
+                StreamingChunk(
+                    content="",
+                    meta={
+                        "received_at": "2025-05-27T12:14:28.228852",
+                        "model": "microsoft/Phi-3.5-mini-instruct",
+                        "usage": {"completion_tokens": 2, "prompt_tokens": 21},
+                    },
+                ),
+                [0, 1],
+            ),
+        ],
+    )
+    def test_convert_chat_completion_stream_output_to_streaming_chunk(
+        self, hf_stream_output, expected_stream_chunk, dummy_previous_chunks
+    ):
+        converted_stream_chunk = _convert_chat_completion_stream_output_to_streaming_chunk(
+            chunk=hf_stream_output, previous_chunks=dummy_previous_chunks
+        )
+        # Remove timestamp from comparison since it's always the current time
+        converted_stream_chunk.meta.pop("received_at", None)
+        expected_stream_chunk.meta.pop("received_at", None)
+        assert converted_stream_chunk == expected_stream_chunk
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get("HF_TOKEN", None),
+    reason="Export an env var called HF_TOKEN containing the Hugging Face token to run this test.",
+)
+class TestSyncIntegration:
+    def test_live_run_serverless(self):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "Qwen/Qwen3.5-9B", "provider": "together"},
+            generation_kwargs={"max_tokens": 20, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+        )
+
+        # No need for instruction tokens here since we use the chat_completion endpoint which handles the chat
+        # templating for us.
+        messages = [
+            ChatMessage.from_user("What is the capital of France? Be concise only provide the capital, nothing else.")
+        ]
+        response = generator.run(messages=messages)
+
+        assert "replies" in response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) > 0
+        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+        assert response["replies"][0].text is not None
+        meta = response["replies"][0].meta
+        assert "usage" in meta
+        assert "prompt_tokens" in meta["usage"]
+        assert meta["usage"]["prompt_tokens"] > 0
+        assert "completion_tokens" in meta["usage"]
+        assert meta["usage"]["completion_tokens"] > 0
+        assert meta["model"] == "Qwen/Qwen3.5-9B"
+        assert meta["finish_reason"] is not None
+
+    def test_live_run_serverless_streaming(self):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "Qwen/Qwen3.5-9B", "provider": "together"},
+            generation_kwargs={"max_tokens": 20, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+            streaming_callback=streaming_callback_handler,
+        )
+
+        # No need for instruction tokens here since we use the chat_completion endpoint which handles the chat
+        # templating for us.
+        messages = [
+            ChatMessage.from_user("What is the capital of France? Be concise only provide the capital, nothing else.")
+        ]
+        response = generator.run(messages=messages)
+
+        assert "replies" in response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) > 0
+        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+        assert response["replies"][0].text is not None
+
+        response_meta = response["replies"][0].meta
+        assert "completion_start_time" in response_meta
+        assert datetime.fromisoformat(response_meta["completion_start_time"]) <= datetime.now(UTC)
+        assert "usage" in response_meta
+        assert "prompt_tokens" in response_meta["usage"]
+        assert response_meta["usage"]["prompt_tokens"] >= 0
+        assert "completion_tokens" in response_meta["usage"]
+        assert response_meta["usage"]["completion_tokens"] >= 0
+        assert response_meta["model"] == "Qwen/Qwen3.5-9B"
+        assert response_meta["finish_reason"] is not None
+
+    def test_live_run_with_tools(self, tools):
+        """
+        We test the round trip: generate tool call, pass tool message, generate response.
+
+        The model used here is not gated and kept in a warm state.
+        """
+
+        chat_messages = [ChatMessage.from_user("What's the weather like in Paris?")]
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "Qwen/Qwen3.5-9B", "provider": "together"},
+            generation_kwargs={"temperature": 0.5, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+        )
+
+        results = generator.run(chat_messages, tools=tools)
+        assert len(results["replies"]) == 1
+        message = results["replies"][0]
+
+        assert message.tool_calls
+        tool_call = message.tool_call
+        assert isinstance(tool_call, ToolCall)
+        assert tool_call.tool_name == "weather"
+        assert "city" in tool_call.arguments
+        assert "Paris" in tool_call.arguments["city"]
+        assert message.meta["finish_reason"] == "tool_calls"
+
+        new_messages = [*chat_messages, message, ChatMessage.from_tool(tool_result="22° C", origin=tool_call)]
+
+        # the model tends to make tool calls if provided with tools, so we don't pass them here
+        results = generator.run(new_messages, generation_kwargs={"max_tokens": 50})
+
+        assert len(results["replies"]) == 1
+        final_message = results["replies"][0]
+        assert not final_message.tool_calls
+        assert len(final_message.text) > 0
+        assert "paris" in final_message.text.lower() and "22" in final_message.text
+
+    def test_live_run_multimodal(self, test_files_path):
+        image_path = test_files_path / "apple.jpg"
+        # Resize the image to keep this test fast
+        image_content = ImageContent.from_file_path(file_path=image_path, size=(100, 100))
+        messages = [ChatMessage.from_user(content_parts=["What does this image show? Max 5 words", image_content])]
+
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "Qwen/Qwen3.5-9B", "provider": "together"},
+            generation_kwargs={"max_tokens": 20, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+        )
+
+        response = generator.run(messages=messages)
+
+        assert "replies" in response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) > 0
+        message = response["replies"][0]
+        assert message.text
+        assert len(message.text) > 0
+        assert any(word in message.text.lower() for word in ["apple", "fruit", "red"])
+
+
+class TestRunAsync:
+    @pytest.mark.asyncio
+    async def test_run_async(self, mock_check_valid_model, mock_chat_completion_async, chat_messages):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+            generation_kwargs={"temperature": 0.6},
+            stop_words=["stop", "words"],
+            streaming_callback=None,
+        )
+
+        response = await generator.run_async(messages=chat_messages)
+
+        # check kwargs passed to chat_completion
+        _, kwargs = mock_chat_completion_async.call_args
+        hf_messages = [
+            {"role": "system", "content": "You are a helpful assistant speaking A2 level of English"},
+            {"role": "user", "content": "Tell me about Berlin"},
+        ]
+        assert kwargs == {
+            "temperature": 0.6,
+            "stop": ["stop", "words"],
+            "max_tokens": 512,
+            "tools": None,
+            "messages": hf_messages,
+        }
+
+        assert isinstance(response, dict)
+        assert "replies" in response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) == 1
+        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+
+    @pytest.mark.asyncio
+    async def test_run_async_with_generation_kwargs(
+        self, mock_check_valid_model, mock_chat_completion_async, chat_messages
+    ):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+            generation_kwargs={"max_tokens": 100, "temperature": 0.5},
+        )
+
+        await generator.run_async(messages=chat_messages, generation_kwargs={"temperature": 0.9})
+
+        _, kwargs = mock_chat_completion_async.call_args
+        assert kwargs["max_tokens"] == 100
+        assert kwargs["temperature"] == 0.9
+
+    @pytest.mark.asyncio
+    async def test_run_async_with_string_input(self, mock_check_valid_model, mock_chat_completion_async):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+        )
+        response = await generator.run_async("What's the capital of France?")
+
+        _, kwargs = mock_chat_completion_async.call_args
+        assert kwargs["messages"] == [{"role": "user", "content": "What's the capital of France?"}]
+
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) == 1
+        assert isinstance(response["replies"][0], ChatMessage)
+
+    @pytest.mark.asyncio
+    async def test_run_async_with_streaming(self, mock_check_valid_model, mock_chat_completion_async, chat_messages):
+        streaming_call_count = 0
+
+        async def streaming_callback_fn(chunk: StreamingChunk):
+            nonlocal streaming_call_count
+            streaming_call_count += 1
+            assert isinstance(chunk, StreamingChunk)
+
+        # Create a fake streamed response
+        async def mock_aiter(self):
+            yield ChatCompletionStreamOutput(
+                choices=[
+                    ChatCompletionStreamOutputChoice(
+                        delta=ChatCompletionStreamOutputDelta(content="The", role="assistant"),
+                        index=0,
+                        finish_reason=None,
+                    )
+                ],
+                id="some_id",
+                model="some_model",
+                system_fingerprint="some_fingerprint",
+                created=1710498504,
+            )
+
+            yield ChatCompletionStreamOutput(
+                choices=[
+                    ChatCompletionStreamOutputChoice(
+                        delta=ChatCompletionStreamOutputDelta(content=None, role=None), index=0, finish_reason="length"
+                    )
+                ],
+                id="some_id",
+                model="some_model",
+                system_fingerprint="some_fingerprint",
+                created=1710498504,
+            )
+
+        mock_response = Mock(__aiter__=mock_aiter)
+        mock_chat_completion_async.return_value = mock_response
+
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+            streaming_callback=streaming_callback_fn,
+        )
+
+        response = await generator.run_async(messages=chat_messages)
+
+        # check kwargs passed to chat_completion
+        _, kwargs = mock_chat_completion_async.call_args
+        assert kwargs == {
+            "stop": [],
+            "stream": True,
+            "max_tokens": 512,
+            "stream_options": ChatCompletionInputStreamOptions(include_usage=True),
+        }
+
+        # Assert that the streaming callback was called twice
+        assert streaming_call_count == 2
+
+        # Assert that the response contains the generated replies
+        assert "replies" in response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) > 0
+        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+
+    @pytest.mark.asyncio
+    async def test_run_async_with_tools(self, tools, mock_check_valid_model):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-3.1-70B-Instruct"},
+            tools=tools,
+        )
+
+        with patch("huggingface_hub.AsyncInferenceClient.chat_completion", autospec=True) as mock_chat_completion_async:
+            completion = ChatCompletionOutput(
+                choices=[
+                    ChatCompletionOutputComplete(
+                        finish_reason="stop",
+                        index=0,
+                        message=ChatCompletionOutputMessage(
+                            role="assistant",
+                            content=None,
+                            tool_calls=[
+                                ChatCompletionOutputToolCall(
+                                    function=ChatCompletionOutputFunctionDefinition(
+                                        arguments={"city": "Paris"}, name="weather", description=None
+                                    ),
+                                    id="0",
+                                    type="function",
+                                )
+                            ],
+                        ),
+                        logprobs=None,
+                    )
+                ],
+                created=1729074760,
+                id="",
+                model="meta-llama/Llama-3.1-70B-Instruct",
+                system_fingerprint="2.3.2-dev0-sha-28bb7ae",
+                usage=ChatCompletionOutputUsage(completion_tokens=30, prompt_tokens=426, total_tokens=456),
+            )
+            mock_chat_completion_async.return_value = completion
+
+            messages = [ChatMessage.from_user("What is the weather in Paris?")]
+            response = await generator.run_async(messages=messages)
+
+        assert isinstance(response, dict)
+        assert "replies" in response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) == 1
+        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+        assert response["replies"][0].tool_calls[0].tool_name == "weather"
+        assert response["replies"][0].tool_calls[0].arguments == {"city": "Paris"}
+        assert response["replies"][0].tool_calls[0].id == "0"
+        assert response["replies"][0].meta == {
+            "finish_reason": "tool_calls",
+            "index": 0,
+            "model": "meta-llama/Llama-3.1-70B-Instruct",
+            "usage": {"completion_tokens": 30, "prompt_tokens": 426},
+        }
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get("HF_TOKEN", None),
+    reason="Export an env var called HF_TOKEN containing the Hugging Face token to run this test.",
+)
+class TestAsyncIntegration:
+    @pytest.mark.asyncio
+    async def test_live_run_async_serverless(self):
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "Qwen/Qwen3.5-9B", "provider": "together"},
+            generation_kwargs={"max_tokens": 20, "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+        )
+
+        messages = [
+            ChatMessage.from_user("What is the capital of France? Be concise only provide the capital, nothing else.")
+        ]
+        try:
+            response = await generator.run_async(messages=messages)
+
+            assert "replies" in response
+            assert isinstance(response["replies"], list)
+            assert len(response["replies"]) > 0
+            assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+            assert response["replies"][0].text is not None
+
+            meta = response["replies"][0].meta
+            assert "usage" in meta
+            assert "prompt_tokens" in meta["usage"]
+            assert meta["usage"]["prompt_tokens"] > 0
+            assert "completion_tokens" in meta["usage"]
+            assert meta["usage"]["completion_tokens"] > 0
+            assert meta["model"] == "Qwen/Qwen3.5-9B"
+            assert meta["finish_reason"] is not None
+        finally:
+            await generator.close_async()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get("HF_TOKEN", None),
+    reason="Export an env var called HF_TOKEN containing the Hugging Face token to run this test.",
+)
+class TestReasoningIntegration:
+    def test_live_run_multi_turn_with_reasoning_model(self):
+        """
+        Test multi-turn conversation with a reasoning model.
+
+        This test verifies that:
+        1. Reasoning content is captured from the model's response
+        2. When the assistant message (with reasoning) is sent back in a multi-turn conversation,
+           the API call succeeds (reasoning is dropped during conversion since HF API doesn't support it)
+        """
+        # Note: Using a model that supports reasoning AND a provider that actually follows the spec defined in
+        # huggingface-hub. Reasoning content especially seems to be non-standard across providers and is either left
+        # in the main response or put in a new field that is not part of the official API.
+        # One combo that does respect the spec is groq + openai/gpt-oss-20b.
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "openai/gpt-oss-20b", "provider": "groq"},
+            generation_kwargs={"max_tokens": 300},
+        )
+
+        # First turn: ask a question
+        messages = [ChatMessage.from_user("What is 2 + 2? Answer briefly.")]
+        response = generator.run(messages=messages)
+
+        assert "replies" in response
+        assert len(response["replies"]) > 0
+        first_reply = response["replies"][0]
+        assert first_reply.text is not None
+        assert first_reply.reasoning is not None
+
+        # Second turn: send a follow-up including the assistant's previous response
+        # This tests that convert_message_to_hf_format properly handles messages
+        # that may contain ReasoningContent (it should skip it)
+        follow_up_messages = [
+            ChatMessage.from_user("What is 2 + 2? Answer briefly."),
+            first_reply,  # Include the assistant's response with reasoning
+            ChatMessage.from_user("Now what is 3 + 3? Answer briefly."),
+        ]
+        follow_up_response = generator.run(messages=follow_up_messages)
+
+        # Verify the second turn succeeds
+        assert "replies" in follow_up_response
+        assert len(follow_up_response["replies"]) > 0
+        assert follow_up_response["replies"][0].text is not None
+        assert follow_up_response["replies"][0].reasoning is not None
+
+
+class TestTools:
+    def test_hugging_face_api_generator_with_toolset_initialization(self, tools):
+        """Test that the HuggingFaceAPIChatGenerator can be initialized with a Toolset."""
+        toolset = Toolset(tools)
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API, api_params={"model": "irrelevant"}, tools=toolset
+        )
+        assert generator.tools == toolset
+
+    def test_from_dict_with_toolset(self, tools):
+        """Test that the HuggingFaceAPIChatGenerator can be deserialized from a dictionary with a Toolset."""
+        toolset = Toolset(tools)
+        component = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API, api_params={"model": "irrelevant"}, tools=toolset
+        )
+        data = component.to_dict()
+
+        deserialized_component = HuggingFaceAPIChatGenerator.from_dict(data)
+
+        assert isinstance(deserialized_component.tools, Toolset)
+        assert len(deserialized_component.tools) == len(tools)
+        assert all(isinstance(tool, Tool) for tool in deserialized_component.tools)
+
+    def test_to_dict_with_toolset(self, tools):
+        """Test that the HuggingFaceAPIChatGenerator can be serialized to a dictionary with a Toolset."""
+        toolset = Toolset(tools[:1])
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API, api_params={"model": "irrelevant"}, tools=toolset
+        )
+        data = generator.to_dict()
+
+        # deserializing the serialized component must reproduce the original toolset
+        loaded = HuggingFaceAPIChatGenerator.from_dict(data)
+        assert isinstance(loaded.tools, Toolset)
+        assert list(loaded.tools) == list(toolset)
+
+    def test_convert_tools_to_hfapi_tools(self):
+        assert _convert_tools_to_hfapi_tools(None) is None
+        assert _convert_tools_to_hfapi_tools([]) is None
+
+        tool = Tool(
+            name="weather",
+            description="useful to determine the weather in a given location",
+            parameters={"city": {"type": "string"}},
+            function=get_weather,
+        )
+        hf_tools = _convert_tools_to_hfapi_tools([tool])
+        assert len(hf_tools) == 1
+        assert hf_tools[0].type == "function"
+        assert hf_tools[0].function.name == "weather"
+        assert hf_tools[0].function.description == "useful to determine the weather in a given location"
+        assert hf_tools[0].function.parameters == {"city": {"type": "string"}}
+
+
+class TestReasoning:
+    def test_run_with_reasoning_non_streaming(self, mock_check_valid_model, chat_messages):
+        """Test that reasoning content is correctly extracted from non-streaming responses."""
+        with patch("huggingface_hub.InferenceClient.chat_completion", autospec=True) as mock_chat_completion:
+            reasoning_text = "Let me think about this. France is a country in Europe. Its capital city is Paris."
+            completion = ChatCompletionOutput(
+                choices=[
+                    ChatCompletionOutputComplete(
+                        finish_reason="eos_token",
+                        index=0,
+                        message=ChatCompletionOutputMessage(
+                            content="The capital of France is Paris.", role="assistant", reasoning=reasoning_text
+                        ),
+                    )
+                ],
+                id="some_id",
+                model="some_model",
+                system_fingerprint="some_fingerprint",
+                usage=ChatCompletionOutputUsage(completion_tokens=20, prompt_tokens=17, total_tokens=37),
+                created=1710498360,
+            )
+            mock_chat_completion.return_value = completion
+
+            generator = HuggingFaceAPIChatGenerator(
+                api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+                api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+            )
+
+            response = generator.run(chat_messages)
+
+            assert "replies" in response
+            assert len(response["replies"]) == 1
+            reply = response["replies"][0]
+            assert reply.text == "The capital of France is Paris."
+            assert reply.reasoning is not None
+            assert isinstance(reply.reasoning, ReasoningContent)
+            assert reply.reasoning.reasoning_text == reasoning_text
+
+    def test_run_without_reasoning_non_streaming(self, mock_check_valid_model, mock_chat_completion, chat_messages):
+        """Test that responses without reasoning work correctly (backward compatibility)."""
+        generator = HuggingFaceAPIChatGenerator(
+            api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+            api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+        )
+
+        response = generator.run(chat_messages)
+
+        assert "replies" in response
+        assert len(response["replies"]) == 1
+        reply = response["replies"][0]
+        assert reply.text == "The capital of France is Paris."
+        assert reply.reasoning is None
+
+    def test_run_with_reasoning_streaming(self, mock_check_valid_model, chat_messages):
+        """Test that reasoning content is correctly extracted from streaming responses."""
+        streaming_chunks_received = []
+
+        def streaming_callback_fn(chunk: StreamingChunk):
+            streaming_chunks_received.append(chunk)
+
+        with patch("huggingface_hub.InferenceClient.chat_completion", autospec=True) as mock_chat_completion:
+            # Create a fake streamed response with reasoning
+            def mock_iter(self):
+                # First chunk with reasoning
+                yield ChatCompletionStreamOutput(
+                    choices=[
+                        ChatCompletionStreamOutputChoice(
+                            delta=ChatCompletionStreamOutputDelta(
+                                role="assistant", content=None, reasoning="Let me think..."
+                            ),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                    id="some_id",
+                    model="some_model",
+                    system_fingerprint="some_fingerprint",
+                    created=1710498504,
+                )
+                # Second chunk with more reasoning
+                yield ChatCompletionStreamOutput(
+                    choices=[
+                        ChatCompletionStreamOutputChoice(
+                            delta=ChatCompletionStreamOutputDelta(
+                                role=None, content=None, reasoning=" The capital of France is Paris."
+                            ),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                    id="some_id",
+                    model="some_model",
+                    system_fingerprint="some_fingerprint",
+                    created=1710498504,
+                )
+                # Third chunk with actual content
+                yield ChatCompletionStreamOutput(
+                    choices=[
+                        ChatCompletionStreamOutputChoice(
+                            delta=ChatCompletionStreamOutputDelta(role=None, content="Paris", reasoning=None),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                    id="some_id",
+                    model="some_model",
+                    system_fingerprint="some_fingerprint",
+                    created=1710498504,
+                )
+                # Final chunk with finish reason
+                yield ChatCompletionStreamOutput(
+                    choices=[
+                        ChatCompletionStreamOutputChoice(
+                            delta=ChatCompletionStreamOutputDelta(role=None, content=None, reasoning=None),
+                            index=0,
+                            finish_reason="stop",
+                        )
+                    ],
+                    id="some_id",
+                    model="some_model",
+                    system_fingerprint="some_fingerprint",
+                    created=1710498504,
+                )
+
+            mock_response = Mock(__iter__=mock_iter)
+            mock_chat_completion.return_value = mock_response
+
+            generator = HuggingFaceAPIChatGenerator(
+                api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+                api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+                streaming_callback=streaming_callback_fn,
+            )
+
+            response = generator.run(chat_messages)
+
+            # Check streaming chunks received with reasoning
+            assert len(streaming_chunks_received) == 4
+            assert streaming_chunks_received[0].reasoning is not None
+            assert streaming_chunks_received[0].reasoning.reasoning_text == "Let me think..."
+            assert streaming_chunks_received[1].reasoning is not None
+            assert streaming_chunks_received[1].reasoning.reasoning_text == " The capital of France is Paris."
+
+            # Check final message
+            assert "replies" in response
+            assert len(response["replies"]) == 1
+            reply = response["replies"][0]
+            assert reply.text == "Paris"
+            assert reply.reasoning is not None
+            assert isinstance(reply.reasoning, ReasoningContent)
+            assert reply.reasoning.reasoning_text == "Let me think... The capital of France is Paris."
+
+    @pytest.mark.asyncio
+    async def test_run_async_with_reasoning_non_streaming(self, mock_check_valid_model, chat_messages):
+        """Test that reasoning content is correctly extracted from async non-streaming responses."""
+        with patch(
+            "huggingface_hub.AsyncInferenceClient.chat_completion", new_callable=AsyncMock
+        ) as mock_chat_completion:
+            completion = ChatCompletionOutput(
+                choices=[
+                    ChatCompletionOutputComplete(
+                        finish_reason="eos_token",
+                        index=0,
+                        message=ChatCompletionOutputMessage(
+                            content="The capital of France is Paris.",
+                            role="assistant",
+                            reasoning="Let me reason about this question step by step.",
+                        ),
+                    )
+                ],
+                id="some_id",
+                model="some_model",
+                system_fingerprint="some_fingerprint",
+                usage=ChatCompletionOutputUsage(completion_tokens=20, prompt_tokens=17, total_tokens=37),
+                created=1710498360,
+            )
+            mock_chat_completion.return_value = completion
+
+            generator = HuggingFaceAPIChatGenerator(
+                api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+                api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+            )
+
+            response = await generator.run_async(chat_messages)
+
+            assert "replies" in response
+            assert len(response["replies"]) == 1
+            reply = response["replies"][0]
+            assert reply.text == "The capital of France is Paris."
+            assert reply.reasoning is not None
+            assert isinstance(reply.reasoning, ReasoningContent)
+            assert reply.reasoning.reasoning_text == "Let me reason about this question step by step."
+
+    @pytest.mark.asyncio
+    async def test_run_async_with_reasoning_streaming(self, mock_check_valid_model, chat_messages):
+        """Test that reasoning content is correctly extracted from async streaming responses."""
+        streaming_chunks_received = []
+
+        async def streaming_callback_fn(chunk: StreamingChunk):
+            streaming_chunks_received.append(chunk)
+
+        with patch(
+            "huggingface_hub.AsyncInferenceClient.chat_completion", new_callable=AsyncMock
+        ) as mock_chat_completion:
+            # Create async iterable for streaming
+            async def mock_aiter():
+                # First chunk with reasoning
+                yield ChatCompletionStreamOutput(
+                    choices=[
+                        ChatCompletionStreamOutputChoice(
+                            delta=ChatCompletionStreamOutputDelta(
+                                role="assistant", content=None, reasoning="Thinking..."
+                            ),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                    id="some_id",
+                    model="some_model",
+                    system_fingerprint="some_fingerprint",
+                    created=1710498504,
+                )
+                # Second chunk with content
+                yield ChatCompletionStreamOutput(
+                    choices=[
+                        ChatCompletionStreamOutputChoice(
+                            delta=ChatCompletionStreamOutputDelta(role=None, content="Paris", reasoning=None),
+                            index=0,
+                            finish_reason=None,
+                        )
+                    ],
+                    id="some_id",
+                    model="some_model",
+                    system_fingerprint="some_fingerprint",
+                    created=1710498504,
+                )
+                # Final chunk
+                yield ChatCompletionStreamOutput(
+                    choices=[
+                        ChatCompletionStreamOutputChoice(
+                            delta=ChatCompletionStreamOutputDelta(role=None, content=None, reasoning=None),
+                            index=0,
+                            finish_reason="stop",
+                        )
+                    ],
+                    id="some_id",
+                    model="some_model",
+                    system_fingerprint="some_fingerprint",
+                    created=1710498504,
+                )
+
+            mock_chat_completion.return_value = mock_aiter()
+
+            generator = HuggingFaceAPIChatGenerator(
+                api_type=HFGenerationAPIType.SERVERLESS_INFERENCE_API,
+                api_params={"model": "meta-llama/Llama-2-13b-chat-hf"},
+                streaming_callback=streaming_callback_fn,
+            )
+
+            response = await generator.run_async(chat_messages)
+
+            # Check streaming chunks
+            assert len(streaming_chunks_received) == 3
+            assert streaming_chunks_received[0].reasoning is not None
+            assert streaming_chunks_received[0].reasoning.reasoning_text == "Thinking..."
+
+            # Check final message
+            assert "replies" in response
+            assert len(response["replies"]) == 1
+            reply = response["replies"][0]
+            assert reply.text == "Paris"
+            assert reply.reasoning is not None
+            assert isinstance(reply.reasoning, ReasoningContent)
+            assert reply.reasoning.reasoning_text == "Thinking..."
+
+    def test_convert_chat_completion_stream_output_to_streaming_chunk_with_reasoning(self):
+        """Test that reasoning is correctly extracted from streaming chunks."""
+        # In streaming mode, reasoning and content come in separate chunks
+        chunk = ChatCompletionStreamOutput(
+            choices=[
+                ChatCompletionStreamOutputChoice(
+                    delta=ChatCompletionStreamOutputDelta(
+                        role="assistant", content=None, reasoning="Let me think about this."
+                    ),
+                    index=0,
+                    finish_reason=None,
+                )
+            ],
+            id="some_id",
+            model="some_model",
+            system_fingerprint="some_fingerprint",
+            created=1710498504,
+        )
+
+        streaming_chunk = _convert_chat_completion_stream_output_to_streaming_chunk(chunk=chunk, previous_chunks=[])
+
+        assert streaming_chunk.content == ""
+        assert streaming_chunk.reasoning is not None
+        assert isinstance(streaming_chunk.reasoning, ReasoningContent)
+        assert streaming_chunk.reasoning.reasoning_text == "Let me think about this."
+
+    def test_convert_chat_completion_stream_output_to_streaming_chunk_without_reasoning(self):
+        """Test that chunks without reasoning still work correctly."""
+        chunk = ChatCompletionStreamOutput(
+            choices=[
+                ChatCompletionStreamOutputChoice(
+                    delta=ChatCompletionStreamOutputDelta(role="assistant", content="Hello"),
+                    index=0,
+                    finish_reason=None,
+                )
+            ],
+            id="some_id",
+            model="some_model",
+            system_fingerprint="some_fingerprint",
+            created=1710498504,
+        )
+
+        streaming_chunk = _convert_chat_completion_stream_output_to_streaming_chunk(chunk=chunk, previous_chunks=[])
+
+        assert streaming_chunk.content == "Hello"
+        assert streaming_chunk.reasoning is None
+
+
+class TestToolSchema:
+    def test_resolve_schema_refs_no_defs(self):
+        """Schema without $defs is returned as-is."""
+        schema = {"type": "object", "properties": {"name": {"type": "string"}}}
+        assert _resolve_schema_refs(schema) == schema
+
+    def test_resolve_schema_refs_expands_defs(self):
+        """Schema with $defs and $ref is expanded correctly."""
+        schema = {
+            "$defs": {
+                "User": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+                    "required": ["name"],
+                }
+            },
+            "type": "object",
+            "properties": {"user": {"$ref": "#/$defs/User"}},
+            "required": ["user"],
+        }
+        resolved = _resolve_schema_refs(schema)
+        assert "$defs" not in resolved
+        assert "$ref" not in resolved["properties"]["user"]
+        assert resolved["properties"]["user"]["type"] == "object"
+        assert resolved["properties"]["user"]["properties"]["name"] == {"type": "string"}
+
+    def test_resolve_schema_refs_nested_refs(self):
+        """Schema with nested $ref references is expanded correctly."""
+        schema = {
+            "$defs": {
+                "Address": {"type": "object", "properties": {"street": {"type": "string"}}},
+                "User": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}, "address": {"$ref": "#/$defs/Address"}},
+                },
+            },
+            "type": "object",
+            "properties": {"user": {"$ref": "#/$defs/User"}},
+        }
+        resolved = _resolve_schema_refs(schema)
+        assert "$defs" not in resolved
+        user = resolved["properties"]["user"]
+        assert user["properties"]["address"]["type"] == "object"
+        assert user["properties"]["address"]["properties"]["street"] == {"type": "string"}
+
+    def test_convert_tools_to_hfapi_tools_resolves_defs(self):
+        """Tool schemas with $defs are resolved before passing to HF API."""
+        tool = Tool(
+            name="get_user",
+            description="Get user info",
+            parameters={
+                "$defs": {"User": {"type": "object", "properties": {"name": {"type": "string"}}}},
+                "type": "object",
+                "properties": {"user": {"$ref": "#/$defs/User"}},
+            },
+            function=lambda user: user,
+        )
+        hf_tools = _convert_tools_to_hfapi_tools([tool])
+        assert hf_tools is not None
+        assert len(hf_tools) == 1
+        params = hf_tools[0].function.parameters or hf_tools[0].function.arguments
+        assert "$defs" not in params
+        assert params["properties"]["user"]["type"] == "object"

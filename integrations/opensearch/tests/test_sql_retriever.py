@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from haystack.dataclasses import Document
@@ -48,6 +48,72 @@ def test_from_dict(_mock_opensearch_client):
     data = retriever.to_dict()
     retriever_from_dict = OpenSearchSQLRetriever.from_dict(data)
     assert retriever_from_dict._raise_on_failure is True
+
+
+def test_close():
+    mock_store = Mock(spec=OpenSearchDocumentStore)
+    retriever = OpenSearchSQLRetriever(document_store=mock_store)
+
+    retriever.close()
+
+    mock_store.close.assert_called_once_with()
+    assert retriever._document_store is mock_store
+
+
+@pytest.mark.asyncio
+async def test_close_async():
+    mock_store = Mock(spec=OpenSearchDocumentStore)
+    mock_store.close_async = AsyncMock()
+    retriever = OpenSearchSQLRetriever(document_store=mock_store)
+
+    await retriever.close_async()
+
+    mock_store.close_async.assert_awaited_once_with()
+    assert retriever._document_store is mock_store
+
+
+@patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
+def test_query_sql_uses_positional_args(_mock_opensearch_class):
+    """Verify perform_request is called with positional method/url args (ddtrace compatibility)."""
+    mock_transport = MagicMock()
+    mock_transport.perform_request.return_value = {"schema": [], "datarows": []}
+    mock_client = MagicMock()
+    mock_client.transport = mock_transport
+    _mock_opensearch_class.return_value = mock_client
+
+    document_store = OpenSearchDocumentStore(hosts="some fake host")
+    document_store._client = mock_client
+
+    document_store._query_sql(query="SELECT 1", fetch_size=10)
+
+    mock_transport.perform_request.assert_called_once()
+    call_args, call_kwargs = mock_transport.perform_request.call_args
+    assert call_args[0] == "POST"
+    assert call_args[1] == "/_plugins/_sql"
+    assert call_kwargs.get("body") == {"query": "SELECT 1", "fetch_size": 10}
+
+
+@patch("haystack_integrations.document_stores.opensearch.document_store.AsyncOpenSearch")
+@patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
+@pytest.mark.asyncio
+async def test_query_sql_async_uses_positional_args(_mock_opensearch_class, _mock_async_opensearch_class):
+    """Verify async perform_request is called with positional method/url args (ddtrace compatibility)."""
+    mock_transport = MagicMock()
+    mock_transport.perform_request = AsyncMock(return_value={"schema": [], "datarows": []})
+    mock_async_client = MagicMock()
+    mock_async_client.transport = mock_transport
+    _mock_async_opensearch_class.return_value = mock_async_client
+
+    document_store = OpenSearchDocumentStore(hosts="some fake host")
+    document_store._async_client = mock_async_client
+
+    await document_store._query_sql_async(query="SELECT 1", fetch_size=10)
+
+    mock_transport.perform_request.assert_called_once()
+    call_args, call_kwargs = mock_transport.perform_request.call_args
+    assert call_args[0] == "POST"
+    assert call_args[1] == "/_plugins/_sql"
+    assert call_kwargs.get("body") == {"query": "SELECT 1", "fetch_size": 10}
 
 
 @pytest.mark.integration

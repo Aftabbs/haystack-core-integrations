@@ -26,30 +26,6 @@ def mock_embed_post_response(*args, **kwargs):  # noqa: ARG001
     return mock_response
 
 
-def mock_generate_post_response(*args, **kwargs):  # noqa: ARG001
-    prompt = kwargs["json"]["messages"][0]["content"]
-    model = kwargs["json"]["model"]
-    mock_response = requests.Response()
-    mock_response.status_code = 200
-    choices = [
-        {
-            "index": i,
-            "message": {"role": "assistant", "content": f"Response {i} to '{prompt}'"},
-            "finish_reason": "stop",
-        }
-        for i in range(3)
-    ]
-    mock_response._content = json.dumps(
-        {
-            "model": model,
-            "object": "chat.completion",
-            "usage": {"total_tokens": 10, "prompt_tokens": 5, "completion_tokens": 5},
-            "choices": choices,
-        }
-    ).encode()
-    return mock_response
-
-
 def mock_models_get_response(*args, **kwargs):  # noqa: ARG001
     mock_response = requests.Response()
     mock_response.status_code = 200
@@ -157,6 +133,15 @@ class TestNimBackend:
         assert backend.api_url == "http://localhost:8000"
         assert backend.model_type is None
 
+    def test_close(self, monkeypatch):
+        monkeypatch.setenv("NVIDIA_API_KEY", "fake-api-key")
+        backend = NimBackend(model="custom-model", api_url="http://localhost:8000")
+
+        with patch.object(backend.session, "close") as mock_close:
+            backend.close()
+
+        mock_close.assert_called_once_with()
+
     def test_embed(self, monkeypatch):
         with patch("requests.sessions.Session.post", side_effect=mock_embed_post_response) as mock_post:
             monkeypatch.setenv("NVIDIA_API_KEY", "fake-api-key")
@@ -177,46 +162,6 @@ class TestNimBackend:
                 timeout=60.0,
             )
 
-    def test_generate(self, monkeypatch):
-        with patch("requests.sessions.Session.post", side_effect=mock_generate_post_response) as mock_post:
-            monkeypatch.setenv("NVIDIA_API_KEY", "fake-api-key")
-            backend = NimBackend(model="meta/llama3-8b-instruct", api_url=DEFAULT_API_URL, client="NvidiaGenerator")
-            prompt = "a"
-            replies, meta = backend.generate(prompt=prompt)
-            assert replies == ["Response 0 to 'a'", "Response 1 to 'a'", "Response 2 to 'a'"]
-            assert meta == [
-                {
-                    "role": "assistant",
-                    "usage": {"prompt_tokens": 5, "total_tokens": 10, "completion_tokens": 5},
-                    "finish_reason": "stop",
-                },
-                {
-                    "role": "assistant",
-                    "usage": {"prompt_tokens": 5, "total_tokens": 10, "completion_tokens": 5},
-                    "finish_reason": "stop",
-                },
-                {
-                    "role": "assistant",
-                    "usage": {"prompt_tokens": 5, "total_tokens": 10, "completion_tokens": 5},
-                    "finish_reason": "stop",
-                },
-            ]
-
-            expected_url = DEFAULT_API_URL + "/chat/completions"
-            mock_post.assert_called_once_with(
-                expected_url,
-                json={
-                    "model": "meta/llama3-8b-instruct",
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        },
-                    ],
-                },
-                timeout=60.0,
-            )
-
     def test_models(self, monkeypatch):
         with patch("requests.sessions.Session.get", side_effect=mock_models_get_response) as mock_get:
             monkeypatch.setenv("NVIDIA_API_KEY", "fake-api-key")
@@ -232,6 +177,26 @@ class TestNimBackend:
                 expected_url,
                 timeout=60.0,
             )
+
+    def test_embed_raises_on_http_error(self, monkeypatch):
+        error_response = requests.Response()
+        error_response.status_code = 500
+        error_response._content = b"server exploded"
+        with patch("requests.sessions.Session.post", return_value=error_response):
+            monkeypatch.setenv("NVIDIA_API_KEY", "fake-api-key")
+            backend = NimBackend(model="nvidia/nv-embedqa-e5-v5", api_url=DEFAULT_API_URL, client="NvidiaTextEmbedder")
+            with pytest.raises(ValueError, match="Failed to query embedding endpoint"):
+                backend.embed(texts=["a"])
+
+    def test_models_raises_when_empty(self, monkeypatch):
+        empty_response = requests.Response()
+        empty_response.status_code = 200
+        empty_response._content = json.dumps({"data": []}).encode()
+        with patch("requests.sessions.Session.get", return_value=empty_response):
+            monkeypatch.setenv("NVIDIA_API_KEY", "fake-api-key")
+            backend = NimBackend(model="custom-model", api_url="http://localhost:8000")
+            with pytest.raises(ValueError, match="No hosted model were found"):
+                backend.models()
 
     def test_rank(self, monkeypatch):
         with patch("requests.sessions.Session.post", side_effect=mock_rank_post_response) as mock_post:
@@ -258,3 +223,49 @@ class TestNimBackend:
                 },
                 timeout=60.0,
             )
+
+    def test_rank_local_nim_appends_ranking_path(self, monkeypatch):
+        # Local/self-hosted NIM deployments have no model-specific endpoint override,
+        # so `rank()` must append the `/ranking` path itself instead of relying on
+        # `validate_hosted_model` having already baked it into `self.api_url`.
+        with patch("requests.sessions.Session.post", side_effect=mock_rank_post_response) as mock_post:
+            monkeypatch.setenv("NVIDIA_API_KEY", "fake-api-key")
+            backend = NimBackend(model="custom-rerank-model", api_url="http://localhost:8000/v1", client="NvidiaRanker")
+            query_text = "query"
+            document_texts = ["text1", "text2"]
+            backend.rank(query_text=query_text, document_texts=document_texts)
+
+            expected_url = "http://localhost:8000/v1/ranking"
+            mock_post.assert_called_once_with(
+                expected_url,
+                json={
+                    "model": "custom-rerank-model",
+                    "query": {"text": query_text},
+                    "passages": [{"text": text} for text in document_texts],
+                },
+                timeout=60.0,
+            )
+
+    def test_rank_raises_on_http_error(self, monkeypatch):
+        error_response = requests.Response()
+        error_response.status_code = 500
+        error_response._content = b"server exploded"
+        with patch("requests.sessions.Session.post", return_value=error_response):
+            monkeypatch.setenv("NVIDIA_API_KEY", "fake-api-key")
+            backend = NimBackend(
+                model="nvidia/llama-3.2-nv-rerankqa-1b-v2", api_url=DEFAULT_API_URL, client="NvidiaRanker"
+            )
+            with pytest.raises(ValueError, match="Failed to query ranking endpoint"):
+                backend.rank(query_text="q", document_texts=["a"])
+
+    def test_rank_raises_when_rankings_missing(self, monkeypatch):
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps({"unexpected": "payload"}).encode()
+        with patch("requests.sessions.Session.post", return_value=response):
+            monkeypatch.setenv("NVIDIA_API_KEY", "fake-api-key")
+            backend = NimBackend(
+                model="nvidia/llama-3.2-nv-rerankqa-1b-v2", api_url=DEFAULT_API_URL, client="NvidiaRanker"
+            )
+            with pytest.raises(ValueError, match="Expected 'rankings' in response"):
+                backend.rank(query_text="q", document_texts=["a"])

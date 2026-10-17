@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -36,7 +37,7 @@ class S3Downloader:
             "AWS_SECRET_ACCESS_KEY", strict=False
         ),
         aws_session_token: Secret | None = Secret.from_env_var("AWS_SESSION_TOKEN", strict=False),  # noqa: B008
-        aws_region_name: Secret | None = Secret.from_env_var("AWS_DEFAULT_REGION", strict=False),  # noqa: B008
+        aws_region_name: Secret | str | None = Secret.from_env_var("AWS_DEFAULT_REGION", strict=False),  # noqa: B008
         aws_profile_name: Secret | None = Secret.from_env_var("AWS_PROFILE", strict=False),  # noqa: B008
         boto3_config: dict[str, Any] | None = None,
         file_root_path: str | None = None,
@@ -67,12 +68,14 @@ class S3Downloader:
         :param file_root_path: The path where the file will be downloaded.
             Can be set through this parameter or the `FILE_ROOT_PATH` environment variable.
             If none of them is set, a `ValueError` is raised.
+            Downloads are confined to this directory: a document whose file name resolves outside of it
+            (for example an absolute path or one containing `..`) is logged and skipped instead of written.
         :param file_extensions: The file extensions that are permitted to be downloaded.
             By default, all file extensions are allowed.
         :param max_workers: The maximum number of workers to use for concurrent downloads.
         :param max_cache_size: The maximum number of files to cache.
         :param file_name_meta_key: The name of the meta key that contains the file name to download. The file name
-            will also be used to create local file path for download.
+            will also be used to create local file path for download, relative to `file_root_path`.
             By default, the `Document.meta["file_name"]` is used. If you want to use a
             different key in `Document.meta`, you can set it here.
         :param s3_key_generation_function: An optional function that generates the S3 key for the file to download.
@@ -84,6 +87,7 @@ class S3Downloader:
             By default, the value is `"S3_DOWNLOADER_BUCKET"`.
         :raises ValueError: If the `file_root_path` is not set through
             the constructor or the `FILE_ROOT_PATH` environment variable.
+        :raises AWSConfigurationError: If the provided AWS credentials are invalid.
 
         """
 
@@ -114,27 +118,38 @@ class S3Downloader:
 
         self._storage: S3Storage | None = None
 
-        def resolve_secret(secret: Secret | None) -> str | None:
-            return secret.resolve_value() if secret else None
+    def warm_up(self) -> None:
+        """
+        Warm up the component by initializing the settings and storage.
 
-        self._session = get_aws_session(
-            aws_access_key_id=resolve_secret(aws_access_key_id),
-            aws_secret_access_key=resolve_secret(aws_secret_access_key),
-            aws_session_token=resolve_secret(aws_session_token),
-            aws_region_name=resolve_secret(aws_region_name),
-            aws_profile_name=resolve_secret(aws_profile_name),
+        :raises ValueError: If the environment variable naming the S3 bucket (`s3_bucket_name_env`, by default
+            `S3_DOWNLOADER_BUCKET`) is not set.
+        :raises S3ConfigurationError: If the S3 client cannot be created.
+        """
+        if self._storage is not None:
+            return
+
+        def resolve_secret(secret: Secret | str | None) -> str | None:
+            return secret.resolve_value() if isinstance(secret, Secret) else secret
+
+        session = get_aws_session(
+            aws_access_key_id=resolve_secret(self.aws_access_key_id),
+            aws_secret_access_key=resolve_secret(self.aws_secret_access_key),
+            aws_session_token=resolve_secret(self.aws_session_token),
+            aws_region_name=resolve_secret(self.aws_region_name),
+            aws_profile_name=resolve_secret(self.aws_profile_name),
         )
-        self._config = Config(
+        config = Config(
             user_agent_extra="x-client-framework:haystack", **(self.boto3_config if self.boto3_config else {})
         )
+        self.file_root_path.mkdir(parents=True, exist_ok=True)
+        self._storage = S3Storage.from_env(session=session, config=config, s3_bucket_name_env=self.s3_bucket_name_env)
 
-    def warm_up(self) -> None:
-        """Warm up the component by initializing the settings and storage."""
-        if self._storage is None:
-            self.file_root_path.mkdir(parents=True, exist_ok=True)
-            self._storage = S3Storage.from_env(
-                session=self._session, config=self._config, s3_bucket_name_env=self.s3_bucket_name_env
-            )
+    def close(self) -> None:
+        """Close the owned S3 client."""
+        if self._storage is not None:
+            self._storage.close()
+            self._storage = None
 
     @component.output_types(documents=list[Document])
     def run(
@@ -147,13 +162,12 @@ class S3Downloader:
         Return enriched `Document`s with the path of the downloaded file.
         :param documents: Document containing the name of the file to download in the meta field.
         :returns: A dictionary with:
-            - `documents`: The downloaded `Document`s; each has `meta['file_path']`.
+            - `documents`: The downloaded `Document`s; each has `meta['file_path']`. Documents whose file name
+              is missing, or resolves outside of `file_root_path`, are logged and skipped.
         :raises S3Error: If a download attempt fails or the file does not exist in the S3 bucket.
-        :raises ValueError: If the path where files will be downloaded is not set.
         """
 
-        if self._storage is None:
-            self.warm_up()
+        self.warm_up()
 
         filtered_documents = self._filter_documents_by_extensions(documents) if self.file_extensions else documents
 
@@ -180,14 +194,42 @@ class S3Downloader:
             if Path(doc.meta.get(self.file_name_meta_key, "")).suffix.lower() in self.file_extensions
         ]
 
+    def _resolve_local_file_path(self, file_name: str) -> Path:
+        """
+        Resolve the local download path for a file name and ensure it stays inside `file_root_path`.
+
+        The file name comes from document metadata, which may be influenced by untrusted input. Without this
+        check an absolute file name or one containing `..` segments would escape the download directory, and
+        the S3 object would be written anywhere the process can write.
+
+        :param file_name: The file name taken from the document metadata.
+        :returns: The resolved local path, guaranteed to be inside the resolved `file_root_path`.
+        :raises ValueError: If the resolved path is outside `file_root_path` or is the root directory itself.
+        """
+        root = self.file_root_path.resolve()
+        candidate = (root / file_name).resolve()
+
+        if not candidate.is_relative_to(root):
+            msg = (
+                f"Refusing to download to a path outside of 'file_root_path': {file_name!r}. "
+                f"Resolved path: '{candidate}', configured root: '{root}'."
+            )
+            raise ValueError(msg)
+        if candidate == root:
+            msg = f"Refusing to overwrite the download root directory with the file {file_name!r}."
+            raise ValueError(msg)
+
+        return candidate
+
     def _download_file(self, document: Document) -> Document | None:
         """
         Download a single file from AWS S3 Bucket to local filesystem.
 
         :param document: `Document` with the name of the file to download in the meta field.
         :returns:
-            The same `Document` with `meta` containing the `file_path` of the
-            downloaded file.
+            The same `Document` with `meta` containing the `file_path` of the downloaded file, or `None` if the
+            document has no file name in its metadata or its file name resolves outside of `file_root_path`.
+            Both cases are logged and skipped rather than raised.
         :raises S3Error: If the download or head request fails or the file does not exist in the S3 bucket.
         """
 
@@ -198,16 +240,25 @@ class S3Downloader:
             )
             return None
 
-        file_path = self.file_root_path / Path(file_name)
+        try:
+            file_path = self._resolve_local_file_path(str(file_name))
+        except ValueError as error:
+            logger.warning("Skipping download of {file_name}: {error}", file_name=repr(file_name), error=str(error))
+            return None
 
-        if file_path.is_file():
-            # set access and modification time to now without redownloading the file
-            file_path.touch()
-
-        else:
+        # if the file exists, avoid downloading it and just update the timestamp
+        try:
+            os.utime(file_path, None)
+        except FileNotFoundError:
             s3_key = self.s3_key_generation_function(document) if self.s3_key_generation_function else file_name
-            # we know that _storage is not None after warm_up() is called, but mypy does not know that
-            self._storage.download(key=s3_key, local_file_path=file_path)  # type: ignore[union-attr]
+            # download to a temp path to prevent other downloaders running concurrently to see a partially-written file
+            tmp_path = file_path.with_name(f"{file_path.name}.tmp-{uuid.uuid4().hex}")
+            try:
+                # we know that _storage is not None after warm_up() is called, but mypy does not know that
+                self._storage.download(key=s3_key, local_file_path=tmp_path)  # type: ignore[union-attr]
+                os.replace(tmp_path, file_path)
+            finally:
+                tmp_path.unlink(missing_ok=True)
 
         document.meta["file_path"] = str(file_path)
         return document
@@ -248,6 +299,7 @@ class S3Downloader:
             aws_session_token=self.aws_session_token,
             aws_region_name=self.aws_region_name,
             aws_profile_name=self.aws_profile_name,
+            boto3_config=self.boto3_config,
             file_root_path=str(self.file_root_path),
             max_workers=self.max_workers,
             max_cache_size=self.max_cache_size,

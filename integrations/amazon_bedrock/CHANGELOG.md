@@ -1,5 +1,222 @@
 # Changelog
 
+## [integrations/amazon_bedrock-v8.4.0] - 2026-10-14
+
+### 🚀 Features
+
+- *(amazon-bedrock)* Support text and image embeddings in Cohere v4 (#4100)
+
+### 🧹 Chores
+
+- Add missing amazon_bedrock 8.3.1 changelog entry (#4095)
+
+## [integrations/amazon_bedrock-v8.3.1] - 2026-10-12
+
+### 🐛 Bug Fixes
+
+- Forward cacheDetails in Amazon Bedrock chat generator usage (#4090)
+
+## [integrations/amazon_bedrock-v8.3.0] - 2026-10-01
+
+### 🚜 Refactor
+
+- Generalize flattened generation_kwargs for tool_choice/thinking/output_config (#4028)
+
+## [integrations/amazon_bedrock-v8.2.0] - 2026-09-24
+
+### 🚀 Features
+
+- Add thinking_display flattened generation_kwarg to Anthropic and Bedrock chat generators (#3993)
+
+
+## [integrations/amazon_bedrock-v8.1.1] - 2026-09-23
+
+### 🐛 Bug Fixes
+
+- Serialize missing init params in `to_dict` (transformers, amazon_bedrock) (#3873)
+
+
+## [integrations/amazon_bedrock-v8.1.0] - 2026-09-04
+
+### 🚀 Features
+
+- Add AmazonBedrockTokenCounter to amazon-bedrock integration (#3865)
+
+
+## [integrations/amazon_bedrock-v8.0.0] - 2026-09-03
+
+### 🚀 Features
+
+- [**breaking**] Amazon Bedrock - lifecycle handling (#3900)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+### 🧹 Chores
+
+- [**breaking**] Remove deprecated `AmazonBedrockGenerator` (use `AmazonBedrockChatGenerator` instead) (#3890)
+
+
+## [integrations/amazon_bedrock-v7.1.0] - 2026-08-31
+
+### 🧹 Chores
+
+- AmazonBedrockChatGenerator - support sync streaming callbacks in async contexts (#3831)
+
+
+## [integrations/amazon_bedrock-v7.0.0] - 2026-08-26
+
+### 🌀 Miscellaneous
+
+- !fix: `BedrockKnowledgeBaseRetriever` → `AmazonBedrockKnowledgeBaseRetriever` (#3859)
+
+## [integrations/amazon_bedrock-v6.18.0] - 2026-08-26
+
+### 🐛 Bug Fixes
+
+- `AmazonBedrockRetriever` was missing some last details (#3842)
+
+
+## [integrations/amazon_bedrock-v6.17.0] - 2026-08-21
+
+### 🚀 Features
+
+- Feat (bedrock): add support for file content in a tool result (#3826)
+
+
+## [integrations/amazon_bedrock-v6.16.2] - 2026-08-18
+
+### 🐛 Bug Fixes
+
+- Standardize license files (#3771)
+- Confine S3Downloader downloads to file_root_path (#3812)
+
+### 🧹 Chores
+
+- Re-standardize READMEs (#3768)
+- Clarify how generation_kwargs passed in run are handled (#3805)
+
+
+## [integrations/amazon_bedrock-v6.16.1] - 2026-08-14
+
+### 🐛 Bug Fixes
+
+- ValidationException on invalid bedrock tool result json (#3766)
+
+
+## [integrations/amazon_bedrock-v6.16.0] - 2026-08-11
+
+### 🚀 Features
+
+- Add Bedrock Knowledge Base retriever to amazon-bedrock integration (#3582)
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- AmazonBedRockRanker reordered the top_k fallback to happen after validation (#3748)
+
+### 🧪 Testing
+
+- Fix cohere, amazon_bedrock, mirage, and ollama tests under Haystack 3.0 (#3566)
+
+
+## [integrations/amazon_bedrock-v6.15.1] - 2026-07-07
+
+### 🐛 Bug Fixes
+
+- Deserialization of flattened system_cachepoint_config in AmazonBedrockChatGenerator (#3548)
+
+### 🧪 Testing
+
+- Guard ToolInvoker imports so chat-generator tests run under Haystack 3.0 (#3535)
+
+
+## [integrations/amazon_bedrock-v6.15.0] - 2026-07-02
+
+### 🚀 Features
+
+- Support disabled thinking for Claude Sonnet 5 with flattened generation kwargs (#3526)
+
+### 🧹 Chores
+
+- Add none option to adaptive_thinking_effort (#3527)
+
+
+## [integrations/amazon_bedrock-v6.14.0] - 2026-06-25
+
+### 🚀 Features
+
+- Add system_cachepoint_config to AmazonBedrockChatGenerator (#3497)
+
+
+## [integrations/amazon_bedrock-v6.13.0] - 2026-06-24
+
+### 🐛 Bug Fixes
+
+- *(amazon-bedrock)* Forward dimensions/normalize for Titan V2 embedders (#3477)
+
+
+## [integrations/amazon_bedrock-v6.12.0] - 2026-06-12
+
+### 🚀 Features
+
+- Support str in addition to Secret for aws_region_name (#3423)
+
+
+## [integrations/amazon_bedrock-v6.11.0] - 2026-06-05
+
+### 🚀 Features
+
+- Amazon Bedrock - accept str as ChatGenerator input; deprecate generator; migrate generator example to chat generator (#3398)
+
+
+## [integrations/amazon_bedrock-v6.10.2] - 2026-05-19
+
+### 🐛 Bug Fixes
+
+- Type error during streaming of AmazonBedrockChatGenerator (#3332)
+
+
+## [integrations/amazon_bedrock-v6.10.1] - 2026-05-19
+
+### 🐛 Bug Fixes
+
+- S3Downloader - improve concurrent behavior (#3327)
+
+
+## [integrations/amazon_bedrock-v6.10.0] - 2026-05-12
+
+### 🚀 Features
+
+- Support adaptive_thinking_effort flat param for Claude (#3297)
+
+
+## [integrations/amazon_bedrock-v6.9.0] - 2026-05-11
+
+### 🐛 Bug Fixes
+
+- Normalize token usage conversion in AmazonBedrockGenerator (#3247)
+
+
+## [integrations/amazon_bedrock-v6.8.2] - 2026-05-06
+
+### 🐛 Bug Fixes
+
+- *(amazon-bedrock)* Use dataclasses.replace instead of mutating StreamingChunk (#3273)
+
+
+## [integrations/amazon_bedrock-v6.8.1] - 2026-04-22
+
+### 🐛 Bug Fixes
+
+- *(amazon-bedrock)* Prevent double-wrapping of tools_cachepoint_config in _format_tools (#3199)
+
+### 🧪 Testing
+
+- Bedrock - increase unit tests coverage (#3165)
+
+
 ## [integrations/amazon_bedrock-v6.8.0] - 2026-04-09
 
 ### 🚀 Features
@@ -134,12 +351,8 @@
 
 ### 🚀 Features
 
-- `AmazonBedrockChatGenerator` update tools param to ToolsType (#2415)
 - Cohere Embed v4 support in Bedrock (#2612)
 
-### 📚 Documentation
-
-- Add pydoc configurations for Docusaurus (#2411)
 
 ### ⚙️ CI
 
@@ -153,6 +366,16 @@
 
 - Adopt PEP 585 type hinting (part 2) (#2508)
 
+## [integrations/amazon_bedrock-v5.2.0] - 2025-10-22
+
+### 🚀 Features
+
+- `AmazonBedrockChatGenerator` update tools param to ToolsType (#2415)
+
+### 📚 Documentation
+
+- Add pydoc configurations for Docusaurus (#2411)
+
 ## [integrations/amazon_bedrock-v5.1.0] - 2025-09-29
 
 ### 🚀 Features
@@ -164,7 +387,6 @@
 
 ### 🚀 Features
 
-- Support AWS Bedrock Guardrails in `AmazonBedrockChatGenerator` (#2284)
 - Add a new `S3Downloader` component (#2192)
 
 ### 📚 Documentation
@@ -172,8 +394,17 @@
 
 ### 🧹 Chores
 
-- Bedrock - remove unused `stop_words` init parameter (#2275)
 - [**breaking**] Remove deprecated `BedrockRanker` (use `AmazonBedrockRanker` instead) (#2287)
+
+## [integrations/amazon_bedrock-v4.1.0] - 2025-09-19
+
+### 🚀 Features
+
+- Support AWS Bedrock Guardrails in `AmazonBedrockChatGenerator` (#2284)
+
+### 🧹 Chores
+
+- Bedrock - remove unused `stop_words` init parameter (#2275)
 
 ### 🌀 Miscellaneous
 
@@ -281,18 +512,21 @@
 
 - Fix BedrockChatGenerator to be able to handle multiple tool calls from one response (#1711)
 
+
+### 🌀 Miscellaneous
+
+- Chore: Update docstrings, add more types, remove haystack 2.12 check and pin >=2.13.1 (#1706)
+
+## [integrations/amazon_bedrock-v3.5.2] - 2025-05-05
+
 ### 🚜 Refactor
 
 - Refactor tests of AmazonBedrock Integration (#1671)
-
 
 ### 🧹 Chores
 
 - Update ChatGenerators with `deserialize_tools_or_toolset_inplace` (#1623)
 
-### 🌀 Miscellaneous
-
-- Chore: Update docstrings, add more types, remove haystack 2.12 check and pin >=2.13.1 (#1706)
 
 ## [integrations/amazon_bedrock-v3.5.0] - 2025-04-03
 
@@ -468,12 +702,7 @@
 
 ### 🐛 Bug Fixes
 
-- *(Bedrock)* Allow tools kwargs for AWS Bedrock Claude model (#976)
 - Chat roles for model responses in chat generators (#1030)
-
-### 🚜 Refactor
-
-- Remove usage of deprecated `ChatMessage.to_openai_format` (#1007)
 
 ### 🧹 Chores
 
@@ -482,6 +711,17 @@
 ### 🌀 Miscellaneous
 
 - Modify regex to allow cross-region inference in bedrock  (#1120)
+
+## [integrations/amazon_bedrock-v1.0.2] - 2024-08-21
+
+### 🐛 Bug Fixes
+
+- *(Bedrock)* Allow tools kwargs for AWS Bedrock Claude model (#976)
+
+### 🚜 Refactor
+
+- Remove usage of deprecated `ChatMessage.to_openai_format` (#1007)
+
 
 ## [integrations/amazon_bedrock-v1.0.1] - 2024-08-19
 
@@ -518,10 +758,22 @@
 
 ## [integrations/amazon_bedrock-v0.9.3] - 2024-07-17
 
+### 🌀 Miscellaneous
+
+- Add meta deprecration warning (#910)
+
+## [integrations/amazon_bedrock-v0.9.2] - 2024-07-03
+
+### 🚀 Features
+
+- Made truncation optional for BedrockGenerator (#833)
+
+
+## [integrations/amazon_bedrock-v0.9.1] - 2024-06-28
+
 ### 🚀 Features
 
 - Use non-gated tokenizer as fallback for mistral in AmazonBedrockChatGenerator (#843)
-- Made truncation optional for BedrockGenerator (#833)
 
 ### ⚙️ CI
 
@@ -534,7 +786,6 @@
 ### 🌀 Miscellaneous
 
 - Ci: install `pytest-rerunfailures` where needed; add retry config to `test-cov` script (#845)
-- Add meta deprecration warning (#910)
 
 ## [integrations/amazon_bedrock-v0.9.0] - 2024-06-14
 
@@ -596,10 +847,6 @@
 
 ## [integrations/amazon_bedrock-v0.5.1] - 2024-02-22
 
-### 🚀 Features
-
-- Add Amazon Bedrock chat model support (#333)
-
 ### 🐛 Bug Fixes
 
 - Fix order of API docs (#447)
@@ -615,20 +862,34 @@
 
 ### 🌀 Miscellaneous
 
-- Amazon bedrock: generate api docs (#326)
 - Adopt Secret to Amazon Bedrock (#416)
 - Bedrock - remove `supports` method (#456)
 - Bedrock refactoring (#455)
 - Bedrock Text Embedder (#466)
 - Bedrock Document Embedder (#468)
 
+## [integrations/amazon_bedrock-v0.4.0] - 2024-02-08
+
+### 🚀 Features
+
+- Add Amazon Bedrock chat model support (#333)
+
+### 🌀 Miscellaneous
+
+- Amazon bedrock: generate api docs (#326)
+
 ## [integrations/amazon_bedrock-v0.3.0] - 2024-01-30
 
 ### 🧹 Chores
 
-- [**breaking**] Rename `model_name` to `model` in `AmazonBedrockGenerator` (#220)
 - Amazon Bedrock subproject refactoring (#293)
 - Adjust amazon bedrock helper classes names (#297)
+
+## [integrations/amazon_bedrock-v0.2.0] - 2024-01-17
+
+### 🧹 Chores
+
+- [**breaking**] Rename `model_name` to `model` in `AmazonBedrockGenerator` (#220)
 
 ## [integrations/amazon_bedrock-v0.1.0] - 2024-01-03
 

@@ -1,5 +1,56 @@
 # Changelog
 
+## [integrations/docling-v2.0.0] - 2026-07-31
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- *(docling)* [**breaking**] Store binary_hash as a string to avoid 64-bit overflow (#3699)
+
+
+## [integrations/docling-v1.3.0] - 2026-07-16
+
+### 🧹 Chores
+
+- Docling - drop the haystack-ai <3.0.0 cap to allow Haystack 3.0 (#3603)
+
+
+## [integrations/docling-v1.2.0] - 2026-07-08
+
+### 🐛 Bug Fixes
+
+- Docling stop relying on `haystack.utils.base_serialization` helpers (#3562)
+
+### 🧪 Testing
+
+- (docling) update unit test to not download model (#3460)
+
+
+## [integrations/docling-v1.1.0] - 2026-06-16
+
+### 🚀 Features
+
+- (docling) move construction of default hybrid chunker to `DoclingConverter.warm_up` (#3448)
+
+
+## [integrations/docling-v1.0.0] - 2026-05-11
+
+### 🐛 Bug Fixes
+
+- *(docling)* [**breaking**] Change default export type to MARKDOWN and add page_number to chunk metadata (#3276)
+
+
+## [integrations/docling-v0.4.0] - 2026-05-04
+
+### 🚀 Features
+
+- Add serialization/deserialization to DoclingConverter  (#3267)
+
+### 🧪 Testing
+
+- Docling - add a few unit tests (#3212)
+
+
 ## [integrations/docling-v0.3.0] - 2026-04-10
 
 ### 🚀 Features

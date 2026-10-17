@@ -1,15 +1,16 @@
 import base64
+import dataclasses
+import inspect
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from botocore.eventstream import EventStream
 from haystack import logging
 from haystack.components.generators.utils import _convert_streaming_chunks_to_chat_message
 from haystack.dataclasses import (
-    AsyncStreamingCallbackT,
     ChatMessage,
     ChatRole,
     ComponentInfo,
@@ -17,6 +18,7 @@ from haystack.dataclasses import (
     FinishReason,
     ImageContent,
     ReasoningContent,
+    StreamingCallbackT,
     StreamingChunk,
     SyncStreamingCallbackT,
     TextContent,
@@ -93,7 +95,7 @@ def _format_tools(
         )
 
     if tools_cachepoint_config:
-        tool_specs.append({"cachePoint": tools_cachepoint_config})
+        tool_specs.append(tools_cachepoint_config)
 
     return {"tools": tool_specs}
 
@@ -196,10 +198,16 @@ def _format_tool_result_message(tool_call_result_message: ChatMessage) -> dict[s
     # Assuming tool call result messages will only contain tool results
     tool_results = []
     for tool_call_result in tool_call_result_message.tool_call_results:
+        content: list[dict[str, Any]]
         if isinstance(tool_call_result.result, str):
             try:
                 json_result = json.loads(tool_call_result.result)
-                content = [{"json": json_result}]
+                # Bedrock's toolResult.content[].json field requires a JSON object, not an arbitrary JSON value
+                # (e.g. a bare number, string, boolean, null or array is rejected with a ValidationException).
+                if isinstance(json_result, dict):
+                    content = [{"json": json_result}]
+                else:
+                    content = [{"text": tool_call_result.result}]
             except json.JSONDecodeError:
                 content = [{"text": tool_call_result.result}]
         elif isinstance(tool_call_result.result, list):
@@ -208,7 +216,15 @@ def _format_tool_result_message(tool_call_result_message: ChatMessage) -> dict[s
                 if isinstance(item, TextContent):
                     content.append({"text": item.text})
                 elif isinstance(item, ImageContent):
-                    content.append(_convert_image_content_to_bedrock_format(item))
+                    content.append(_convert_image_content_to_bedrock_format(image_content=item))
+                elif isinstance(item, FileContent):
+                    content.append(_convert_file_content_to_bedrock_format(file_content=item))
+                else:
+                    err_msg = (
+                        "Unsupported content type in tool call result list. "
+                        "Only TextContent, ImageContent, and FileContent are supported."
+                    )
+                    raise ValueError(err_msg)
         else:
             err_msg = "Unsupported content type in tool call result"
             raise ValueError(err_msg)
@@ -385,7 +401,9 @@ def _validate_and_format_cache_point(cache_point: dict[str, str] | None) -> dict
     return {"cachePoint": cache_point}
 
 
-def _format_messages(messages: list[ChatMessage]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _format_messages(
+    messages: list[ChatMessage], system_cachepoint_config: dict[str, dict[str, str]] | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """
     Format a list of Haystack ChatMessages to the format expected by Bedrock API.
 
@@ -393,6 +411,7 @@ def _format_messages(messages: list[ChatMessage]) -> tuple[list[dict[str, Any]],
     and tool results.
 
     :param messages: List of ChatMessage objects to format for Bedrock API.
+    :param system_cachepoint_config: Optional cache point configuration for system messages.
     :returns: Tuple containing (system_prompts, non_system_messages) in Bedrock format,
               where system_prompts is a list of system message dictionaries and
               non_system_messages is a list of properly formatted message dictionaries.
@@ -408,6 +427,8 @@ def _format_messages(messages: list[ChatMessage]) -> tuple[list[dict[str, Any]],
             system_prompts.append({"text": msg.text})
             if cache_point:
                 system_prompts.append(cache_point)
+            elif system_cachepoint_config:
+                system_prompts.append(system_cachepoint_config)
             continue
 
         if msg.tool_calls:
@@ -457,7 +478,7 @@ def _parse_completion_response(response_body: dict[str, Any], model: str) -> lis
                     "total_tokens": response_body.get("usage", {}).get("totalTokens", 0),
                     "cache_read_input_tokens": response_body.get("usage", {}).get("cacheReadInputTokens", 0),
                     "cache_write_input_tokens": response_body.get("usage", {}).get("cacheWriteInputTokens", 0),
-                    "cache_details": response_body.get("usage", {}).get("CacheDetails", {}),
+                    "cache_details": response_body.get("usage", {}).get("cacheDetails", []),
                 },
             }
             # guardrail trace
@@ -532,7 +553,7 @@ def _convert_event_to_streaming_chunk(
 
     # Initialize an empty StreamingChunk to return if no relevant event is found
     # (e.g. for messageStart and contentBlockStop)
-    base_meta = {"model": model, "received_at": datetime.now(timezone.utc).isoformat()}
+    base_meta = {"model": model, "received_at": datetime.now(UTC).isoformat()}
     streaming_chunk = StreamingChunk(content="", meta=base_meta)
 
     if "contentBlockStart" in event:
@@ -568,13 +589,16 @@ def _convert_event_to_streaming_chunk(
         # This only occurs when accumulating the arguments for a toolUse
         # The content_block for this tool should already exist at this point
         elif "toolUse" in delta:
+            tool_use_input = delta["toolUse"].get("input", "")
+            # boto3 might return int for input
+            arguments = str(tool_use_input) if tool_use_input is not None else None
             streaming_chunk = StreamingChunk(
                 content="",
                 index=block_idx,
                 tool_calls=[
                     ToolCallDelta(
                         index=block_idx,
-                        arguments=delta["toolUse"].get("input", ""),
+                        arguments=arguments,
                     )
                 ],
                 meta=base_meta,
@@ -591,10 +615,10 @@ def _convert_event_to_streaming_chunk(
             streaming_chunk = StreamingChunk(
                 content="",
                 index=block_idx,
-                reasoning=ReasoningContent(
-                    reasoning_text=reasoning_text,
-                    extra=extra,
-                ),
+                # redactedContent-only deltas have no text or signature, skip them like the non-streaming path
+                reasoning=ReasoningContent(reasoning_text=reasoning_text, extra=extra)
+                if reasoning_text or extra
+                else None,
                 meta=base_meta,
             )
 
@@ -618,7 +642,7 @@ def _convert_event_to_streaming_chunk(
                 "total_tokens": usage.get("totalTokens", 0),
                 "cache_read_input_tokens": usage.get("cacheReadInputTokens", 0),
                 "cache_write_input_tokens": usage.get("cacheWriteInputTokens", 0),
-                "cache_details": usage.get("cacheDetails", {}),
+                "cache_details": usage.get("cacheDetails", []),
             }
         if "trace" in event_meta:
             chunk_meta["trace"] = event_meta["trace"]
@@ -627,7 +651,7 @@ def _convert_event_to_streaming_chunk(
         if len(chunk_meta) > len(base_meta):
             streaming_chunk = StreamingChunk(content="", meta=chunk_meta)
 
-    streaming_chunk.component_info = component_info
+    streaming_chunk = dataclasses.replace(streaming_chunk, component_info=component_info)
 
     return streaming_chunk
 
@@ -684,7 +708,7 @@ def _convert_chunks_to_messages(chunks: list[StreamingChunk]) -> list[ChatMessag
 
 async def _parse_streaming_response_async(
     response_stream: EventStream,
-    streaming_callback: AsyncStreamingCallbackT,
+    streaming_callback: StreamingCallbackT,
     model: str,
     component_info: ComponentInfo,
 ) -> list[ChatMessage]:
@@ -705,7 +729,10 @@ async def _parse_streaming_response_async(
         if content_block_idx is not None and content_block_idx not in content_block_idxs:
             streaming_chunk.start = True
             content_block_idxs.add(content_block_idx)
-        await streaming_callback(streaming_chunk)
+        # sync callbacks are allowed in async contexts with Haystack >= 3.0, so only await async ones
+        callback_result = streaming_callback(streaming_chunk)
+        if inspect.isawaitable(callback_result):
+            await callback_result
         chunks.append(streaming_chunk)
 
     replies = _convert_chunks_to_messages(chunks)

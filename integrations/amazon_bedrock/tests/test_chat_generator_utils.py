@@ -17,14 +17,17 @@ from haystack.dataclasses import (
 from haystack.tools import Tool
 
 from haystack_integrations.components.generators.amazon_bedrock.chat.utils import (
+    _convert_event_to_streaming_chunk,
     _convert_file_content_to_bedrock_format,
     _convert_streaming_chunks_to_chat_message,
     _format_messages,
     _format_textual_assistant_message,
+    _format_tool_result_message,
     _format_tools,
     _format_user_message,
     _parse_completion_response,
     _parse_streaming_response,
+    _parse_streaming_response_async,
     _validate_and_format_cache_point,
     _validate_guardrail_config,
 )
@@ -67,7 +70,7 @@ def tools():
 
 class TestAmazonBedrockChatGeneratorUtils:
     def test_format_tools(self, tools):
-        formatted_tool = _format_tools(tools, tools_cachepoint_config={"type": "default"})
+        formatted_tool = _format_tools(tools, tools_cachepoint_config={"cachePoint": {"type": "default"}})
         assert formatted_tool == {
             "tools": [
                 {
@@ -102,6 +105,19 @@ class TestAmazonBedrockChatGeneratorUtils:
                 {"cachePoint": {"type": "default"}},
             ],
         }
+
+    def test_format_tools_does_not_double_wrap_cachepoint(self, tools):
+        # Regression test for https://github.com/deepset-ai/haystack-core-integrations/issues/3181
+        # __init__ pre-formats tools_cachepoint_config via _validate_and_format_cache_point,
+        # so _format_tools must append it as-is without an extra cachePoint wrapper.
+
+        formatted_config = _validate_and_format_cache_point({"type": "default"})
+        assert formatted_config == {"cachePoint": {"type": "default"}}
+
+        result = _format_tools(tools, tools_cachepoint_config=formatted_config)
+        cache_entries = [e for e in result["tools"] if "cachePoint" in e]
+        assert len(cache_entries) == 1
+        assert cache_entries[0] == {"cachePoint": {"type": "default"}}
 
     def test_convert_file_content_to_bedrock_format_no_mime_type(self):
         file_content = FileContent(
@@ -233,6 +249,47 @@ class TestAmazonBedrockChatGeneratorUtils:
             },
         ]
 
+    def test_format_tool_result_message_json_object(self):
+        # a tool result string that parses as a JSON object is sent as a Bedrock "json" content block
+        message = ChatMessage.from_tool(
+            tool_result='{"city": "Paris", "temperature": 25}',
+            origin=ToolCall(id="123", tool_name="weather", arguments={"city": "Paris"}),
+        )
+        formatted_message = _format_tool_result_message(message)
+        assert formatted_message == {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": "123",
+                        "content": [{"json": {"city": "Paris", "temperature": 25}}],
+                    }
+                }
+            ],
+        }
+
+    @pytest.mark.parametrize("tool_result", ["42", "true", "null", "[1, 2, 3]"])
+    def test_format_tool_result_message_non_object_json_falls_back_to_text(self, tool_result):
+        # Bedrock's toolResult.content[].json field requires a JSON object; a string that parses to a
+        # non-object JSON value (number, bool, null, array) must fall back to a "text" content block,
+        # otherwise Bedrock rejects the request with a ValidationException.
+        message = ChatMessage.from_tool(
+            tool_result=tool_result,
+            origin=ToolCall(id="123", tool_name="weather", arguments={"city": "Paris"}),
+        )
+        formatted_message = _format_tool_result_message(message)
+        assert formatted_message == {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": "123",
+                        "content": [{"text": tool_result}],
+                    }
+                }
+            ],
+        }
+
     def test_format_messages_with_cache_point(self):
         meta = {"cachePoint": {"type": "default"}}
 
@@ -298,6 +355,37 @@ class TestAmazonBedrockChatGeneratorUtils:
                     {"cachePoint": {"type": "default"}},
                 ],
             },
+        ]
+
+    def test_format_messages_with_system_cachepoint_config(self):
+        system_cachepoint_config = {"cachePoint": {"type": "default"}}
+        messages = [
+            ChatMessage.from_system("You are a helpful assistant."),
+            ChatMessage.from_user("Hello"),
+        ]
+        formatted_system_prompts, formatted_messages = _format_messages(
+            messages, system_cachepoint_config=system_cachepoint_config
+        )
+        assert formatted_system_prompts == [
+            {"text": "You are a helpful assistant."},
+            {"cachePoint": {"type": "default"}},
+        ]
+        assert formatted_messages == [
+            {"role": "user", "content": [{"text": "Hello"}]},
+        ]
+
+    def test_format_messages_system_cachepoint_config_does_not_double_append_when_per_message_cache_point_set(self):
+        system_cachepoint_config = {"cachePoint": {"type": "default"}}
+        # per-message cache point (raw, before _validate_and_format_cache_point wrapping)
+        messages = [
+            ChatMessage.from_system("You are a helpful assistant.", meta={"cachePoint": {"type": "default"}}),
+            ChatMessage.from_user("Hello"),
+        ]
+        formatted_system_prompts, _ = _format_messages(messages, system_cachepoint_config=system_cachepoint_config)
+        # per-message cache point takes priority; system_cachepoint_config is not also appended
+        assert formatted_system_prompts == [
+            {"text": "You are a helpful assistant."},
+            {"cachePoint": {"type": "default"}},
         ]
 
     def test_format_messages_tool_result_with_image(self):
@@ -372,6 +460,56 @@ class TestAmazonBedrockChatGeneratorUtils:
                 "content": [{"text": "Beautiful landscape with mountains"}],
             },
         ]
+
+    def test_format_tool_result_message_with_file_content(self):
+        file_content = FileContent(
+            base64_data=base64.b64encode(b"This is a test document."),
+            mime_type="application/pdf",
+            filename="test document.pdf",
+            validation=False,
+        )
+        message = ChatMessage.from_tool(
+            tool_result=[TextContent("Here's the retrieved document"), file_content],
+            origin=ToolCall(id="123", tool_name="file_retriever", arguments={"path": "test document.pdf"}),
+        )
+
+        formatted_message = _format_tool_result_message(message)
+
+        assert formatted_message == {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": "123",
+                        "content": [
+                            {"text": "Here's the retrieved document"},
+                            {
+                                "document": {
+                                    "format": "pdf",
+                                    "source": {"bytes": b"This is a test document."},
+                                    "name": "test document",
+                                }
+                            },
+                        ],
+                    }
+                }
+            ],
+        }
+
+    def test_format_tool_result_message_with_unsupported_list_item_raises(self):
+        message = ChatMessage.from_tool(
+            tool_result=[TextContent("This is supported"), 256],
+            origin=ToolCall(id="123", tool_name="test_tool", arguments={}),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"Unsupported content type in tool call result list. "
+                "Only TextContent, ImageContent, and FileContent are supported."
+            ),
+        ):
+            _format_tool_result_message(message)
 
     def test_format_message_thinking(self):
         assistant_message = ChatMessage.from_assistant(
@@ -615,7 +753,7 @@ class TestAmazonBedrockChatGeneratorUtils:
             },
         ]
 
-    def test_extract_replies_from_text_response(self, mock_boto3_session):
+    def test_extract_replies_from_text_response(self):
         model = "global.anthropic.claude-sonnet-4-6"
         text_response = {
             "output": {
@@ -630,8 +768,8 @@ class TestAmazonBedrockChatGeneratorUtils:
                 "outputTokens": 20,
                 "totalTokens": 30,
                 "cacheReadInputTokens": 1000,
-                "cacheWriteInputTokens": 0,
-                "cacheDetails": {},
+                "cacheWriteInputTokens": 1500,
+                "cacheDetails": [{"ttl": "5m", "inputTokens": 500}, {"ttl": "1h", "inputTokens": 1000}],
             },
         }
 
@@ -647,13 +785,13 @@ class TestAmazonBedrockChatGeneratorUtils:
                 "completion_tokens": 20,
                 "total_tokens": 30,
                 "cache_read_input_tokens": 1000,
-                "cache_write_input_tokens": 0,
-                "cache_details": {},
+                "cache_write_input_tokens": 1500,
+                "cache_details": [{"ttl": "5m", "inputTokens": 500}, {"ttl": "1h", "inputTokens": 1000}],
             },
             "index": 0,
         }
 
-    def test_extract_replies_from_tool_response(self, mock_boto3_session):
+    def test_extract_replies_from_tool_response(self):
         model = "global.anthropic.claude-sonnet-4-6"
         tool_response = {
             "output": {
@@ -690,12 +828,12 @@ class TestAmazonBedrockChatGeneratorUtils:
                 "total_tokens": 40,
                 "cache_read_input_tokens": 0,
                 "cache_write_input_tokens": 0,
-                "cache_details": {},
+                "cache_details": [],
             },
             "index": 0,
         }
 
-    def test_extract_replies_from_text_mixed_response(self, mock_boto3_session):
+    def test_extract_replies_from_text_mixed_response(self):
         model = "global.anthropic.claude-sonnet-4-6"
         mixed_response = {
             "output": {
@@ -734,12 +872,12 @@ class TestAmazonBedrockChatGeneratorUtils:
                 "total_tokens": 60,
                 "cache_read_input_tokens": 0,
                 "cache_write_input_tokens": 0,
-                "cache_details": {},
+                "cache_details": [],
             },
             "index": 0,
         }
 
-    def test_extract_replies_from_multi_tool_response(self, mock_boto3_session):
+    def test_extract_replies_from_multi_tool_response(self):
         model = "global.anthropic.claude-sonnet-4-6"
         response_body = {
             "ResponseMetadata": {
@@ -813,13 +951,13 @@ class TestAmazonBedrockChatGeneratorUtils:
                     "total_tokens": 500,
                     "cache_read_input_tokens": 0,
                     "cache_write_input_tokens": 0,
-                    "cache_details": {},
+                    "cache_details": [],
                 },
             },
         )
         assert replies[0] == expected_message
 
-    def test_extract_replies_from_one_tool_response_with_thinking(self, mock_boto3_session):
+    def test_extract_replies_from_one_tool_response_with_thinking(self):
         model = "arn:aws:bedrock:us-east-1::inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0"
         response_body = {
             "ResponseMetadata": {
@@ -868,7 +1006,7 @@ class TestAmazonBedrockChatGeneratorUtils:
                 "totalTokens": 558,
                 "cacheReadInputTokens": 0,
                 "cacheWriteInputTokens": 0,
-                "cacheDetails": {},
+                "cacheDetails": [],
             },
             "metrics": {"latencyMs": 4811},
         }
@@ -902,13 +1040,13 @@ class TestAmazonBedrockChatGeneratorUtils:
                     "total_tokens": 558,
                     "cache_read_input_tokens": 0,
                     "cache_write_input_tokens": 0,
-                    "cache_details": {},
+                    "cache_details": [],
                 },
             },
         )
         assert replies[0] == expected_message
 
-    def test_extract_replies_with_guardrail(self, mock_boto3_session):
+    def test_extract_replies_with_guardrail(self):
         model = "global.anthropic.claude-sonnet-4-6"
 
         trace = {
@@ -983,12 +1121,12 @@ class TestAmazonBedrockChatGeneratorUtils:
                 "total_tokens": 0,
                 "cache_read_input_tokens": 0,
                 "cache_write_input_tokens": 0,
-                "cache_details": {},
+                "cache_details": [],
             },
             "trace": trace,
         }
 
-    def test_parse_completion_response_with_citations(self, mock_boto3_session):
+    def test_parse_completion_response_with_citations(self):
         model = "anthropic.claude-4-6-sonnet"
 
         response_body = {
@@ -1079,7 +1217,7 @@ class TestAmazonBedrockChatGeneratorUtils:
             ],
         }
 
-    def test_process_streaming_response_one_tool_call(self, mock_boto3_session):
+    def test_process_streaming_response_one_tool_call(self):
         """
         Test that process_streaming_response correctly handles streaming events and accumulates responses
         """
@@ -1234,7 +1372,7 @@ class TestAmazonBedrockChatGeneratorUtils:
                         "total_tokens": 435,
                         "cache_read_input_tokens": 0,
                         "cache_write_input_tokens": 0,
-                        "cache_details": {},
+                        "cache_details": [],
                     },
                 },
             )
@@ -1341,7 +1479,7 @@ class TestAmazonBedrockChatGeneratorUtils:
                         "total_tokens": 435,
                         "cache_read_input_tokens": 0,
                         "cache_write_input_tokens": 0,
-                        "cache_details": {},
+                        "cache_details": [],
                     },
                 },
                 component_info=c_info,
@@ -1356,7 +1494,7 @@ class TestAmazonBedrockChatGeneratorUtils:
         assert len(replies) == 1
         assert replies == expected_messages
 
-    def test_process_streaming_response_one_tool_call_with_thinking(self, mock_boto3_session):
+    def test_process_streaming_response_one_tool_call_with_thinking(self):
         model = "arn:aws:bedrock:us-east-1::inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0"
         type_ = (
             "haystack_integrations.components.generators.amazon_bedrock.chat.chat_generator.AmazonBedrockChatGenerator"
@@ -1519,7 +1657,7 @@ class TestAmazonBedrockChatGeneratorUtils:
                         "total_tokens": 516,
                         "cache_read_input_tokens": 0,
                         "cache_write_input_tokens": 0,
-                        "cache_details": {},
+                        "cache_details": [],
                     },
                     "completion_start_time": ANY,
                 },
@@ -1533,7 +1671,7 @@ class TestAmazonBedrockChatGeneratorUtils:
         for chunk in reasoning_chunks:
             assert "reasoning_contents" not in chunk.meta
 
-    def test_parse_streaming_response_with_two_tool_calls(self, mock_boto3_session):
+    def test_parse_streaming_response_with_two_tool_calls(self):
         model = "global.anthropic.claude-sonnet-4-6"
         type_ = (
             "haystack_integrations.components.generators.amazon_bedrock.chat.chat_generator.AmazonBedrockChatGenerator"
@@ -1703,7 +1841,7 @@ class TestAmazonBedrockChatGeneratorUtils:
                         "total_tokens": 449,
                         "cache_read_input_tokens": 0,
                         "cache_write_input_tokens": 0,
-                        "cache_details": {},
+                        "cache_details": [],
                     },
                     "completion_start_time": ANY,
                 },
@@ -1711,7 +1849,7 @@ class TestAmazonBedrockChatGeneratorUtils:
         ]
         assert replies == expected_messages
 
-    def test_parse_streaming_response_with_guardrail(self, mock_boto3_session):
+    def test_parse_streaming_response_with_guardrail(self):
         model = "global.anthropic.claude-sonnet-4-6"
         type_ = (
             "haystack_integrations.components.generators.amazon_bedrock.chat.chat_generator.AmazonBedrockChatGenerator"
@@ -1791,13 +1929,46 @@ class TestAmazonBedrockChatGeneratorUtils:
                         "total_tokens": 0,
                         "cache_read_input_tokens": 0,
                         "cache_write_input_tokens": 0,
-                        "cache_details": {},
+                        "cache_details": [],
                     },
                     "trace": trace,
                 },
             )
         ]
         assert replies == expected_messages
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("use_async_callback", [True, False])
+    async def test_parse_streaming_response_async_with_sync_and_async_callback(self, use_async_callback):
+        model = "anthropic.claude-3-5-sonnet-20240620-v1:0"
+        events = [
+            {"contentBlockDelta": {"delta": {"text": "Hello"}, "contentBlockIndex": 0}},
+            {"contentBlockDelta": {"delta": {"text": " world"}, "contentBlockIndex": 0}},
+            {"contentBlockStop": {"contentBlockIndex": 0}},
+            {"messageStop": {"stopReason": "end_turn"}},
+        ]
+
+        async def event_stream():
+            for event in events:
+                yield event
+
+        collected = []
+
+        async def async_callback(chunk: StreamingChunk) -> None:
+            collected.append(chunk)
+
+        def sync_callback(chunk: StreamingChunk) -> None:
+            collected.append(chunk)
+
+        callback = async_callback if use_async_callback else sync_callback
+
+        replies = await _parse_streaming_response_async(event_stream(), callback, model, ComponentInfo(type="test"))
+
+        assert len(collected) == len(events)
+        assert "".join(chunk.content for chunk in collected) == "Hello world"
+        assert len(replies) == 1
+        assert replies[0].text == "Hello world"
+        assert replies[0].meta["finish_reason"] == "stop"
 
     def test_convert_streaming_chunks_to_chat_message_tool_call_with_empty_arguments(
         self,
@@ -2086,3 +2257,69 @@ class TestAmazonBedrockChatGeneratorUtils:
 
         with pytest.raises(ValueError, match=r"Cache point can only contain 'type' and 'ttl' keys."):
             _validate_and_format_cache_point({"type": "default", "invalid": "config"})
+
+    def test_convert_event_to_streaming_chunk_tool_use_input_int(self):
+        model = "global.anthropic.claude-sonnet-4-6"
+        component_info = ComponentInfo(
+            type="haystack_integrations.components.generators.amazon_bedrock.chat.chat_generator.AmazonBedrockChatGenerator"
+        )
+
+        # boto3 may return an int for toolUse input — must be cast to str
+        event_int = {
+            "contentBlockDelta": {
+                "delta": {"toolUse": {"input": 42}},
+                "contentBlockIndex": 1,
+            }
+        }
+        chunk = _convert_event_to_streaming_chunk(event_int, model, component_info)
+        assert chunk.tool_calls is not None
+        assert chunk.tool_calls[0].arguments == "42"
+
+        # None input should stay None
+        event_none = {
+            "contentBlockDelta": {
+                "delta": {"toolUse": {"input": None}},
+                "contentBlockIndex": 1,
+            }
+        }
+        chunk = _convert_event_to_streaming_chunk(event_none, model, component_info)
+        assert chunk.tool_calls is not None
+        assert chunk.tool_calls[0].arguments is None
+
+        # Normal string input should pass through unchanged
+        event_str = {
+            "contentBlockDelta": {
+                "delta": {"toolUse": {"input": '{"city": "Berlin"}'}},
+                "contentBlockIndex": 1,
+            }
+        }
+        chunk = _convert_event_to_streaming_chunk(event_str, model, component_info)
+        assert chunk.tool_calls is not None
+        assert chunk.tool_calls[0].arguments == '{"city": "Berlin"}'
+
+    def test_parse_streaming_response_redacted_reasoning_is_not_replayed(self):
+        # OpenAI models on Bedrock (e.g. GPT-6) stream reasoning only as redactedContent
+        model = "us.openai.gpt-6-sol"
+        type_ = (
+            "haystack_integrations.components.generators.amazon_bedrock.chat.chat_generator.AmazonBedrockChatGenerator"
+        )
+        events = [
+            {"messageStart": {"role": "assistant"}},
+            {
+                "contentBlockDelta": {
+                    "delta": {"reasoningContent": {"redactedContent": b"rsn_abc"}},
+                    "contentBlockIndex": 0,
+                }
+            },
+            {"contentBlockStop": {"contentBlockIndex": 0}},
+            {"contentBlockDelta": {"delta": {"text": "No."}, "contentBlockIndex": 1}},
+            {"contentBlockStop": {"contentBlockIndex": 1}},
+            {"messageStop": {"stopReason": "end_turn"}},
+        ]
+
+        replies = _parse_streaming_response(events, lambda chunk: None, model, ComponentInfo(type=type_))
+
+        assert replies[0].text == "No."
+        assert replies[0].reasoning is None
+        formatted_message = _format_messages([replies[0]])[1][0]
+        assert formatted_message == {"role": "assistant", "content": [{"text": "No."}]}

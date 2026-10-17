@@ -93,7 +93,7 @@ def _group_nested_conditions(
                 inner.append(_parse_logical_condition(c, nested_fields=None))
             else:
                 inner.append(_parse_comparison_condition(c, nested_fields))
-        if len(inner) > 1:
+        if len(inner) > 1 and operator != "OR":
             inner = _normalize_ranges(inner)
         if len(inner) == 1:
             conditions.append({"nested": {"path": path, "query": inner[0]}})
@@ -120,7 +120,10 @@ def _parse_logical_condition(condition: dict[str, Any], nested_fields: set[str] 
     else:
         conditions = [_parse_comparison_condition(c, nested_fields) for c in condition["conditions"]]
 
-    if len(conditions) > 1:
+    # Range merging is only valid when the conditions are AND-combined (AND, and the
+    # inner `must` of NOT). Merging same-field ranges under OR would collapse e.g.
+    # `price < 10 OR price > 100` into a single impossible range, matching nothing.
+    if len(conditions) > 1 and operator != "OR":
         conditions = _normalize_ranges(conditions)
     if operator == "AND":
         return {"bool": {"must": conditions}}
@@ -142,7 +145,10 @@ def _equal(field: str, value: Any) -> dict[str, Any]:
             "terms_set": {
                 field: {
                     "terms": value,
-                    "minimum_should_match_script": {"source": f"Math.max(params.num_terms, doc['{field}'].size())"},
+                    "minimum_should_match_script": {
+                        "source": "Math.max(params.num_terms, doc[params.field].size())",
+                        "params": {"field": field},
+                    },
                 }
             }
         }
@@ -305,6 +311,14 @@ def _parse_comparison_condition(condition: dict[str, Any], nested_fields: set[st
     return COMPARISON_OPERATORS[operator](field, value)
 
 
+_BOUND_SIDES = {"gt": "lower", "gte": "lower", "lt": "upper", "lte": "upper"}
+
+
+def _bound_sides(comparison: dict[str, Any]) -> set[str]:
+    """Returns which sides of a range a comparison constrains, `gt`/`gte` being the same side."""
+    return {_BOUND_SIDES.get(key, key) for key in comparison}
+
+
 def _normalize_ranges(conditions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Merges range conditions acting on a same field.
@@ -325,12 +339,20 @@ def _normalize_ranges(conditions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     range_conditions = [next(iter(c["range"].items())) for c in conditions if "range" in c]
     if range_conditions:
         conditions = [c for c in conditions if "range" not in c]
-        range_conditions_dict: dict[str, Any] = {}
+        # A field can carry several range clauses. Two bounds share a clause only when they
+        # constrain opposite sides: `price > 1 AND price < 10` merges, but a second lower (or
+        # upper) bound starts a new clause. Elasticsearch keeps just one bound per side within
+        # a clause, so merging `price > 5 AND price > 1` would silently drop one of them.
+        range_conditions_dict: dict[str, list[dict[str, Any]]] = {}
         for field_name, comparison in range_conditions:
-            if field_name not in range_conditions_dict:
-                range_conditions_dict[field_name] = {}
-            range_conditions_dict[field_name].update(comparison)
+            clauses = range_conditions_dict.setdefault(field_name, [])
+            for clause in clauses:
+                if not _bound_sides(clause) & _bound_sides(comparison):
+                    clause.update(comparison)
+                    break
+            else:
+                clauses.append(dict(comparison))
 
-        for field_name, comparisons in range_conditions_dict.items():
-            conditions.append({"range": {field_name: comparisons}})
+        for field_name, clauses in range_conditions_dict.items():
+            conditions.extend({"range": {field_name: clause}} for clause in clauses)
     return conditions

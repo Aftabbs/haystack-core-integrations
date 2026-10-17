@@ -1,5 +1,68 @@
 # Changelog
 
+## [integrations/azure_ai_search-v4.2.1] - 2026-09-09
+
+### 🐛 Bug Fixes
+
+- Serialize include_search_metadata in AzureAISearchDocumentStore.to_dict (#3925)
+
+### 🧪 Testing
+
+- Make Azure AI Search tests automatically use common metadata (#3880)
+
+
+## [integrations/azure_ai_search-v4.2.0] - 2026-09-02
+
+### 🚀 Features
+
+- *(azure_ai_search)* Improve handling of unknown metadata fields (#3862)
+
+
+## [integrations/azure_ai_search-v4.1.1] - 2026-09-02
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- `AzureSearchDocumentStore` get_metadata_field_unique_values setting list of values to return to `Any` (#3713)
+- AzureAISearch adding optional parameter `filters` to `get_metadata_field_unique_values()` (#3740)
+- Standardize license files (#3771)
+- *(azure_ai_search)* Use a value-safe delimiter for search.in filters (#3846)
+
+
+## [integrations/azure_ai_search-v4.1.0] - 2026-07-27
+
+### 🚀 Features
+
+- Azure AI Search - add closing methods (#3662)
+
+### 🧪 Testing
+
+- Azure AI Search - fix test_count_unique_metadata_by_filter_with_multiple_filters for 3.0 changes (#3659)
+
+
+## [integrations/azure_ai_search-v4.0.1] - 2026-07-20
+
+### 🐛 Bug Fixes
+
+- *(azure_ai_search)* Escape single quotes in OData string literals (#3590)
+
+### 📚 Documentation
+
+- Replace old haystack core imports with haystack_integrations paths (#3545)
+
+
+## [integrations/azure_ai_search-v4.0.0] - 2026-05-04
+
+### 🧪 Testing
+
+- Track test coverage for all integrations (#3065)
+- Azure AI Search - add unit tests (#3201)
+
+### 🧹 Chores
+
+- [**breaking**] Azure AI - adaptations for the new SDK (#3269)
+
+
 ## [integrations/azure_ai_search-v3.2.0] - 2026-03-30
 
 ### 🚀 Features

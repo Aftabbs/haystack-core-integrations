@@ -11,8 +11,10 @@ from haystack.dataclasses import (
 )
 from haystack.tools import Tool, Toolset
 from openai import AsyncOpenAI
-from openai.types.chat import ChatCompletion, ChatCompletionMessage
+from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_chunk import Choice as ChoiceChunk
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
 
 from haystack_integrations.components.generators.openrouter.chat.chat_generator import (
     OpenRouterChatGenerator,
@@ -82,17 +84,19 @@ def mock_async_chat_completion():
         yield mock_chat_completion_create
 
 
-class TestOpenRouterChatGeneratorAsync:
-    def test_init_default_async(self, monkeypatch):
+@pytest.mark.asyncio
+class TestOpenRouterChatGeneratorAsyncUnit:
+    async def test_warm_up_async(self, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "test-api-key")
         component = OpenRouterChatGenerator()
+        if hasattr(component, "warm_up_async"):
+            # haystack-ai >= 3.0 creates the async client during async warm-up
+            await component.warm_up_async()
 
         assert isinstance(component.async_client, AsyncOpenAI)
         assert component.async_client.api_key == "test-api-key"
         assert component.async_client.base_url == "https://openrouter.ai/api/v1/"
-        assert not component.generation_kwargs
 
-    @pytest.mark.asyncio
     async def test_run_async(self, chat_messages, mock_async_chat_completion, monkeypatch):  # noqa: ARG002
         monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
         component = OpenRouterChatGenerator()
@@ -105,7 +109,6 @@ class TestOpenRouterChatGeneratorAsync:
         assert len(response["replies"]) == 1
         assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
 
-    @pytest.mark.asyncio
     async def test_run_async_with_params(self, chat_messages, mock_async_chat_completion, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
         component = OpenRouterChatGenerator(generation_kwargs={"max_tokens": 10, "temperature": 0.5})
@@ -123,29 +126,173 @@ class TestOpenRouterChatGeneratorAsync:
         assert len(response["replies"]) == 1
         assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
 
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenAI API key to run this test.",
-    )
-    @pytest.mark.integration
-    @pytest.mark.asyncio
-    async def test_live_run_async(self):
-        chat_messages = [ChatMessage.from_user("What's the capital of France")]
-        component = OpenRouterChatGenerator()
-        results = await component.run_async(chat_messages)
-        assert len(results["replies"]) == 1
-        message: ChatMessage = results["replies"][0]
-        assert "Paris" in message.text
-        assert "openai/gpt-5-mini" in message.meta["model"]
-        assert message.meta["finish_reason"] == "stop"
+    async def test_run_async_with_generation_kwargs(self, chat_messages, mock_async_chat_completion, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+        component = OpenRouterChatGenerator(generation_kwargs={"max_tokens": 10, "temperature": 0.5})
+        await component.run_async(chat_messages, generation_kwargs={"temperature": 0.9})
 
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenAI API key to run this test.",
-    )
-    @pytest.mark.integration
-    @pytest.mark.asyncio
-    async def test_live_run_streaming_async(self):
+        _, kwargs = mock_async_chat_completion.call_args
+        assert kwargs["extra_body"]["max_tokens"] == 10
+        assert kwargs["extra_body"]["temperature"] == 0.9
+
+    async def test_run_async_with_reasoning(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+
+        with patch(
+            "openai.resources.chat.completions.AsyncCompletions.create",
+            new_callable=AsyncMock,
+        ) as mock_create:
+            completion = ChatCompletion(
+                id="test-async-reasoning",
+                model="deepseek/deepseek-r1",
+                object="chat.completion",
+                choices=[
+                    Choice(
+                        finish_reason="stop",
+                        logprobs=None,
+                        index=0,
+                        message=ChatCompletionMessage(
+                            content="Paris is the capital of France.",
+                            role="assistant",
+                            reasoning="The user asked about capitals. France's capital is Paris.",
+                            reasoning_details=[
+                                {
+                                    "type": "reasoning.text",
+                                    "text": "The user asked about capitals. France's capital is Paris.",
+                                }
+                            ],
+                        ),
+                    )
+                ],
+                created=int(datetime.now(tz=pytz.timezone("UTC")).timestamp()),
+                usage={"prompt_tokens": 57, "completion_tokens": 40, "total_tokens": 97},
+            )
+            mock_create.return_value = completion
+
+            component = OpenRouterChatGenerator(
+                model="deepseek/deepseek-r1",
+                generation_kwargs={"reasoning": {"effort": "high"}},
+            )
+            response = await component.run_async([ChatMessage.from_user("What's the capital of France?")])
+
+            assert len(response["replies"]) == 1
+            reply = response["replies"][0]
+            assert reply.text == "Paris is the capital of France."
+            assert reply.reasoning is not None
+            assert "capitals" in reply.reasoning.reasoning_text
+            assert reply.reasoning.extra["reasoning_details"][0]["type"] == "reasoning.text"
+
+    async def test_run_async_streaming_with_reasoning(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+
+        def chunk(delta: ChoiceDelta, finish_reason: str | None = None) -> ChatCompletionChunk:
+            return ChatCompletionChunk(
+                id="gen-1",
+                choices=[ChoiceChunk(delta=delta, index=0, finish_reason=finish_reason)],
+                created=1750162525,
+                model="deepseek/deepseek-r1",
+                object="chat.completion.chunk",
+            )
+
+        async def stream():
+            for delta in [
+                ChoiceDelta(
+                    content="",
+                    role="assistant",
+                    reasoning="France's capital ",
+                    reasoning_details=[{"type": "reasoning.text", "text": "France's capital ", "index": 0}],
+                ),
+                ChoiceDelta(
+                    content="",
+                    role="assistant",
+                    reasoning="is Paris.",
+                    reasoning_details=[{"type": "reasoning.text", "text": "is Paris.", "index": 0}],
+                ),
+                ChoiceDelta(content="Paris.", role="assistant"),
+            ]:
+                yield chunk(delta)
+            yield chunk(ChoiceDelta(content="", role="assistant"), finish_reason="stop")
+
+        streamed: list[StreamingChunk] = []
+
+        async def callback(streaming_chunk: StreamingChunk) -> None:
+            streamed.append(streaming_chunk)
+
+        with patch(
+            "openai.resources.chat.completions.AsyncCompletions.create",
+            new_callable=AsyncMock,
+            return_value=stream(),
+        ):
+            component = OpenRouterChatGenerator(model="deepseek/deepseek-r1", streaming_callback=callback)
+            response = await component.run_async([ChatMessage.from_user("What's the capital of France?")])
+
+        assert len(streamed) == 4
+        assert [c.reasoning.reasoning_text for c in streamed[:2]] == ["France's capital ", "is Paris."]
+        assert [c.start for c in streamed[:2]] == [True, False]
+        assert streamed[2].content == "Paris."
+        assert streamed[2].start is True
+        assert streamed[2].index == 1
+        assert streamed[3].finish_reason == "stop"
+
+        reply = response["replies"][0]
+        assert reply.text == "Paris."
+        assert reply.reasoning is not None
+        assert reply.reasoning.reasoning_text == "France's capital is Paris."
+        assert reply.reasoning.extra["reasoning_details"] == [
+            {"type": "reasoning.text", "text": "France's capital is Paris.", "index": 0}
+        ]
+        assert reply.meta["finish_reason"] == "stop"
+
+    async def test_run_async_empty_messages(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+        component = OpenRouterChatGenerator()
+        response = await component.run_async([])
+        assert response == {"replies": []}
+
+    async def test_run_async_with_string_input(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+
+        with patch(
+            "openai.resources.chat.completions.AsyncCompletions.create",
+            new_callable=AsyncMock,
+        ) as mock_create:
+            completion = ChatCompletion(
+                id="test-async-string-input",
+                model="openai/gpt-5-mini",
+                object="chat.completion",
+                choices=[
+                    Choice(
+                        finish_reason="stop",
+                        logprobs=None,
+                        index=0,
+                        message=ChatCompletionMessage(content="Paris.", role="assistant"),
+                    )
+                ],
+                created=int(datetime.now(tz=pytz.timezone("UTC")).timestamp()),
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            )
+            mock_create.return_value = completion
+
+            component = OpenRouterChatGenerator()
+            response = await component.run_async("What's the capital of France?")
+
+            # the backend should receive exactly one user message
+            _, kwargs = mock_create.call_args
+            assert kwargs["messages"] == [{"role": "user", "content": "What's the capital of France?"}]
+
+            assert len(response["replies"]) == 1
+            assert response["replies"][0].text == "Paris."
+
+
+@pytest.mark.skipif(
+    not os.environ.get("OPENROUTER_API_KEY", None),
+    reason="Export an env var called OPENROUTER_API_KEY containing the OpenRouter API key to run this test.",
+)
+@pytest.mark.integration
+@pytest.mark.asyncio
+class TestOpenRouterChatGeneratorAsyncIntegration:
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_live_run_async(self, streaming):
         counter = 0
         responses = ""
 
@@ -155,34 +302,49 @@ class TestOpenRouterChatGeneratorAsync:
             counter += 1
             responses += chunk.content if chunk.content else ""
 
-        component = OpenRouterChatGenerator(streaming_callback=callback)
+        component = OpenRouterChatGenerator(
+            streaming_callback=callback if streaming else None,
+            generation_kwargs={"max_tokens": 1000},
+        )
         results = await component.run_async([ChatMessage.from_user("What's the capital of France?")])
 
         assert len(results["replies"]) == 1
         message: ChatMessage = results["replies"][0]
         assert "Paris" in message.text
-
         assert "openai/gpt-5-mini" in message.meta["model"]
         assert message.meta["finish_reason"] == "stop"
 
-        assert counter > 1
-        assert "Paris" in responses
+        if streaming:
+            assert counter > 1
+            assert "Paris" in responses
 
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenAI API key to run this test.",
-    )
-    @pytest.mark.integration
-    @pytest.mark.asyncio
-    async def test_live_run_with_tools_and_response_async(self, tools):
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_live_run_with_tools_and_response_async(self, tools, streaming):
         """
         Integration test that the OpenRouterChatGenerator component can run with tools and get a response.
         """
+        counter = 0
+        streamed_tool_calls = []
+
+        async def callback(chunk: StreamingChunk):
+            nonlocal counter
+            counter += 1
+            if chunk.meta.get("tool_calls"):
+                streamed_tool_calls.extend(chunk.meta["tool_calls"])
+
         initial_messages = [ChatMessage.from_user("What's the weather like in Paris?")]
-        component = OpenRouterChatGenerator(tools=tools)
-        results = await component.run_async(messages=initial_messages, generation_kwargs={"tool_choice": "auto"})
+        component = OpenRouterChatGenerator(
+            tools=tools,
+            streaming_callback=callback if streaming else None,
+            generation_kwargs={"tool_choice": "auto", "max_tokens": 1000},
+        )
+        results = await component.run_async(messages=initial_messages)
 
         assert len(results["replies"]) > 0, "No replies received"
+
+        if streaming:
+            assert counter > 1, "Streaming callback was not called multiple times"
+            assert streamed_tool_calls, "No tool calls received in streaming"
 
         # Find the message with tool calls
         tool_message = None
@@ -215,60 +377,6 @@ class TestOpenRouterChatGeneratorAsync:
         assert len(final_message.text) > 0
         assert "paris" in final_message.text.lower()
 
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenAI API key to run this test.",
-    )
-    @pytest.mark.integration
-    @pytest.mark.asyncio
-    async def test_live_run_with_tools_streaming_async(self, tools):
-        """
-        Integration test that the OpenRouterChatGenerator component can run with tools and streaming.
-        """
-
-        counter = 0
-        tool_calls = []
-
-        async def callback(chunk: StreamingChunk):
-            nonlocal counter
-            nonlocal tool_calls
-            counter += 1
-            if chunk.meta.get("tool_calls"):
-                tool_calls.extend(chunk.meta["tool_calls"])
-
-        component = OpenRouterChatGenerator(tools=tools, streaming_callback=callback)
-        results = await component.run_async(
-            [ChatMessage.from_user("What's the weather like in Paris?")],
-            generation_kwargs={"tool_choice": "auto"},
-        )
-
-        assert len(results["replies"]) > 0, "No replies received"
-        assert counter > 1, "Streaming callback was not called multiple times"
-        assert tool_calls, "No tool calls received in streaming"
-
-        # Find the message with tool calls
-        tool_message = None
-        for message in results["replies"]:
-            if message.tool_call:
-                tool_message = message
-                break
-
-        assert tool_message is not None, "No message with tool call found"
-        assert isinstance(tool_message, ChatMessage), "Tool message is not a ChatMessage instance"
-        assert ChatMessage.is_from(tool_message, ChatRole.ASSISTANT), "Tool message is not from the assistant"
-
-        tool_call = tool_message.tool_call
-        assert tool_call.id, "Tool call does not contain value for 'id' key"
-        assert tool_call.tool_name == "weather"
-        assert "paris" in tool_call.arguments["city"].lower(), f"Expected 'paris' in city: {tool_call.arguments}"
-        assert tool_message.meta["finish_reason"] == "tool_calls"
-
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenRouter API key to run this test.",
-    )
-    @pytest.mark.integration
-    @pytest.mark.asyncio
     async def test_integration_mixing_tools_and_toolset_async(self):
         """Test mixing Tool list and Toolset at runtime in async mode."""
 
@@ -310,7 +418,7 @@ class TestOpenRouterChatGeneratorAsync:
         toolset = Toolset([weather_tool, time_tool])
 
         # Initialize with no tools, we'll pass them at runtime
-        component = OpenRouterChatGenerator()
+        component = OpenRouterChatGenerator(generation_kwargs={"max_tokens": 1000})
 
         # Pass mixed list: echo_tool (individual) and toolset (weather + time) at runtime
         # This tests that both individual tools and toolsets can be combined

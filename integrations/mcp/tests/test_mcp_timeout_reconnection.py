@@ -7,6 +7,7 @@ by killing the server process and then restarting it.
 """
 
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -15,12 +16,19 @@ import sys
 import tempfile
 import textwrap
 import time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
+from mcp import types
 
 from haystack_integrations.tools.mcp import MCPTool, SSEServerInfo
-from haystack_integrations.tools.mcp.mcp_tool import SSEClient
+from haystack_integrations.tools.mcp.mcp_tool import (
+    MCPConnectionError,
+    MCPInvocationError,
+    SSEClient,
+    StdioClient,
+    StreamableHttpServerInfo,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +73,68 @@ class TestMCPTimeoutReconnection:
         # Test that parameters are passed through correctly
         assert isinstance(client, SSEClient)
 
+    @pytest.mark.asyncio
+    async def test_call_tool_without_session_raises_connection_error(self):
+        client = StdioClient(command="echo")
+
+        with pytest.raises(MCPConnectionError):
+            await client.call_tool("any", {})
+
+    @pytest.mark.asyncio
+    async def test_call_tool_wraps_is_error_response_as_invocation_error(self):
+        client = StdioClient(command="echo")
+        client.session = AsyncMock()
+        bad_result = types.CallToolResult(content=[types.TextContent(type="text", text="server said no")], isError=True)
+        client.session.call_tool = AsyncMock(return_value=bad_result)
+
+        with pytest.raises(MCPInvocationError, match="server said no"):
+            await client.call_tool("x", {})
+
+    @pytest.mark.asyncio
+    async def test_call_tool_stdio_does_not_retry_on_connection_error(self):
+        client = StdioClient(command="echo", max_retries=2)
+        client.session = AsyncMock()
+        client.session.call_tool = AsyncMock(side_effect=ConnectionError("dead"))
+
+        with pytest.raises(MCPInvocationError, match="STDIO"):
+            await client.call_tool("x", {})
+
+        assert client.session.call_tool.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_call_tool_http_exhausts_retries_with_backoff(self):
+        info = StreamableHttpServerInfo(url="http://x/mcp", max_retries=2, base_delay=0.0, max_delay=0.0)
+        client = info.create_client()
+        client.session = AsyncMock()
+        client.session.call_tool = AsyncMock(side_effect=ConnectionError("lost"))
+        client.connect = AsyncMock()
+
+        with pytest.raises(MCPInvocationError, match="reconnection attempts"):
+            await client.call_tool("x", {})
+
+        assert client.session.call_tool.await_count == 3  # initial + 2 retries
+        assert client.connect.await_count == 2  # reconnection on the first two failures
+
+    @pytest.mark.asyncio
+    async def test_call_tool_http_reconnection_failures_raise_final_error(self):
+        info = StreamableHttpServerInfo(url="http://x/mcp", max_retries=1, base_delay=0.0, max_delay=0.0)
+        client = info.create_client()
+        client.session = AsyncMock()
+        client.session.call_tool = AsyncMock(side_effect=ConnectionError("lost"))
+        client.connect = AsyncMock(side_effect=RuntimeError("server gone"))
+
+        with pytest.raises(MCPInvocationError, match="reconnection attempts failed"):
+            await client.call_tool("x", {})
+
+    @pytest.mark.asyncio
+    async def test_call_tool_wraps_unexpected_exceptions(self):
+        client = StdioClient(command="echo")
+        client.session = AsyncMock()
+        client.session.call_tool = AsyncMock(side_effect=ValueError("nope"))
+
+        with pytest.raises(MCPInvocationError, match="nope"):
+            await client.call_tool("x", {})
+
     def test_retry_logic_with_mock(self):
         """Test retry logic using mocked SSE client (unit test)."""
         # Create a real SSE client but mock its session and connect method
@@ -77,9 +147,7 @@ class TestMCPTimeoutReconnection:
         client.connect = AsyncMock()
 
         # Create a successful response mock
-        success_response = MagicMock()
-        success_response.isError = False
-        success_response.model_dump_json.return_value = '{"result": "success"}'
+        success_response = types.CallToolResult(content=[types.TextContent(type="text", text="success")], isError=False)
 
         # First call fails with ConnectionError, second call succeeds
         mock_session.call_tool.side_effect = [ConnectionError("Connection lost"), success_response]
@@ -93,7 +161,7 @@ class TestMCPTimeoutReconnection:
         result = asyncio.run(test_call())
 
         # Verify the result
-        assert result == '{"result": "success"}'
+        assert json.loads(result)["content"][0]["text"] == "success"
 
         # Verify retry behavior
         assert mock_session.call_tool.call_count == 2  # Initial call + retry
@@ -112,7 +180,14 @@ class TestMCPTimeoutReconnection:
                 script_content = textwrap.dedent(f"""
                     import sys
                     import signal
-                    from mcp.server.fastmcp import FastMCP
+
+                    try:
+                        from mcp.server import MCPServer          # mcp v2
+                        server_cls, ctor_kwargs, run_kwargs = MCPServer, {{}}, {{"host": "127.0.0.1", "port": {port}}}
+                    except ImportError:
+                        from mcp.server.fastmcp import FastMCP    # mcp v1
+                        server_cls = FastMCP
+                        ctor_kwargs, run_kwargs = {{"host": "127.0.0.1", "port": {port}}}, {{}}
 
                     # Handle shutdown signals gracefully (cross-platform)
                     def signal_handler(signum, frame):
@@ -124,7 +199,7 @@ class TestMCPTimeoutReconnection:
                     if hasattr(signal, 'SIGINT'):
                         signal.signal(signal.SIGINT, signal_handler)
 
-                    mcp = FastMCP("Reconnection Test Server", host="127.0.0.1", port={port})
+                    mcp = server_cls("Reconnection Test Server", **ctor_kwargs)
 
                     @mcp.tool()
                     def test_tool(message: str) -> str:
@@ -133,7 +208,7 @@ class TestMCPTimeoutReconnection:
                     if __name__ == "__main__":
                         try:
                             print(f"Starting server on port {port}", flush=True)
-                            mcp.run(transport="sse")
+                            mcp.run(transport="sse", **run_kwargs)
                         except (KeyboardInterrupt, SystemExit):
                             print("Server shutting down gracefully", flush=True)
                             sys.exit(0)

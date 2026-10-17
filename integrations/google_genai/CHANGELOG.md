@@ -1,5 +1,144 @@
 # Changelog
 
+## [integrations/google_genai-v6.0.2] - 2026-10-14
+
+### 🧹 Chores
+
+- Drop redundant deserialize_secrets_inplace calls in integrations requiring haystack-ai>=2.23 (#4058)
+- Add gemini-4-argon to Google GenAI SUPPORTED_MODELS (#4099)
+
+
+## [integrations/google_genai-v6.0.1] - 2026-09-25
+
+### 🐛 Bug Fixes
+
+- Serialization of google genai thought signatures (#3995)
+
+
+## [integrations/google_genai-v6.0.0] - 2026-09-15
+
+### 📚 Documentation
+
+- *(gemini)* Default to gemini-3.8-flash, deprecate old models (#3959)
+
+
+## [integrations/google_genai-v5.0.1] - 2026-09-14
+
+### 🐛 Bug Fixes
+
+- Google GenAI - allow empty assistant messages (#3953)
+
+
+## [integrations/google_genai-v5.0.0] - 2026-09-07
+
+### 🚀 Features
+
+- [**breaking**] Google GenAI - add lifecycle handling (#3915)
+
+
+## [integrations/google_genai-v4.9.0] - 2026-09-04
+
+### 🚀 Features
+
+- Add GoogleGenAITokenCounter to google-genai integration (#3868)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+
+## [integrations/google_genai-v4.8.0] - 2026-08-24
+
+### 🚀 Features
+
+- Feat (google-genai): add file content support in tool result (#3828)
+
+
+## [integrations/google_genai-v4.7.1] - 2026-08-20
+
+### 🐛 Bug Fixes
+
+- Fix finish reason mapping for streaming Gemini models (#3823)
+
+
+## [integrations/google_genai-v4.7.0] - 2026-08-20
+
+### 📚 Documentation
+
+- *(gemini)* Update defaults to 3.7 Flash (#3816)
+
+
+## [integrations/google_genai-v4.6.1] - 2026-08-18
+
+### 🐛 Bug Fixes
+
+- Confine GoogleGenAIMultimodalDocumentEmbedder file paths to root_path (#3811)
+
+
+## [integrations/google_genai-v4.6.0] - 2026-08-18
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- Standardize license files (#3771)
+- [**breaking**] Standardize generation_kwargs handling in GoogleGenAIChatGenerator (#3804)
+
+### 🧹 Chores
+
+- Re-standardize READMEs (#3768)
+
+
+## [integrations/google_genai-v4.5.0] - 2026-07-03
+
+### 🧪 Testing
+
+- Trust test modules under Haystack 3.0's deserialization allowlist (#3537)
+
+### 🧹 Chores
+
+- Improve consistency of integrations folder structure (#3430)
+- Support sync streaming callbacks in async contexts for Haystack 2.x/3.x compatibility (#3534)
+
+
+## [integrations/google_genai-v4.4.1] - 2026-06-08
+
+### 🐛 Bug Fixes
+
+- Async streaming chunk indices in GoogleGenAIChatGenerator start at 0, not 1 (#3410)
+
+
+## [integrations/google_genai-v4.4.0] - 2026-06-08
+
+### 🚀 Features
+
+- *(google_genai)* Add timeout and max_retries to embedder components (#3412)
+
+
+## [integrations/google_genai-v4.3.0] - 2026-06-05
+
+### 🚀 Features
+
+- Google GenAI - accept str as ChatGenerator input (#3394)
+
+### 🧪 Testing
+
+- Remove old integration tests using deprecated model (#3381)
+
+
+## [integrations/google_genai-v4.2.0] - 2026-04-29
+
+### 🚜 Refactor
+
+- Google GenAI embedders - adaptations for Gemini Embedding 2 general availability (#3251)
+
+
+## [integrations/google_genai-v4.1.0] - 2026-04-24
+
+### 🐛 Bug Fixes
+
+- *(google-genai)* Include cached_content_token_count in streaming responses (#3177)
+
+
 ## [integrations/google_genai-v4.0.1] - 2026-04-13
 
 ### 🐛 Bug Fixes
@@ -47,11 +186,15 @@
 
 ### 🚀 Features
 
-- *(google-genai)* Add timeout and max_retries to chat generator (#2875)
 - GoogleGenAIChatGenerator provides supported models list (#2930)
 - Add GoogleGenAIMultimodalDocumentEmbedder to support gemini-embedding-2 (#2944)
 
-### 🌀 Miscellaneous
+
+## [integrations/google_genai-v3.9.0] - 2026-03-09
+
+### 🚀 Features
+
+- *(google-genai)* Add timeout and max_retries to chat generator (#2875)
 
 
 ## [integrations/google_genai-v3.8.0] - 2026-03-02

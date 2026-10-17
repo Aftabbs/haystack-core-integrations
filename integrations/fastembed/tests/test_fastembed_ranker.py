@@ -28,6 +28,7 @@ class TestFastembedRanker:
         assert not ranker.local_files_only
         assert ranker.meta_fields_to_embed == []
         assert ranker.meta_data_separator == "\n"
+        assert ranker.score_threshold is None
 
     def test_init_with_parameters(self):
         """
@@ -43,6 +44,7 @@ class TestFastembedRanker:
             local_files_only=True,
             meta_fields_to_embed=["test_field"],
             meta_data_separator=" | ",
+            score_threshold=0.5,
         )
         assert ranker.model_name == "BAAI/bge-reranker-base"
         assert ranker.top_k == 64
@@ -53,6 +55,20 @@ class TestFastembedRanker:
         assert ranker.local_files_only
         assert ranker.meta_fields_to_embed == ["test_field"]
         assert ranker.meta_data_separator == " | "
+        assert ranker.score_threshold == 0.5
+
+    def test_init_with_model_kwargs_parameters(self):
+        """
+        Test initialization of FastembedRanker with model_kwargs parameters.
+        """
+        model_kwargs = {"providers": ["CUDAExecutionProvider"]}
+
+        ranker = FastembedRanker(
+            model_name="BAAI/bge-reranker-base",
+            model_kwargs=model_kwargs,
+        )
+
+        assert ranker.model_kwargs == model_kwargs
 
     def test_init_with_incorrect_input(self):
         """
@@ -88,6 +104,8 @@ class TestFastembedRanker:
                 "local_files_only": False,
                 "meta_fields_to_embed": [],
                 "meta_data_separator": "\n",
+                "score_threshold": None,
+                "model_kwargs": None,
             },
         }
 
@@ -105,6 +123,8 @@ class TestFastembedRanker:
             local_files_only=True,
             meta_fields_to_embed=["test_field"],
             meta_data_separator=" | ",
+            score_threshold=0.5,
+            model_kwargs={"providers": ["CUDAExecutionProvider"]},
         )
         ranker_dict = ranker.to_dict()
         assert ranker_dict == {
@@ -119,6 +139,8 @@ class TestFastembedRanker:
                 "local_files_only": True,
                 "meta_fields_to_embed": ["test_field"],
                 "meta_data_separator": " | ",
+                "score_threshold": 0.5,
+                "model_kwargs": {"providers": ["CUDAExecutionProvider"]},
             },
         }
 
@@ -138,6 +160,7 @@ class TestFastembedRanker:
                 "local_files_only": False,
                 "meta_fields_to_embed": [],
                 "meta_data_separator": "\n",
+                "score_threshold": None,
             },
         }
         ranker = default_from_dict(FastembedRanker, ranker_dict)
@@ -150,6 +173,7 @@ class TestFastembedRanker:
         assert not ranker.local_files_only
         assert ranker.meta_fields_to_embed == []
         assert ranker.meta_data_separator == "\n"
+        assert ranker.score_threshold is None
 
     def test_from_dict_with_custom_init_parameters(self):
         """
@@ -167,6 +191,8 @@ class TestFastembedRanker:
                 "local_files_only": True,
                 "meta_fields_to_embed": ["test_field"],
                 "meta_data_separator": " | ",
+                "score_threshold": 0.5,
+                "model_kwargs": {"providers": ["CUDAExecutionProvider"]},
             },
         }
         ranker = default_from_dict(FastembedRanker, ranker_dict)
@@ -179,6 +205,8 @@ class TestFastembedRanker:
         assert ranker.local_files_only
         assert ranker.meta_fields_to_embed == ["test_field"]
         assert ranker.meta_data_separator == " | "
+        assert ranker.score_threshold == 0.5
+        assert ranker.model_kwargs == {"providers": ["CUDAExecutionProvider"]}
 
     def test_run_incorrect_input_format(self):
         """
@@ -215,6 +243,12 @@ class TestFastembedRanker:
             match="top_k must be > 0, but got -3",
         ):
             ranker.run(query=query, documents=list_document, top_k=-3)
+
+        with pytest.raises(
+            ValueError,
+            match="top_k must be > 0, but got 0",
+        ):
+            ranker.run(query=query, documents=list_document, top_k=0)
 
     def test_run_empty_document_list(self):
         """
@@ -257,6 +291,20 @@ class TestFastembedRanker:
             parallel=None,
         )
 
+    def test_run_with_score_threshold(self):
+        """
+        Tests that documents below score_threshold are filtered out.
+        """
+        ranker = FastembedRanker(model_name="model_name", score_threshold=0.5)
+        ranker._model = MagicMock()
+        ranker._model.rerank.return_value = [0.9, 0.3, 0.7]
+
+        documents = [Document(content=f"doc {i}") for i in range(3)]
+        result = ranker.run(query="test", documents=documents)
+
+        assert len(result["documents"]) == 2
+        assert all(doc.score >= 0.5 for doc in result["documents"])
+
     def test_run_calls_warm_up(self):
         """
         Unit test to check that warm_up is called when run is called for the first time.
@@ -270,6 +318,24 @@ class TestFastembedRanker:
             ranker.run(query="test query", documents=[Document(content="test document")])
 
         mock_warm_up.assert_called_once()
+
+    @patch("haystack_integrations.components.rankers.fastembed.ranker.TextCrossEncoder")
+    def test_warm_up_forwards_model_kwargs(self, mocked_cross_encoder):
+        """
+        Test that model_kwargs (e.g. GPU providers) are forwarded to the underlying Fastembed model.
+        """
+        ranker = FastembedRanker(
+            model_name="BAAI/bge-reranker-base",
+            model_kwargs={"providers": ["CUDAExecutionProvider"]},
+        )
+        ranker.warm_up()
+        mocked_cross_encoder.assert_called_once_with(
+            model_name="BAAI/bge-reranker-base",
+            cache_dir=None,
+            threads=None,
+            local_files_only=False,
+            providers=["CUDAExecutionProvider"],
+        )
 
     @pytest.mark.integration
     def test_run(self):

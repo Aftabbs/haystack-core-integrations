@@ -1,5 +1,79 @@
 # Changelog
 
+## [integrations/weaviate-v7.9.0] - 2026-09-21
+
+### 🚀 Features
+
+- Send X-Weaviate-Client-Integration telemetry header (#3954)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+### 🧹 Chores
+
+- Raise weaviate-client floor and test against Weaviate 1.39 (#3956)
+
+
+## [integrations/weaviate-v7.8.0] - 2026-09-01
+
+### 🐛 Bug Fixes
+
+- `Weaviate` match `search_term` against metadata field value, not content + default size value set to 10 (#3643)
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- `WeaviateDocumentStore` get_metadata_field_unique_values setting list of values to return to `Any` (#3708)
+- Weaviate adding optional parameter `filters` to `get_metadata_field_unique_values()` (#3741)
+- Standardize license files (#3771)
+
+### 🧪 Testing
+
+- `WeaviateDocumentStore` removing duplicated tests already covered by haystack Mixin tests (#3787)
+
+
+## [integrations/weaviate-v7.7.0] - 2026-07-22
+
+### 🚜 Refactor
+
+- Align Weaviate closing methods to standard (#3630)
+
+
+## [integrations/weaviate-v7.6.0] - 2026-06-22
+
+### 🐛 Bug Fixes
+
+- Serialize WeaviateDocumentStore grpc_port and grpc_secure (#3453)
+
+### 🧹 Chores
+
+- Weaviate - lower-bound pin for python-dateutil (#3270)
+
+
+## [integrations/weaviate-v7.5.0] - 2026-04-27
+
+### 🐛 Bug Fixes
+
+- Remove document mutation from weaviate tests(#3160)
+
+### 🚜 Refactor
+
+- Weaviate, chroma, elasticsearch, opensearch, azure_ai_search use `_normalize_metadata_field_name` from haystack.utils (#2953)
+
+### 🧪 Testing
+
+- Test compatible integrations with python 3.14; update pyproject (#3001)
+- Track test coverage for all integrations (#3065)
+- Weaviate - add unit tests (#3169)
+
+### 🧹 Chores
+
+- Add ANN type annotations to stackit, togetherai, unstructured, valkey, watsonx, weave, weaviate (#2994)
+- Enforce ruff docstring rules (D102/D103/D205/D209/D213/D417/D419) in integrations 41-47 (#3012)
+
+### 🌀 Miscellaneous
+
+- `WeaviateDocumentStore` rely on Mixin tests (#3005)
+- !refactor: use async mixin tests in `WeaviateDocumentStore` + fix bug in write_documents (#3225)
+
 ## [integrations/weaviate-v7.4.0] - 2026-03-17
 
 ### 🐛 Bug Fixes
@@ -163,21 +237,20 @@
 
 ### 🧹 Chores
 
-- Weaviate - remove legacy filter support (#1070)
 - Update changelog after removing legacy filters (#1083)
 - Update ruff linting scripts and settings (#1105)
+
+## [integrations/weaviate-v3.0.0] - 2024-09-12
+
+### 🧹 Chores
+
+- Weaviate - remove legacy filter support (#1070)
 
 
 ## [integrations/weaviate-v2.2.1] - 2024-09-07
 
-### 🚀 Features
-
-- Add filter_policy to weaviate integration (#824)
-
 ### 🐛 Bug Fixes
 
-- Weaviate filter error (#811)
-- Fix connection to Weaviate Cloud Service (#624)
 - Pin weaviate-client (#1046)
 - Weaviate - fix connection issues with some WCS URLs (#1058)
 
@@ -185,9 +258,27 @@
 
 - Do not retry tests in `hatch run test` command (#954)
 
-### ⚙️ CI
+### 🌀 Miscellaneous
 
-- Retry tests to reduce flakyness (#836)
+- Chore: weaviate - ruff update, don't ruff tests (#986)
+
+## [integrations/weaviate-v2.2.0] - 2024-08-02
+
+### 🌀 Miscellaneous
+
+- Fix: Weaviate: Use collections.list_all instead of collections._get_all (#921)
+
+## [integrations/weaviate-v2.1.3] - 2024-07-17
+
+### 🌀 Miscellaneous
+
+- Fix: `weaviate` - Fallback to default filter policy when deserializing retrievers without the init parameter  (#903)
+
+## [integrations/weaviate-v2.1.2] - 2024-07-15
+
+### 🚀 Features
+
+- Add filter_policy to weaviate integration (#824)
 
 ### 🧹 Chores
 
@@ -195,15 +286,24 @@
 
 ### 🌀 Miscellaneous
 
+- Chore: Minor retriever pydoc fix (#884)
+
+## [integrations/weaviate-v2.1.1] - 2024-06-25
+
+### 🐛 Bug Fixes
+
+- Weaviate filter error (#811)
+- Fix connection to Weaviate Cloud Service (#624)
+
+### ⚙️ CI
+
+- Retry tests to reduce flakyness (#836)
+
+### 🌀 Miscellaneous
+
 - Handle connection to WCS and add tests
 - Revert "Handle connection to WCS and add tests"
-
-This reverts commit f48802b2ce612896fd06a13cf33dffd9f77a8859.
 - Ci: install `pytest-rerunfailures` where needed; add retry config to `test-cov` script (#845)
-- Chore: Minor retriever pydoc fix (#884)
-- Fix: `weaviate` - Fallback to default filter policy when deserializing retrievers without the init parameter  (#903)
-- Fix: Weaviate: Use collections.list_all instead of collections._get_all (#921)
-- Chore: weaviate - ruff update, don't ruff tests (#986)
 
 ## [integrations/weaviate-v2.1.0] - 2024-06-10
 

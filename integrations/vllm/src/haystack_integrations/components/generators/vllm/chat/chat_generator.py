@@ -1,5 +1,10 @@
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import dataclasses
+import inspect
 import json
 from typing import Any
 
@@ -8,12 +13,15 @@ from haystack.components.generators.chat.openai import (
     _check_finish_reason,
     _convert_chat_completion_chunk_to_streaming_chunk,
 )
-from haystack.components.generators.utils import _convert_streaming_chunks_to_chat_message, _serialize_object
+from haystack.components.generators.utils import (
+    _convert_streaming_chunks_to_chat_message,
+    _normalize_messages,
+    _serialize_object,
+)
 from haystack.core.component import component
 from haystack.dataclasses import ChatMessage, ToolCall
 from haystack.dataclasses.chat_message import ReasoningContent
 from haystack.dataclasses.streaming_chunk import (
-    AsyncStreamingCallbackT,
     ComponentInfo,
     StreamingCallbackT,
     StreamingChunk,
@@ -26,13 +34,13 @@ from haystack.tools import (
     deserialize_tools_or_toolset_inplace,
     flatten_tools_or_toolsets,
     serialize_tools_or_toolset,
-    warm_up_tools,
 )
 from haystack.utils import Secret, deserialize_callable, serialize_callable
-from haystack.utils.http_client import init_http_client
 from openai import AsyncOpenAI, AsyncStream, OpenAI, Stream
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from openai.types.chat.chat_completion import Choice
+
+from haystack_integrations.common.vllm.utils import _create_async_openai_client, _create_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -250,34 +258,40 @@ class VLLMChatGenerator:
 
         self._client: OpenAI | None = None
         self._async_client: AsyncOpenAI | None = None
-        self._is_warmed_up = False
 
     def warm_up(self) -> None:
-        """Create the OpenAI clients and warm up tools."""
-        if self._is_warmed_up:
-            return
+        """Create the synchronous OpenAI client."""
+        if self._client is None:
+            self._client = _create_openai_client(
+                api_key=self.api_key,
+                api_base_url=self.api_base_url,
+                timeout=self.timeout,
+                max_retries=self.max_retries,
+                http_client_kwargs=self.http_client_kwargs,
+            )
 
-        api_key = "placeholder-api-key"
-        if self.api_key and (resolved_value := self.api_key.resolve_value()):
-            api_key = resolved_value
+    async def warm_up_async(self) -> None:
+        """Create the asynchronous OpenAI client."""
+        if self._async_client is None:
+            self._async_client = _create_async_openai_client(
+                api_key=self.api_key,
+                api_base_url=self.api_base_url,
+                timeout=self.timeout,
+                max_retries=self.max_retries,
+                http_client_kwargs=self.http_client_kwargs,
+            )
 
-        client_kwargs: dict[str, Any] = {
-            "api_key": api_key,
-            "base_url": self.api_base_url,
-        }
-        if self.timeout is not None:
-            client_kwargs["timeout"] = self.timeout
-        if self.max_retries is not None:
-            client_kwargs["max_retries"] = self.max_retries
+    def close(self) -> None:
+        """Close the synchronous OpenAI client."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
-        self._client = OpenAI(
-            http_client=init_http_client(self.http_client_kwargs, async_client=False), **client_kwargs
-        )
-        self._async_client = AsyncOpenAI(
-            http_client=init_http_client(self.http_client_kwargs, async_client=True), **client_kwargs
-        )
-        warm_up_tools(self.tools)
-        self._is_warmed_up = True
+    async def close_async(self) -> None:
+        """Close the asynchronous OpenAI client."""
+        if self._async_client is not None:
+            await self._async_client.close()
+            self._async_client = None
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -328,7 +342,7 @@ class VLLMChatGenerator:
 
         openai_formatted_messages = [message.to_openai_dict_format() for message in messages]
 
-        flattened_tools = flatten_tools_or_toolsets(tools or self.tools)
+        flattened_tools = flatten_tools_or_toolsets(tools if tools is not None else self.tools)
         _check_duplicate_tool_names(flattened_tools)
         tool_definitions = None
         if flattened_tools:
@@ -392,7 +406,7 @@ class VLLMChatGenerator:
         return [_convert_streaming_chunks_to_chat_message(chunks=chunks)]
 
     async def _handle_async_stream_response(
-        self, chat_completion: AsyncStream[ChatCompletionChunk], callback: AsyncStreamingCallbackT
+        self, chat_completion: AsyncStream[ChatCompletionChunk], callback: StreamingCallbackT
     ) -> list[ChatMessage]:
         """Handle an asynchronous streaming response, extracting reasoning content from vLLM's reasoning chunks."""
         component_info = ComponentInfo.from_component(self)
@@ -430,7 +444,10 @@ class VLLMChatGenerator:
                         content_started = True
 
                 chunks.append(streaming_chunk)
-                await callback(streaming_chunk)
+                # sync callbacks are allowed in async contexts with Haystack >= 3.0, so only await async ones
+                callback_result = callback(streaming_chunk)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
         except asyncio.CancelledError:
             await asyncio.shield(chat_completion.close())
             raise
@@ -440,7 +457,7 @@ class VLLMChatGenerator:
     @component.output_types(replies=list[ChatMessage])
     def run(
         self,
-        messages: list[ChatMessage],
+        messages: list[ChatMessage] | str,
         streaming_callback: StreamingCallbackT | None = None,
         generation_kwargs: dict[str, Any] | None = None,
         *,
@@ -451,11 +468,13 @@ class VLLMChatGenerator:
 
         :param messages:
             A list of ChatMessage instances representing the input messages.
+            If a string is provided, it is converted to a list containing a ChatMessage with user role.
         :param streaming_callback:
             A callback function that is called when a new token is received from the stream.
         :param generation_kwargs:
-            Additional keyword arguments for text generation. These parameters will
-            override the parameters passed during component initialization.
+            Additional keyword arguments for text generation. These are merged per key with the
+            `generation_kwargs` passed at initialization: keys provided here take precedence, keys set only
+            at initialization are kept.
             For details on vLLM API parameters, see
             [vLLM documentation](https://docs.vllm.ai/en/stable/serving/openai_compatible_server/).
         :param tools:
@@ -466,8 +485,9 @@ class VLLMChatGenerator:
             A dictionary with the following key:
             - `replies`: A list containing the generated responses as ChatMessage instances.
         """
-        if not self._is_warmed_up:
-            self.warm_up()
+        self.warm_up()
+        assert self._client is not None  # noqa: S101
+        messages = _normalize_messages(messages)
 
         if len(messages) == 0:
             return {"replies": []}
@@ -477,7 +497,6 @@ class VLLMChatGenerator:
         )
 
         api_kwargs = self._prepare_api_call(messages, streaming_callback, generation_kwargs, tools)
-        assert self._client is not None  # noqa: S101
         chat_completion = self._client.chat.completions.create(**api_kwargs)
 
         if streaming_callback is not None:
@@ -495,7 +514,7 @@ class VLLMChatGenerator:
     @component.output_types(replies=list[ChatMessage])
     async def run_async(
         self,
-        messages: list[ChatMessage],
+        messages: list[ChatMessage] | str,
         streaming_callback: StreamingCallbackT | None = None,
         generation_kwargs: dict[str, Any] | None = None,
         *,
@@ -506,12 +525,14 @@ class VLLMChatGenerator:
 
         :param messages:
             A list of ChatMessage instances representing the input messages.
+            If a string is provided, it is converted to a list containing a ChatMessage with user role.
         :param streaming_callback:
             A callback function that is called when a new token is received from the stream.
             Must be a coroutine.
         :param generation_kwargs:
-            Additional keyword arguments for text generation. These parameters will
-            override the parameters passed during component initialization.
+            Additional keyword arguments for text generation. These are merged per key with the
+            `generation_kwargs` passed at initialization: keys provided here take precedence, keys set only
+            at initialization are kept.
             For details on vLLM API parameters, see
             [vLLM documentation](https://docs.vllm.ai/en/stable/serving/openai_compatible_server/).
         :param tools:
@@ -522,8 +543,9 @@ class VLLMChatGenerator:
             A dictionary with the following key:
             - `replies`: A list containing the generated responses as ChatMessage instances.
         """
-        if not self._is_warmed_up:
-            self.warm_up()
+        await self.warm_up_async()
+        assert self._async_client is not None  # noqa: S101
+        messages = _normalize_messages(messages)
 
         if len(messages) == 0:
             return {"replies": []}
@@ -533,7 +555,6 @@ class VLLMChatGenerator:
         )
 
         api_kwargs = self._prepare_api_call(messages, streaming_callback, generation_kwargs, tools)
-        assert self._async_client is not None  # noqa: S101
         chat_completion = await self._async_client.chat.completions.create(**api_kwargs)
 
         if streaming_callback is not None:

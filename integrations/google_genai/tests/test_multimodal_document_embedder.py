@@ -64,8 +64,47 @@ class TestExtractSourcesInfo:
         with pytest.raises(ValueError, match="has an unsupported MIME type"):
             _extract_sources_info(documents=[document], file_path_meta_field="file_path", root_path="")
 
+    def test_extract_sources_info_rejects_path_traversal(self, test_files_path):
+        # Attacker-controlled document metadata attempts to escape the configured root.
+        document = Document(content="test", meta={"file_path": "../../../../../../etc/passwd"})
+        with pytest.raises(ValueError, match="escapes the configured root"):
+            _extract_sources_info(
+                documents=[document], file_path_meta_field="file_path", root_path=str(test_files_path)
+            )
 
-class TestGoogleGenAIMultimodalDocumentEmbedder:
+    def test_extract_sources_info_rejects_absolute_outside_root(self, test_files_path, tmp_path):
+        # Absolute path that lies outside the configured root must be rejected before any IO.
+        outside_file = tmp_path / "secret.png"
+        outside_file.write_bytes(b"secret")
+        document = Document(content="test", meta={"file_path": str(outside_file)})
+        with pytest.raises(ValueError, match="escapes the configured root"):
+            _extract_sources_info(
+                documents=[document], file_path_meta_field="file_path", root_path=str(test_files_path)
+            )
+
+    def test_extract_sources_info_rejects_symlink_escaping_root(self, tmp_path):
+        # A symlink inside the root pointing outside of it must not be followed.
+        outside_file = tmp_path / "secret.png"
+        outside_file.write_bytes(b"secret")
+        root = tmp_path / "root"
+        root.mkdir()
+        (root / "link.png").symlink_to(outside_file)
+        document = Document(content="test", meta={"file_path": "link.png"})
+        with pytest.raises(ValueError, match="escapes the configured root"):
+            _extract_sources_info(documents=[document], file_path_meta_field="file_path", root_path=str(root))
+
+    def test_extract_sources_info_accepts_path_inside_root(self, test_files_path):
+        # When the resolved path is inside the configured root, processing must succeed.
+        document = Document(content="test", meta={"file_path": "banana.png"})
+        sources_info = _extract_sources_info(
+            documents=[document], file_path_meta_field="file_path", root_path=str(test_files_path)
+        )
+        assert len(sources_info) == 1
+        assert sources_info[0]["mime_type"] == "image/png"
+        assert sources_info[0]["path"] == (test_files_path / "banana.png").resolve()
+
+
+class TestGoogleGenAIMultimodalDocumentEmbedderInitSerDe:
     def test_init_with_parameters(self):
         embedder = GoogleGenAIMultimodalDocumentEmbedder(
             api_key=Secret.from_token("fake-api-key-2"),
@@ -76,6 +115,8 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
             root_path="root_path",
             image_size=(1024, 1024),
             config={"task_type": "CLASSIFICATION"},
+            timeout=30.0,
+            max_retries=3,
         )
         assert embedder._api_key.resolve_value() == "fake-api-key-2"
         assert embedder._model == "model"
@@ -85,15 +126,12 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
         assert embedder._batch_size == 64
         assert embedder._progress_bar is False
         assert embedder._config == {"task_type": "CLASSIFICATION"}
+        assert embedder._timeout == 30.0
+        assert embedder._max_retries == 3
+        assert embedder._client is None
+        assert embedder._async_client is None
 
-    def test_init_fail_wo_api_key(self, monkeypatch):
-        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-        with pytest.raises(ValueError, match="you must export the GOOGLE_API_KEY or GEMINI_API_KEY"):
-            GoogleGenAIMultimodalDocumentEmbedder()
-
-    def test_to_dict(self, monkeypatch):
-        monkeypatch.setenv("GOOGLE_API_KEY", "fake-api-key")
+    def test_to_dict(self):
         component = GoogleGenAIMultimodalDocumentEmbedder()
 
         data = component_to_dict(component, "embedder")
@@ -103,7 +141,7 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
                 "haystack_integrations.components.embedders.google_genai.multimodal_document_embedder.GoogleGenAIMultimodalDocumentEmbedder"
             ),
             "init_parameters": {
-                "model": "gemini-embedding-2-preview",
+                "model": "gemini-embedding-2",
                 "file_path_meta_field": "file_path",
                 "root_path": None,
                 "image_size": None,
@@ -114,6 +152,8 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
                 "vertex_ai_project": None,
                 "vertex_ai_location": None,
                 "config": None,
+                "timeout": None,
+                "max_retries": None,
             },
         }
 
@@ -123,7 +163,7 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
                 "haystack_integrations.components.embedders.google_genai.multimodal_document_embedder.GoogleGenAIMultimodalDocumentEmbedder"
             ),
             "init_parameters": {
-                "model": "gemini-embedding-2-preview",
+                "model": "gemini-embedding-2",
                 "file_path_meta_field": "file_path",
                 "root_path": "some_root_path",
                 "image_size": (1024, 1024),
@@ -134,13 +174,15 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
                 "vertex_ai_project": None,
                 "vertex_ai_location": None,
                 "config": {"task_type": "CLASSIFICATION"},
+                "timeout": 30.0,
+                "max_retries": 3,
             },
         }
         monkeypatch.setenv("GOOGLE_API_KEY", "fake-api-key")
 
         embedder = component_from_dict(GoogleGenAIMultimodalDocumentEmbedder, data, "embedder")
         assert embedder._api_key.resolve_value() == "fake-api-key"
-        assert embedder._model == "gemini-embedding-2-preview"
+        assert embedder._model == "gemini-embedding-2"
         assert embedder._file_path_meta_field == "file_path"
         assert embedder._root_path == "some_root_path"
         assert embedder._image_size == (1024, 1024)
@@ -150,7 +192,152 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
         assert embedder._api == "gemini"
         assert embedder._vertex_ai_project is None
         assert embedder._vertex_ai_location is None
+        assert embedder._timeout == 30.0
+        assert embedder._max_retries == 3
 
+    def test_to_dict_with_custom_init_parameters(self):
+        component = GoogleGenAIMultimodalDocumentEmbedder(
+            model="model",
+            batch_size=12,
+            timeout=30.0,
+            max_retries=3,
+            config={"output_dimensionality": 768},
+            root_path="some_root_path",
+            image_size=(512, 512),
+            progress_bar=False,
+        )
+        data = component.to_dict()
+        assert data == {
+            "type": (
+                "haystack_integrations.components.embedders.google_genai.multimodal_document_embedder.GoogleGenAIMultimodalDocumentEmbedder"
+            ),
+            "init_parameters": {
+                "model": "model",
+                "file_path_meta_field": "file_path",
+                "root_path": "some_root_path",
+                "image_size": (512, 512),
+                "batch_size": 12,
+                "progress_bar": False,
+                "api_key": {"type": "env_var", "env_vars": ["GOOGLE_API_KEY", "GEMINI_API_KEY"], "strict": False},
+                "api": "gemini",
+                "vertex_ai_project": None,
+                "vertex_ai_location": None,
+                "config": {"output_dimensionality": 768},
+                "timeout": 30.0,
+                "max_retries": 3,
+            },
+        }
+
+    def test_to_dict_from_dict_roundtrip(self, monkeypatch):
+        monkeypatch.setenv("GOOGLE_API_KEY", "fake-api-key")
+        original = GoogleGenAIMultimodalDocumentEmbedder(
+            model="model",
+            batch_size=12,
+            timeout=30.0,
+            max_retries=3,
+            image_size=(512, 512),
+            progress_bar=False,
+            config={"output_dimensionality": 768},
+            root_path="some_root_path",
+        )
+        data = original.to_dict()
+        restored = component_from_dict(GoogleGenAIMultimodalDocumentEmbedder, data, "embedder")
+        assert restored._api_key.resolve_value() == "fake-api-key"
+        assert restored._model == "model"
+        assert restored._batch_size == 12
+        assert restored._timeout == 30.0
+        assert restored._max_retries == 3
+        assert restored._config == {"output_dimensionality": 768}
+        assert restored._root_path == "some_root_path"
+        assert restored._image_size == (512, 512)
+        assert restored._progress_bar is False
+        assert restored._file_path_meta_field == "file_path"
+        assert restored._api == "gemini"
+        assert restored._vertex_ai_project is None
+        assert restored._vertex_ai_location is None
+
+
+class TestComponentLifecycle:
+    def test_key_resolved_at_warm_up_not_init(self, monkeypatch):
+        monkeypatch.delenv("MISSING_GOOGLE_API_KEY", raising=False)
+        embedder = GoogleGenAIMultimodalDocumentEmbedder(api_key=Secret.from_env_var("MISSING_GOOGLE_API_KEY"))
+
+        with pytest.raises(ValueError, match="MISSING_GOOGLE_API_KEY"):
+            embedder.warm_up()
+
+    @patch("haystack_integrations.components.embedders.google_genai.multimodal_document_embedder._get_client")
+    def test_sync_lifecycle(self, mock_get_client):
+        embedder = GoogleGenAIMultimodalDocumentEmbedder(api_key=Secret.from_token("test-api-key"))
+        client = mock_get_client.return_value
+        embedder.warm_up()
+        assert embedder._client is client
+        assert embedder._async_client is None
+
+        embedder.close()
+        client.close.assert_called_once_with()
+        assert embedder._client is None
+
+        embedder.warm_up()
+        assert mock_get_client.call_count == 2
+
+    @patch("haystack_integrations.components.embedders.google_genai.multimodal_document_embedder._get_client")
+    async def test_async_lifecycle(self, mock_get_client):
+        embedder = GoogleGenAIMultimodalDocumentEmbedder(api_key=Secret.from_token("test-api-key"))
+        client = mock_get_client.return_value
+        client.aclose = AsyncMock()
+        await embedder.warm_up_async()
+        assert embedder._async_client is client
+        assert embedder._client is None
+
+        await embedder.close_async()
+        client.aclose.assert_awaited_once_with()
+        assert embedder._async_client is None
+
+        await embedder.warm_up_async()
+        assert mock_get_client.call_count == 2
+
+    @patch("haystack_integrations.components.embedders.google_genai.multimodal_document_embedder._get_client")
+    def test_warm_up_is_idempotent(self, mock_get_client):
+        embedder = GoogleGenAIMultimodalDocumentEmbedder(api_key=Secret.from_token("test-api-key"))
+        embedder.warm_up()
+        embedder.warm_up()
+        mock_get_client.assert_called_once()
+
+    @patch("haystack_integrations.components.embedders.google_genai.multimodal_document_embedder._get_client")
+    async def test_warm_up_async_is_idempotent(self, mock_get_client):
+        embedder = GoogleGenAIMultimodalDocumentEmbedder(api_key=Secret.from_token("test-api-key"))
+        await embedder.warm_up_async()
+        await embedder.warm_up_async()
+        mock_get_client.assert_called_once()
+
+    async def test_close_is_safe_without_warm_up(self):
+        embedder = GoogleGenAIMultimodalDocumentEmbedder(api_key=Secret.from_token("test-api-key"))
+        embedder.close()
+        await embedder.close_async()
+        assert embedder._client is None
+        assert embedder._async_client is None
+
+    @patch("haystack_integrations.components.embedders.google_genai.multimodal_document_embedder._get_client")
+    async def test_close_and_close_async_are_independent(self, mock_get_client):
+        sync_client = MagicMock()
+        async_client = MagicMock()
+        async_client.aclose = AsyncMock()
+        mock_get_client.side_effect = [sync_client, async_client]
+        embedder = GoogleGenAIMultimodalDocumentEmbedder(api_key=Secret.from_token("test-api-key"))
+        embedder.warm_up()
+        await embedder.warm_up_async()
+
+        embedder.close()
+        assert embedder._client is None
+        assert embedder._async_client is async_client
+        async_client.aclose.assert_not_awaited()
+
+        await embedder.close_async()
+        assert embedder._async_client is None
+        sync_client.close.assert_called_once_with()
+
+
+class TestGoogleGenAIMultimodalDocumentEmbedderRun:
     def test_extract_parts_to_embed_images(self, test_files_path):
         embedder = GoogleGenAIMultimodalDocumentEmbedder(api_key=Secret.from_token("fake-api-key"))
         docs = [
@@ -188,6 +375,7 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
 
         mock_response = MagicMock()
         mock_response.embeddings = None
+        embedder._client = MagicMock()
         embedder._client.models.embed_content = MagicMock(return_value=mock_response)
 
         parts = [MagicMock(spec=types.Part)]
@@ -203,6 +391,7 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
         mock_embedding.values = None
         mock_response = MagicMock()
         mock_response.embeddings = [mock_embedding]
+        embedder._client = MagicMock()
         embedder._client.models.embed_content = MagicMock(return_value=mock_response)
 
         parts = [MagicMock(spec=types.Part)]
@@ -211,7 +400,8 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
         assert embeddings == [None]
         assert "has no values" in caplog.text
 
-    def test_run_wrong_input(self):
+    @patch("haystack_integrations.components.embedders.google_genai.multimodal_document_embedder._get_client")
+    def test_run_wrong_input(self, _mock_get_client):
         embedder = GoogleGenAIMultimodalDocumentEmbedder(api_key=Secret.from_token("fake-api-key"))
         with pytest.raises(TypeError, match="expects a list of Documents"):
             embedder.run(documents="not a list")
@@ -229,13 +419,14 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
         mock_embedding.values = [0.1, 0.2, 0.3]
         mock_response = MagicMock()
         mock_response.embeddings = [mock_embedding, mock_embedding]
+        embedder._client = MagicMock()
         embedder._client.models.embed_content = MagicMock(return_value=mock_response)
 
         result = embedder.run(documents=docs)
         assert len(result["documents"]) == 2
         for doc in result["documents"]:
             assert doc.embedding == [0.1, 0.2, 0.3]
-        assert result["meta"]["model"] == "gemini-embedding-2-preview"
+        assert result["meta"]["model"] == "gemini-embedding-2"
 
     @pytest.mark.asyncio
     async def test_run_async_with_mocked_client(self, test_files_path):
@@ -248,12 +439,13 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
         mock_embedding.values = [0.4, 0.5, 0.6]
         mock_response = MagicMock()
         mock_response.embeddings = [mock_embedding]
-        embedder._client.aio.models.embed_content = AsyncMock(return_value=mock_response)
+        embedder._async_client = MagicMock()
+        embedder._async_client.models.embed_content = AsyncMock(return_value=mock_response)
 
         result = await embedder.run_async(documents=docs)
         assert len(result["documents"]) == 1
         assert result["documents"][0].embedding == [0.4, 0.5, 0.6]
-        assert result["meta"]["model"] == "gemini-embedding-2-preview"
+        assert result["meta"]["model"] == "gemini-embedding-2"
 
     @pytest.mark.integration
     @pytest.mark.skipif(
@@ -271,7 +463,7 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
         assert len(result["documents"]) == 2
         for doc in result["documents"]:
             assert len(doc.embedding) == 3072
-        assert result["meta"]["model"] == "gemini-embedding-2-preview"
+        assert result["meta"]["model"] == "gemini-embedding-2"
 
     @pytest.mark.integration
     @pytest.mark.asyncio
@@ -290,4 +482,4 @@ class TestGoogleGenAIMultimodalDocumentEmbedder:
         assert len(result["documents"]) == 2
         for doc in result["documents"]:
             assert len(doc.embedding) == 3072
-        assert result["meta"]["model"] == "gemini-embedding-2-preview"
+        assert result["meta"]["model"] == "gemini-embedding-2"

@@ -4,11 +4,12 @@
 
 from typing import Any, Literal
 
-from google.genai import types
-from haystack import component, default_from_dict, default_to_dict, logging
-from haystack.utils import Secret, deserialize_secrets_inplace
+from google.genai import Client, types
+from google.genai.client import AsyncClient
+from haystack import component, default_to_dict, logging
+from haystack.utils import Secret
 
-from haystack_integrations.components.common.google_genai.utils import _get_client
+from haystack_integrations.common.google_genai.utils import _get_client
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,8 @@ class GoogleGenAITextEmbedder:
         prefix: str = "",
         suffix: str = "",
         config: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        max_retries: int | None = None,
     ) -> None:
         """
         Creates an GoogleGenAITextEmbedder component.
@@ -99,13 +102,22 @@ class GoogleGenAITextEmbedder:
             The name of the model to use for calculating embeddings.
             The default model is `gemini-embedding-001`.
         :param prefix:
-            A string to add at the beginning of each text to embed.
+            A string to add at the beginning of each text. It can be used to specify a task type for
+            `gemini-embedding-2`. For available task types, see
+            [Gemini documentation](https://ai.google.dev/gemini-api/docs/embeddings#task-types).
         :param suffix:
             A string to add at the end of each text to embed.
         :param config:
-            A dictionary of keyword arguments to configure embedding content configuration `types.EmbedContentConfig`.
-            If not specified, it defaults to `{"task_type": "SEMANTIC_SIMILARITY"}`.
-            For more information, see the [Google AI Task types](https://ai.google.dev/gemini-api/docs/embeddings#task-types).
+            A dictionary of keyword arguments to configure embedding content configuration.
+            See [Google API documentation](https://googleapis.github.io/python-genai/genai.html#genai.types.EmbedContentConfig)
+            for the available options.
+            Specifying task types in `config` does not take effect for `gemini-embedding-2`.
+            See [Gemini documentation](https://ai.google.dev/gemini-api/docs/embeddings#task-types) for more
+            information.
+        :param timeout:
+            The timeout in seconds for the underlying Google GenAI client network requests.
+        :param max_retries:
+            The maximum number of retries for the underlying Google GenAI client network requests.
         """
 
         self._api_key = api_key
@@ -115,13 +127,48 @@ class GoogleGenAITextEmbedder:
         self._model_name = model
         self._prefix = prefix
         self._suffix = suffix
-        self._config = config if config is not None else {"task_type": "SEMANTIC_SIMILARITY"}
-        self._client = _get_client(
-            api_key=api_key,
-            api=api,
-            vertex_ai_project=vertex_ai_project,
-            vertex_ai_location=vertex_ai_location,
-        )
+        self._config = config
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self._client: Client | None = None
+        self._async_client: AsyncClient | None = None
+
+    def warm_up(self) -> None:
+        """Create the synchronous Google Gen AI client."""
+        if self._client is None:
+            self._client = _get_client(
+                api_key=self._api_key,
+                api=self._api,
+                vertex_ai_project=self._vertex_ai_project,
+                vertex_ai_location=self._vertex_ai_location,
+                timeout=self._timeout,
+                max_retries=self._max_retries,
+            )
+
+    async def warm_up_async(self) -> None:
+        """Create the asynchronous Google Gen AI client."""
+        if self._async_client is None:
+            self._async_client = _get_client(
+                api_key=self._api_key,
+                api=self._api,
+                vertex_ai_project=self._vertex_ai_project,
+                vertex_ai_location=self._vertex_ai_location,
+                timeout=self._timeout,
+                max_retries=self._max_retries,
+                async_client=True,
+            )
+
+    def close(self) -> None:
+        """Close the synchronous Google Gen AI client."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    async def close_async(self) -> None:
+        """Close the asynchronous Google Gen AI client."""
+        if self._async_client is not None:
+            await self._async_client.aclose()
+            self._async_client = None
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -140,20 +187,9 @@ class GoogleGenAITextEmbedder:
             prefix=self._prefix,
             suffix=self._suffix,
             config=self._config,
+            timeout=self._timeout,
+            max_retries=self._max_retries,
         )
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "GoogleGenAITextEmbedder":
-        """
-        Deserializes the component from a dictionary.
-
-        :param data:
-            Dictionary to deserialize from.
-        :returns:
-            Deserialized component.
-        """
-        deserialize_secrets_inplace(data["init_parameters"], keys=["api_key"])
-        return default_from_dict(cls, data)
 
     def _prepare_input(self, text: str) -> dict[str, Any]:
         if not isinstance(text, str):
@@ -189,6 +225,9 @@ class GoogleGenAITextEmbedder:
             - `embedding`: The embedding of the input text.
             - `meta`: Information about the usage of the model.
         """
+        self.warm_up()
+        assert self._client is not None  # noqa: S101
+
         create_kwargs = self._prepare_input(text=text)
         response = self._client.models.embed_content(**create_kwargs)
         return self._prepare_output(result=response)
@@ -209,6 +248,9 @@ class GoogleGenAITextEmbedder:
             - `embedding`: The embedding of the input text.
             - `meta`: Information about the usage of the model.
         """
+        await self.warm_up_async()
+        assert self._async_client is not None  # noqa: S101
+
         create_kwargs = self._prepare_input(text=text)
-        response = await self._client.aio.models.embed_content(**create_kwargs)
+        response = await self._async_client.models.embed_content(**create_kwargs)
         return self._prepare_output(result=response)

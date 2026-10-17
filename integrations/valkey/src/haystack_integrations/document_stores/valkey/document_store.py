@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import struct
+from contextlib import suppress
 from dataclasses import replace
 from typing import Any, ClassVar, Literal
 
@@ -226,6 +227,7 @@ class ValkeyDocumentStore(DocumentStore):
                     credentials=self._build_credentials(self._username, self._password),
                     request_timeout=self._request_timeout,
                     reconnect_strategy=reconnect_strategy,
+                    client_info_tag="haystack-core-integrations",
                 )
                 self._client = SyncGlideClusterClient.create(cluster_config)
             else:
@@ -235,6 +237,8 @@ class ValkeyDocumentStore(DocumentStore):
                     credentials=self._build_credentials(self._username, self._password),
                     request_timeout=self._request_timeout,
                     reconnect_strategy=reconnect_strategy,
+                    client_info_tag="haystack-core-integrations",
+                    client_name="haystack_vector_store_client",
                 )
                 self._client = SyncGlideClient.create(client_config)
             return self._client
@@ -263,6 +267,7 @@ class ValkeyDocumentStore(DocumentStore):
                     credentials=self._build_credentials(self._username, self._password),
                     request_timeout=self._request_timeout,
                     reconnect_strategy=reconnect_strategy,
+                    client_info_tag="haystack-core-integrations",
                 )
                 self._async_client = await GlideClusterClient.create(cluster_config)
             else:
@@ -272,6 +277,8 @@ class ValkeyDocumentStore(DocumentStore):
                     credentials=self._build_credentials(self._username, self._password),
                     request_timeout=self._request_timeout,
                     reconnect_strategy=reconnect_strategy,
+                    client_info_tag="haystack-core-integrations",
+                    client_name="haystack_vector_store_client",
                 )
                 self._async_client = await GlideClient.create(client_config)
             return self._async_client
@@ -280,24 +287,22 @@ class ValkeyDocumentStore(DocumentStore):
             raise ValkeyDocumentStoreError(msg) from e
 
     def close(self) -> None:
-        """Close the synchronous Valkey client connection."""
-        if self._client:
-            try:
+        """
+        Release the associated synchronous resources.
+        """
+        if self._client is not None:
+            with suppress(Exception):
                 self._client.close()
-            except Exception as e:
-                logger.error("Failed to close Valkey client: {error}", error=e)
-                pass
-        self._client = None
+            self._client = None
 
     async def close_async(self) -> None:
-        """Close the asynchronous Valkey client connection."""
-        if self._async_client:
-            try:
+        """
+        Release the associated asynchronous resources.
+        """
+        if self._async_client is not None:
+            with suppress(Exception):
                 await self._async_client.close()
-            except Exception as e:
-                logger.error("Failed to close Valkey client: {error}", error=e)
-                pass
-        self._async_client = None
+            self._async_client = None
 
     def _has_index(self) -> bool:
         client = self._get_connection()
@@ -695,20 +700,29 @@ class ValkeyDocumentStore(DocumentStore):
         client = await self._get_connection_async()
         await self._create_index_async()
 
-        def write_single_doc(doc: Document) -> Any:
+        async def write_single_doc(doc: Document) -> Any:
             doc_dict = self._prepare_document_dict(doc)
             key = f"{self._index_name}:{doc.id}"
-            return glide_json.set(client, key, "$", json.dumps(doc_dict))
+            return await glide_json.set(client, key, "$", json.dumps(doc_dict))
 
         written_count = 0
         for i in range(0, len(documents), self._batch_size):
             batch = documents[i : i + self._batch_size]
-            try:
-                await asyncio.gather(*[write_single_doc(doc) for doc in batch])
-                written_count += len(batch)
-            except Exception as e:
-                msg = f"Failed to write batch starting at index {i}: {e}"
-                raise ValkeyDocumentStoreError(msg) from e
+            results = await asyncio.gather(*[write_single_doc(doc) for doc in batch], return_exceptions=True)
+            for result in results:
+                if not isinstance(result, BaseException):
+                    written_count += 1
+
+            failures = [
+                (doc, result) for doc, result in zip(batch, results, strict=True) if isinstance(result, BaseException)
+            ]
+            if failures:
+                ids = ", ".join(doc.id for doc, _ in failures)
+                msg = (
+                    f"Failed to write document(s) {ids}: {failures[0][1]}. "
+                    f"{written_count} document(s) were written before this failure."
+                )
+                raise ValkeyDocumentStoreError(msg) from failures[0][1]
 
         return written_count
 
@@ -734,7 +748,9 @@ class ValkeyDocumentStore(DocumentStore):
         """
         client = self._get_connection()
 
-        keys: list[str | bytes] = [f"{self._index_name}:{doc_id}" for doc_id in document_ids]
+        keys: list[str | bytes | bytearray | memoryview[int]] = [
+            f"{self._index_name}:{doc_id}" for doc_id in document_ids
+        ]
         try:
             result = client.delete(keys)
             if result < len(document_ids):
@@ -770,7 +786,9 @@ class ValkeyDocumentStore(DocumentStore):
         """
         client = await self._get_connection_async()
 
-        keys: list[str | bytes] = [f"{self._index_name}:{doc_id}" for doc_id in document_ids]
+        keys: list[str | bytes | bytearray | memoryview[int]] = [
+            f"{self._index_name}:{doc_id}" for doc_id in document_ids
+        ]
         try:
             result = await client.delete(keys)
             if result < len(document_ids):
@@ -1011,24 +1029,24 @@ class ValkeyDocumentStore(DocumentStore):
         search_term: str | None = None,
         from_: int = 0,
         size: int = 10,
-    ) -> tuple[list[str], int]:
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], int]:
         """
         Return unique values for a metadata field with optional search and pagination.
 
-        Values are stringified. For tag fields the distinct values are returned; for numeric fields
-        the string representation of each distinct value is returned.
+        Values are returned in their original type (e.g. int, bool). The `search_term` filter, when
+        provided, matches against the string representation of each value.
 
         :param metadata_field: Metadata field name (e.g. "category" or "meta.category").
         :param search_term: Optional case-insensitive substring filter on the value.
         :param from_: Start index for pagination (default 0).
         :param size: Number of values to return (default 10).
+        :param filters: Optional filters to restrict the documents considered.
         :return: Tuple of (list of unique values for the requested page, total count of unique values).
-        :raises ValueError: If the field is not configured for filtering.
         :raises ValkeyDocumentStoreError: If the operation fails.
         """
-        self._validate_metadata_field_names([metadata_field])
         try:
-            docs = self.filter_documents(filters=None)
+            docs = self.filter_documents(filters=filters)
             return ValkeyDocumentStore._get_metadata_field_unique_values_impl(
                 docs, metadata_field, search_term=search_term, from_=from_, size=size
             )
@@ -1042,21 +1060,24 @@ class ValkeyDocumentStore(DocumentStore):
         search_term: str | None = None,
         from_: int = 0,
         size: int = 10,
-    ) -> tuple[list[str], int]:
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], int]:
         """
         Asynchronously return unique values for a metadata field with optional search and pagination.
+
+        Values are returned in their original type (e.g. int, bool). The `search_term` filter, when
+        provided, matches against the string representation of each value.
 
         :param metadata_field: Metadata field name (e.g. "category" or "meta.category").
         :param search_term: Optional case-insensitive substring filter on the value.
         :param from_: Start index for pagination (default 0).
         :param size: Number of values to return (default 10).
+        :param filters: Optional filters to restrict the documents considered.
         :return: Tuple of (list of unique values for the requested page, total count of unique values).
-        :raises ValueError: If the field is not configured for filtering.
         :raises ValkeyDocumentStoreError: If the operation fails.
         """
-        self._validate_metadata_field_names([metadata_field])
         try:
-            docs = await self.filter_documents_async(filters=None)
+            docs = await self.filter_documents_async(filters=filters)
             return ValkeyDocumentStore._get_metadata_field_unique_values_impl(
                 docs, metadata_field, search_term=search_term, from_=from_, size=size
             )
@@ -1308,8 +1329,10 @@ class ValkeyDocumentStore(DocumentStore):
                     if isinstance(value, bool):
                         value = int(value)
                     elif not isinstance(value, (int, float)):
-                        msg = f"Field '{field_name}' expects numeric value but got {type(value).__name__}"
-                        raise ValueError(msg)
+                        # Not indexable as numeric; omit from the index. The original value is still
+                        # preserved in `payload` above, so type-preserving reads (e.g.
+                        # get_metadata_field_unique_values) remain correct.
+                        value = None
 
             doc_dict[field_name_with_prefix] = value
 
@@ -1467,22 +1490,25 @@ class ValkeyDocumentStore(DocumentStore):
         search_term: str | None = None,
         from_: int = 0,
         size: int = 10,
-    ) -> tuple[list[str], int]:
+    ) -> tuple[list[Any], int]:
         """Extract unique values for a metadata field with optional search and pagination."""
-        unique_vals: list[str] = []
-        seen: set[str] = set()
+        unique_vals: list[Any] = []
+        # Key on (type, str value): values that share a string form (e.g. int 1 and str "1")
+        # must not collapse into a single entry.
+        seen: set[tuple[type, str]] = set()
         for doc in documents:
             val = (doc.meta or {}).get(ValkeyDocumentStore._metadata_field_to_doc_meta_key(metadata_field))
             if val is None:
                 continue
             str_val = str(val)
-            if str_val in seen:
+            dedup_key = (type(val), str_val)
+            if dedup_key in seen:
                 continue
             if search_term is not None and search_term.lower() not in str_val.lower():
                 continue
-            seen.add(str_val)
-            unique_vals.append(str_val)
-        unique_vals.sort()
+            seen.add(dedup_key)
+            unique_vals.append(val)
+        unique_vals.sort(key=str)
         total = len(unique_vals)
         page = unique_vals[from_ : from_ + size]
         return page, total

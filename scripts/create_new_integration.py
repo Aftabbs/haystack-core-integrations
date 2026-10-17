@@ -20,37 +20,51 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 INTEGRATIONS_DIR = REPO_ROOT / "integrations"
 
 COMPONENT_TYPES = [
+    "audio",
+    "classifiers",
     "connectors",
     "converters",
     "document_stores",
     "downloaders",
     "embedders",
     "evaluators",
+    "extractors",
     "fetchers",
     "generators",
     "preprocessors",
     "rankers",
+    "readers",
     "retrievers",
+    "routers",
     "tools",
     "tracing",
     "translators",
+    "websearch",
+    "writers",
 ]
 
 TYPE_LABELS = {
+    "audio": "Audio",
+    "classifiers": "Classifier",
     "connectors": "Connector",
     "converters": "Converter",
     "document_stores": "Document Store",
     "downloaders": "Downloader",
     "embedders": "Embedder",
     "evaluators": "Evaluator",
+    "extractors": "Extractor",
     "fetchers": "Fetcher",
     "generators": "Generator",
     "preprocessors": "Preprocessor",
     "rankers": "Ranker",
+    "readers": "Reader",
     "retrievers": "Retriever",
+    "routers": "Router",
     "tools": "Tool",
     "tracing": "Tracer",
     "translators": "Translator",
+    "websearch": "Websearch",
+    "writers": "Writer",
 }
 
 LICENSE_HEADER = """\
@@ -96,7 +110,11 @@ def prompt_component_type() -> str:
 def main():
     parser = argparse.ArgumentParser(description="Scaffold a new Haystack integration.")
     parser.add_argument("--name", type=str, help="The name of the integration (e.g. opensearch)")
-    parser.add_argument("--type", dest="component_type", help=f"Component type: {', '.join(COMPONENT_TYPES)}")
+    parser.add_argument(
+        "--type",
+        dest="component_type",
+        help=f"Component type: {', '.join(COMPONENT_TYPES)}",
+    )
     args = parser.parse_args()
 
     name = args.name
@@ -126,7 +144,11 @@ def main():
     print(f"  Module: {module_path}")
 
     created_files = create_integration_files(
-        name, component_type, repo_root=REPO_ROOT, integrations_dir=INTEGRATIONS_DIR, license_header=LICENSE_HEADER
+        name,
+        component_type,
+        repo_root=REPO_ROOT,
+        integrations_dir=INTEGRATIONS_DIR,
+        license_header=LICENSE_HEADER,
     )
     for file in created_files:
         print(f"  Created: {file.relative_to(REPO_ROOT)}")
@@ -143,13 +165,14 @@ def main():
     readme_path = update_root_readme(name, component_type, TYPE_LABELS, repo_root=REPO_ROOT)
     print(f"  Updated: {readme_path}")
 
-    print(f"\nDone! Next steps:")
+    print("\nDone! Next steps:")
     print(f"  1. Add your component code in integrations/{name}/src/")
-    print(f"  2. Export the component classes from the __init__.py in your module")
+    print("  2. Export the component classes from the __init__.py in your module")
     print(f"  3. Add integration-specific dependencies to integrations/{name}/pyproject.toml")
     print(f"  4. Add tests in integrations/{name}/tests/")
-    print(f"  5. If your integration tests need API keys, update .github/workflows/{name}.yml accordingly")
-    print(f"     and ask a maintainer to add the secret to the GitHub repo.")
+    print(f"  5. If your integration tests consume API keys, update .github/workflows/{name}.yml accordingly ")
+    print("     (expose the secrets and uncomment the `if:` on the integration test step) and ask a maintainer to add "
+          "the secret to the GitHub repo.")
     print(f"  6. Add relevant keywords to integrations/{name}/pyproject.toml")
     print(f"  7. Check that the correct module paths are used in integrations/{name}/pydoc/config_docusaurus.yml")
 

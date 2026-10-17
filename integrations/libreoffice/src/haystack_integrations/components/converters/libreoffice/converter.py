@@ -10,11 +10,10 @@ from asyncio import create_subprocess_exec
 from collections.abc import Iterable
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, ClassVar, Literal, TypedDict, get_args
+from typing import Any, ClassVar, Literal, Self, TypedDict, get_args
 
 from haystack import component, default_from_dict, default_to_dict
 from haystack.dataclasses import ByteStream
-from typing_extensions import Self
 
 OUTPUT_FILE_TYPE = Literal[
     "pdf",
@@ -158,7 +157,7 @@ class LibreOfficeFileConverter:
         :returns:
             Dictionary with serialized data.
         """
-        return default_to_dict(self)
+        return default_to_dict(self, output_file_type=self.output_file_type)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
@@ -278,6 +277,7 @@ class LibreOfficeFileConverter:
         :raises ValueError: If a source's file type is not in :attr:`SUPPORTED_TYPES`,
             or if `output_file_type` is not a valid conversion target for it,
             or if `output_file_type` has not been provided anywhere.
+        :raises subprocess.CalledProcessError: If soffice exits with a non-zero status.
         """
         resolved_output_file_type = output_file_type or self.output_file_type
         if resolved_output_file_type is None:
@@ -346,6 +346,7 @@ class LibreOfficeFileConverter:
         :raises ValueError: If a source's file type is not in :attr:`SUPPORTED_TYPES`,
             or if `output_file_type` is not a valid conversion target for it,
             or if `output_file_type` has not been provided anywhere.
+        :raises subprocess.CalledProcessError: If soffice exits with a non-zero status.
         """
         resolved_output_file_type = output_file_type or self.output_file_type
         if resolved_output_file_type is None:
@@ -365,7 +366,8 @@ class LibreOfficeFileConverter:
 
                     process = await create_subprocess_exec(*args)
                     # Wait for process to complete as only one instance of soffice can occur at once
-                    await process.wait()
+                    if returncode := await process.wait():
+                        raise subprocess.CalledProcessError(returncode, args)
                     outputs.append(
                         ByteStream(
                             data=output_path.read_bytes(),
@@ -379,7 +381,8 @@ class LibreOfficeFileConverter:
 
                 process = await create_subprocess_exec(*args)
                 # Wait for process to complete as only one instance of soffice can occur at once
-                await process.wait()
+                if returncode := await process.wait():
+                    raise subprocess.CalledProcessError(returncode, args)
 
                 outputs.append(
                     ByteStream(

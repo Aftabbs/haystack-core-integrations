@@ -4,10 +4,10 @@
 
 import json
 import os
-import urllib.request
 from pathlib import Path
 from typing import Annotated
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 from haystack import Document, Pipeline
@@ -25,6 +25,7 @@ from haystack.dataclasses import (
 )
 from haystack.document_stores.in_memory import InMemoryDocumentStore
 from haystack.tools import Tool, Toolset, create_tool_from_function
+from huggingface_hub import hf_hub_download
 
 from haystack_integrations.components.generators.llama_cpp.chat.chat_generator import (
     LlamaCppChatGenerator,
@@ -58,14 +59,23 @@ def temperature_tool():
 
 
 def download_file(file_link, filename, capsys):
-    # Checks if the file already exists before downloading
-    if not os.path.isfile(filename):
-        urllib.request.urlretrieve(file_link, filename)  # noqa: S310
-        with capsys.disabled():
-            print("\nModel file downloaded successfully.")
-    else:
+    # `filename` is the local destination path. `file_link` is a HuggingFace "resolve"
+    # URL; we download via huggingface_hub so the request is authenticated with the
+    # HF_TOKEN env var (avoids anonymous rate limits and supports gated repos).
+    if os.path.isfile(filename):
         with capsys.disabled():
             print("\nModel file already exists.")
+        return
+
+    # Parse https://huggingface.co/<repo_id>/resolve/<revision>/<path> into its parts.
+    repo_id, _, rest = urlparse(file_link).path.lstrip("/").partition("/resolve/")
+    revision, _, path_in_repo = rest.partition("/")
+    dest = Path(filename)
+    downloaded = Path(hf_hub_download(repo_id=repo_id, filename=path_in_repo, revision=revision, local_dir=dest.parent))
+    if downloaded != dest:
+        downloaded.rename(dest)
+    with capsys.disabled():
+        print("\nModel file downloaded successfully.")
 
 
 def test_convert_message_to_llamacpp_format():
@@ -113,8 +123,20 @@ def test_convert_message_to_llamacpp_format():
     }
 
 
+def test_convert_contentless_assistant_message_to_llamacpp_format():
+    # A Chat Generator that discards a malformed tool call returns a reply with no content parts
+    message = ChatMessage.from_assistant(text=None)
+    assert _convert_message_to_llamacpp_format(message) == {"role": "assistant", "content": ""}
+
+
+def test_convert_reasoning_only_assistant_message_to_llamacpp_format():
+    # Reasoning is not sent to llama.cpp, so a reply carrying only reasoning is sent with empty content
+    message = ChatMessage.from_assistant(reasoning="only reasoning")
+    assert _convert_message_to_llamacpp_format(message) == {"role": "assistant", "content": ""}
+
+
 def test_convert_message_to_llamacpp_invalid():
-    message = ChatMessage(_role=ChatRole.ASSISTANT, _content=[])
+    message = ChatMessage(_role=ChatRole.USER, _content=[])
     with pytest.raises(ValueError):
         _convert_message_to_llamacpp_format(message)
 
@@ -150,9 +172,8 @@ def test_convert_message_to_llamacpp_format_with_unsupported_mime_type():
 def test_convert_message_to_llamacpp_format_with_none_mime_type():
     """Test that a ChatMessage with None mime type raises ValueError."""
     base64_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
-    image_content = ImageContent(base64_image=base64_image, mime_type="image/png")
-    # Manually set mime_type to None to test the validation
-    image_content.mime_type = None
+    # validation=False skips the mime_type guessing in __post_init__, keeping it None
+    image_content = ImageContent(base64_image=base64_image, mime_type=None, validation=False)
     message = ChatMessage.from_user(content_parts=["What's in this image?", image_content])
 
     with pytest.raises(ValueError, match="Unsupported image format: None"):
@@ -671,28 +692,7 @@ def test_handle_streaming_response_tool_calls():
     assert "completion_start_time" in message.meta
 
 
-class TestLlamaCppChatGenerator:
-    @pytest.fixture
-    def generator(self, model_path, capsys):
-        gguf_model_path = (
-            "https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/resolve/main/Qwen_Qwen3-0.6B-Q5_K_S.gguf"
-        )
-        filename = "Qwen_Qwen3-0.6B-Q5_K_S.gguf"
-
-        # Download GGUF model from HuggingFace
-        download_file(gguf_model_path, str(model_path / filename), capsys)
-
-        model_path = str(model_path / filename)
-        generator = LlamaCppChatGenerator(model=model_path, n_ctx=8192, n_batch=512)
-        return generator
-
-    @pytest.fixture
-    def generator_mock(self):
-        mock_model = MagicMock()
-        generator = LlamaCppChatGenerator(model="test_model.gguf", n_ctx=2048, n_batch=512)
-        generator._model = mock_model
-        return generator, mock_model
-
+class TestInit:
     def test_default_init(self):
         """
         Test default initialization parameters.
@@ -704,6 +704,7 @@ class TestLlamaCppChatGenerator:
         assert generator.n_batch == 512
         assert generator.model_kwargs == {"model_path": "test_model.gguf", "n_ctx": 0, "n_batch": 512}
         assert generator.generation_kwargs == {}
+        assert generator._model is None
 
     def test_custom_init(self):
         """
@@ -741,46 +742,6 @@ class TestLlamaCppChatGenerator:
         generator = LlamaCppChatGenerator(model="test_model.gguf", tools=[temperature_tool, toolset])
         assert generator.tools == [temperature_tool, toolset]
 
-    def test_run_with_mixed_tools(self, temperature_tool):
-        """Test run method with mixed Tool and Toolset objects."""
-
-        def population(city: str):
-            """Get population for a given city."""
-            return f"The population of {city} is 2.2 million"
-
-        population_tool = create_tool_from_function(population)
-        toolset = Toolset([population_tool])
-
-        generator = LlamaCppChatGenerator(model="test_model.gguf")
-
-        # Mock the model
-        mock_model = MagicMock()
-        mock_response = {
-            "choices": [{"message": {"content": "Generated text"}, "index": 0, "finish_reason": "stop"}],
-            "id": "test_id",
-            "model": "test_model",
-            "created": 1234567890,
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
-        }
-        mock_model.create_chat_completion.return_value = mock_response
-        generator._model = mock_model
-
-        generator.run(
-            messages=[ChatMessage.from_user("What's the weather in Paris and population of Berlin?")],
-            tools=[temperature_tool, toolset],
-        )
-
-        # Verify the model was called with the correct tools
-        mock_model.create_chat_completion.assert_called_once()
-        call_args = mock_model.create_chat_completion.call_args[1]
-        assert "tools" in call_args
-        assert len(call_args["tools"]) == 2  # Both tools should be flattened
-
-        # Verify tool names
-        tool_names = {tool["function"]["name"] for tool in call_args["tools"]}
-        assert "get_current_temperature" in tool_names
-        assert "population" in tool_names
-
     def test_init_with_multimodal_params(self):
         """Test initialization with multimodal parameters."""
         generator = LlamaCppChatGenerator(
@@ -805,6 +766,36 @@ class TestLlamaCppChatGenerator:
                 model="llava-v1.5-7b-q4_0.gguf", chat_handler_name="invalid", model_clip_path="mmproj-model-f16.gguf"
             )
 
+    def test_ignores_model_path_if_specified_in_model_kwargs(self):
+        """
+        Test that model_path is ignored if already specified in model_kwargs.
+        """
+        generator = LlamaCppChatGenerator(
+            model="test_model.gguf",
+            n_ctx=8192,
+            n_batch=512,
+            model_kwargs={"model_path": "other_model.gguf"},
+        )
+        assert generator.model_kwargs["model_path"] == "other_model.gguf"
+
+    def test_ignores_n_ctx_if_specified_in_model_kwargs(self):
+        """
+        Test that n_ctx is ignored if already specified in model_kwargs.
+        """
+        generator = LlamaCppChatGenerator(model="test_model.gguf", n_ctx=512, n_batch=512, model_kwargs={"n_ctx": 8192})
+        assert generator.model_kwargs["n_ctx"] == 8192
+
+    def test_ignores_n_batch_if_specified_in_model_kwargs(self):
+        """
+        Test that n_batch is ignored if already specified in model_kwargs.
+        """
+        generator = LlamaCppChatGenerator(
+            model="test_model.gguf", n_ctx=8192, n_batch=512, model_kwargs={"n_batch": 1024}
+        )
+        assert generator.model_kwargs["n_batch"] == 1024
+
+
+class TestSerialization:
     def test_to_dict(self):
         generator = LlamaCppChatGenerator(model="test_model.gguf", n_ctx=8192, n_batch=512)
         assert generator.to_dict() == {
@@ -875,33 +866,121 @@ class TestLlamaCppChatGenerator:
         assert deserialized.model_kwargs == {"model_path": "test_model.gguf", "n_ctx": 8192, "n_batch": 512}
         assert deserialized.generation_kwargs == {}
 
-    def test_ignores_model_path_if_specified_in_model_kwargs(self):
-        """
-        Test that model_path is ignored if already specified in model_kwargs.
-        """
-        generator = LlamaCppChatGenerator(
-            model="test_model.gguf",
-            n_ctx=8192,
-            n_batch=512,
-            model_kwargs={"model_path": "other_model.gguf"},
-        )
-        assert generator.model_kwargs["model_path"] == "other_model.gguf"
 
-    def test_ignores_n_ctx_if_specified_in_model_kwargs(self):
-        """
-        Test that n_ctx is ignored if already specified in model_kwargs.
-        """
-        generator = LlamaCppChatGenerator(model="test_model.gguf", n_ctx=512, n_batch=512, model_kwargs={"n_ctx": 8192})
-        assert generator.model_kwargs["n_ctx"] == 8192
+class TestComponentLifecycle:
+    @patch("haystack_integrations.components.generators.llama_cpp.chat.chat_generator.Llama")
+    def test_sync_lifecycle(self, mock_model_cls):
+        generator = LlamaCppChatGenerator(model="test_model.gguf")
+        model = mock_model_cls.return_value
 
-    def test_ignores_n_batch_if_specified_in_model_kwargs(self):
-        """
-        Test that n_batch is ignored if already specified in model_kwargs.
-        """
-        generator = LlamaCppChatGenerator(
-            model="test_model.gguf", n_ctx=8192, n_batch=512, model_kwargs={"n_batch": 1024}
+        generator.warm_up()
+        assert generator._model is model
+
+        generator.close()
+        model.close.assert_called_once_with()
+        assert generator._model is None
+
+        generator.warm_up()
+        assert mock_model_cls.call_count == 2
+
+    def test_warm_up_is_idempotent(self):
+        generator = LlamaCppChatGenerator(model="test_model.gguf")
+
+        with patch("haystack_integrations.components.generators.llama_cpp.chat.chat_generator.Llama") as mock_llama:
+            generator.warm_up()
+            generator.warm_up()
+
+        mock_llama.assert_called_once_with(model_path="test_model.gguf", n_ctx=0, n_batch=512)
+
+    def test_close_is_safe_without_warm_up(self):
+        generator = LlamaCppChatGenerator(model="test_model.gguf")
+
+        generator.close()
+
+        assert generator._model is None
+
+
+class TestRun:
+    @pytest.fixture
+    def generator(self, model_path, capsys):
+        gguf_model_path = (
+            "https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/resolve/main/Qwen_Qwen3-0.6B-Q5_K_S.gguf"
         )
-        assert generator.model_kwargs["n_batch"] == 1024
+        filename = "Qwen_Qwen3-0.6B-Q5_K_S.gguf"
+
+        # Download GGUF model from HuggingFace
+        download_file(gguf_model_path, str(model_path / filename), capsys)
+
+        model_path = str(model_path / filename)
+        generator = LlamaCppChatGenerator(model=model_path, n_ctx=8192, n_batch=512)
+        return generator
+
+    @pytest.fixture
+    def generator_mock(self):
+        mock_model = MagicMock()
+        generator = LlamaCppChatGenerator(model="test_model.gguf", n_ctx=2048, n_batch=512)
+        generator._model = mock_model
+        return generator, mock_model
+
+    def test_run_with_mixed_tools(self, temperature_tool):
+        """Test run method with mixed Tool and Toolset objects."""
+
+        def population(city: str):
+            """Get population for a given city."""
+            return f"The population of {city} is 2.2 million"
+
+        population_tool = create_tool_from_function(population)
+        toolset = Toolset([population_tool])
+
+        generator = LlamaCppChatGenerator(model="test_model.gguf")
+
+        # Mock the model
+        mock_model = MagicMock()
+        mock_response = {
+            "choices": [{"message": {"content": "Generated text"}, "index": 0, "finish_reason": "stop"}],
+            "id": "test_id",
+            "model": "test_model",
+            "created": 1234567890,
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        mock_model.create_chat_completion.return_value = mock_response
+        generator._model = mock_model
+
+        generator.run(
+            messages=[ChatMessage.from_user("What's the weather in Paris and population of Berlin?")],
+            tools=[temperature_tool, toolset],
+        )
+
+        # Verify the model was called with the correct tools
+        mock_model.create_chat_completion.assert_called_once()
+        call_args = mock_model.create_chat_completion.call_args[1]
+        assert "tools" in call_args
+        assert len(call_args["tools"]) == 2  # Both tools should be flattened
+
+        # Verify tool names
+        tool_names = {tool["function"]["name"] for tool in call_args["tools"]}
+        assert "get_current_temperature" in tool_names
+        assert "population" in tool_names
+
+    def test_run_with_string_input(self, generator_mock):
+        """
+        Test that a string input is converted to a user ChatMessage and returns a list of replies.
+        """
+        generator, mock_model = generator_mock
+        mock_output = {
+            "id": "unique-id-123",
+            "model": "Test Model Path",
+            "created": 1715226164,
+            "choices": [{"index": 0, "message": {"content": "Paris", "role": "assistant"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 14, "completion_tokens": 57, "total_tokens": 71},
+        }
+        mock_model.create_chat_completion.return_value = mock_output
+        result = generator.run("What's the capital of France?")
+        call_args = mock_model.create_chat_completion.call_args[1]
+        assert call_args["messages"] == [{"role": "user", "content": "What's the capital of France?"}]
+        assert isinstance(result["replies"], list)
+        assert len(result["replies"]) == 1
+        assert isinstance(result["replies"][0], ChatMessage)
 
     def test_run_with_empty_message(self, generator_mock):
         """
@@ -934,11 +1013,12 @@ class TestLlamaCppChatGenerator:
         assert result["replies"][0].text == "Generated text"
         assert result["replies"][0].role == ChatRole.ASSISTANT
 
-    def test_run_with_generation_kwargs(self, generator_mock):
-        """
-        Test that a valid message and generation kwargs returns a list of replies.
-        """
-        generator, mock_model = generator_mock
+    def test_run_with_generation_kwargs(self):
+        mock_model = MagicMock()
+        generator = LlamaCppChatGenerator(
+            model="test_model.gguf", generation_kwargs={"max_tokens": 128, "temperature": 0.5}
+        )
+        generator._model = mock_model
         mock_output = {
             "id": "unique-id-123",
             "model": "Test Model Path",
@@ -949,8 +1029,11 @@ class TestLlamaCppChatGenerator:
             "usage": {"prompt_tokens": 14, "completion_tokens": 57, "total_tokens": 71},
         }
         mock_model.create_chat_completion.return_value = mock_output
-        generation_kwargs = {"max_tokens": 128}
-        result = generator.run([ChatMessage.from_system("Write a 200 word paragraph.")], generation_kwargs)
+        result = generator.run([ChatMessage.from_system("Write a 200 word paragraph.")], {"temperature": 0.9})
+
+        call_kwargs = mock_model.create_chat_completion.call_args[1]
+        assert call_kwargs["max_tokens"] == 128
+        assert call_kwargs["temperature"] == 0.9
         assert result["replies"][0].text == "Generated text"
         assert result["replies"][0].meta["finish_reason"] == "length"
 
@@ -1000,6 +1083,19 @@ class TestLlamaCppChatGenerator:
         assert callback.counter > 0, "No streaming chunks received"
         message: ChatMessage = results["replies"][0]
         assert message.text and "paris" in message.text.lower(), "Response does not contain Paris"
+
+    @pytest.mark.integration
+    def test_run_with_contentless_assistant_message(self, generator):
+        # The contentless assistant message mimics a reply whose only tool call was discarded
+        messages = [
+            ChatMessage.from_user("What's the capital of France?"),
+            ChatMessage.from_assistant(text=None),
+            ChatMessage.from_user("Answer in a single word."),
+        ]
+        result = generator.run(messages)
+
+        assert len(result["replies"]) == 1
+        assert "paris" in result["replies"][0].text.lower()
 
     @pytest.mark.integration
     def test_run_rag_pipeline(self, generator):
@@ -1157,7 +1253,7 @@ class TestLlamaCppChatGenerator:
         assert llamacpp_message["content"][1]["type"] == "image_url"
 
 
-class TestLlamaCppChatGeneratorAsync:
+class TestRunAsync:
     @pytest.fixture
     def generator_mock(self):
         mock_model = MagicMock()
@@ -1198,9 +1294,12 @@ class TestLlamaCppChatGeneratorAsync:
         assert isinstance(response["replies"], list)
         assert len(response["replies"]) == 0
 
-    async def test_run_async_with_params(self, generator_mock):
-        """Test that run_async passes generation_kwargs correctly."""
-        generator, mock_model = generator_mock
+    async def test_run_async_with_generation_kwargs(self):
+        mock_model = MagicMock()
+        generator = LlamaCppChatGenerator(
+            model="test_model.gguf", generation_kwargs={"max_tokens": 128, "temperature": 0.5}
+        )
+        generator._model = mock_model
         mock_output = {
             "id": "unique-id-123",
             "model": "Test Model Path",
@@ -1214,15 +1313,34 @@ class TestLlamaCppChatGeneratorAsync:
 
         response = await generator.run_async(
             messages=[ChatMessage.from_system("Write a 200 word paragraph.")],
-            generation_kwargs={"max_tokens": 128, "temperature": 0.5},
+            generation_kwargs={"temperature": 0.9},
         )
 
-        assert response["replies"][0].text == "Generated text"
-        assert response["replies"][0].meta["finish_reason"] == "length"
         mock_model.create_chat_completion.assert_called_once()
         call_kwargs = mock_model.create_chat_completion.call_args[1]
         assert call_kwargs["max_tokens"] == 128
-        assert call_kwargs["temperature"] == 0.5
+        assert call_kwargs["temperature"] == 0.9
+        assert response["replies"][0].text == "Generated text"
+        assert response["replies"][0].meta["finish_reason"] == "length"
+
+    async def test_run_async_with_string_input(self, generator_mock):
+        """Test that a string input is converted to a user ChatMessage and returns a list of replies."""
+        generator, mock_model = generator_mock
+        mock_output = {
+            "id": "unique-id-123",
+            "model": "Test Model Path",
+            "created": 1715226164,
+            "choices": [{"index": 0, "message": {"content": "Paris", "role": "assistant"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 14, "completion_tokens": 57, "total_tokens": 71},
+        }
+        mock_model.create_chat_completion.return_value = mock_output
+
+        result = await generator.run_async("What's the capital of France?")
+        call_args = mock_model.create_chat_completion.call_args[1]
+        assert call_args["messages"] == [{"role": "user", "content": "What's the capital of France?"}]
+        assert isinstance(result["replies"], list)
+        assert len(result["replies"]) == 1
+        assert isinstance(result["replies"][0], ChatMessage)
 
     @pytest.fixture
     def generator(self, model_path, capsys):
@@ -1251,7 +1369,7 @@ class TestLlamaCppChatGeneratorAsync:
         assert "Paris" in message.text
 
 
-class TestLlamaCppChatGeneratorFunctionary:
+class TestFunctionCallingFunctionary:
     @pytest.fixture
     def generator(self, model_path, capsys):
         gguf_model_path = (
@@ -1333,7 +1451,7 @@ class TestLlamaCppChatGeneratorFunctionary:
         assert any("72" in reply.text for reply in second_response["replies"])
 
 
-class TestLlamaCppChatGeneratorChatML:
+class TestFunctionCallingChatML:
     @pytest.fixture
     def generator(self, model_path, capsys):
         gguf_model_path = (

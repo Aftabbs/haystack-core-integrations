@@ -183,6 +183,40 @@ def test_normalize_filters(filters, expected):
     assert result == expected
 
 
+def test_or_of_ranges_on_same_field_are_not_merged():
+    # `price < 10 OR price > 100` must stay two separate range clauses under `should`.
+    # Merging them into a single {"lt": 10, "gt": 100} range means price < 10 AND
+    # price > 100, which matches no document.
+    filters = {
+        "operator": "OR",
+        "conditions": [
+            {"field": "meta.price", "operator": "<", "value": 10},
+            {"field": "meta.price", "operator": ">", "value": 100},
+        ],
+    }
+    assert _normalize_filters(filters) == {
+        "bool": {
+            "should": [
+                {"range": {"price": {"lt": 10}}},
+                {"range": {"price": {"gt": 100}}},
+            ]
+        }
+    }
+
+
+def test_equal_with_list_passes_field_as_script_param():
+    # The field name must be bound as a script parameter, never interpolated into the Painless source,
+    # otherwise a quote in the field name breaks out of the string literal and injects code.
+    field = "x'].size()); return 1; //"
+    result = _normalize_filters({"field": f"meta.{field}", "operator": "==", "value": ["a", "b"]})
+
+    script = result["bool"]["must"]["terms_set"][field]["minimum_should_match_script"]
+    assert script == {
+        "source": "Math.max(params.num_terms, doc[params.field].size())",
+        "params": {"field": field},
+    }
+
+
 def test_normalize_filters_invalid_operator():
     with pytest.raises(FilterError):
         _normalize_filters({"operator": "INVALID", "conditions": []})
@@ -219,3 +253,158 @@ def test_normalize_ranges():
     assert conditions == [
         {"range": {"date": {"lt": "2021-01-01", "gte": "2015-01-01"}}},
     ]
+
+
+def test_and_of_same_operator_ranges_keeps_both_bounds():
+    # `price > 5 AND price > 1` must stay two separate range clauses under `must`.
+    # Merging them into a single range makes the second `gt` overwrite the first,
+    # silently dropping a bound and matching documents the filter excludes.
+    filters = {
+        "operator": "AND",
+        "conditions": [
+            {"field": "meta.price", "operator": ">", "value": 5},
+            {"field": "meta.price", "operator": ">", "value": 1},
+        ],
+    }
+    assert _normalize_filters(filters) == {
+        "bool": {
+            "must": [
+                {"range": {"price": {"gt": 5}}},
+                {"range": {"price": {"gt": 1}}},
+            ]
+        }
+    }
+
+
+def test_not_of_same_operator_ranges_keeps_both_bounds():
+    filters = {
+        "operator": "NOT",
+        "conditions": [
+            {"field": "meta.price", "operator": "<=", "value": 5},
+            {"field": "meta.price", "operator": "<=", "value": 1},
+        ],
+    }
+    assert _normalize_filters(filters) == {
+        "bool": {
+            "must_not": [
+                {
+                    "bool": {
+                        "must": [
+                            {"range": {"price": {"lte": 5}}},
+                            {"range": {"price": {"lte": 1}}},
+                        ]
+                    }
+                }
+            ]
+        }
+    }
+
+
+def test_and_of_same_side_bounds_keeps_both_clauses():
+    # `lt` and `lte` constrain the same side, and Elasticsearch keeps only one of them per
+    # clause, so they must not be merged even though the keys differ.
+    filters = {
+        "operator": "AND",
+        "conditions": [
+            {"field": "meta.price", "operator": "<", "value": 3},
+            {"field": "meta.price", "operator": "<=", "value": 5},
+        ],
+    }
+    assert _normalize_filters(filters) == {
+        "bool": {
+            "must": [
+                {"range": {"price": {"lt": 3}}},
+                {"range": {"price": {"lte": 5}}},
+            ]
+        }
+    }
+
+
+def test_normalize_ranges_starts_a_new_clause_on_a_repeated_bound():
+    conditions = [
+        {"range": {"price": {"gt": 1}}},
+        {"range": {"price": {"gt": 5}}},
+        {"range": {"price": {"lt": 10}}},
+    ]
+    # The `lt` still merges into the first clause; only the repeated `gt` splits.
+    assert _normalize_ranges(conditions) == [
+        {"range": {"price": {"gt": 1, "lt": 10}}},
+        {"range": {"price": {"gt": 5}}},
+    ]
+
+
+def test_normalize_filters_rejects_non_dict():
+    with pytest.raises(FilterError, match="Filters must be a dictionary"):
+        _normalize_filters("not-a-dict")  # type: ignore[arg-type]
+
+
+def test_equal_none_list_and_text_branches():
+    assert _normalize_filters({"field": "meta.k", "operator": "==", "value": None}) == {
+        "bool": {"must": {"bool": {"must_not": {"exists": {"field": "k"}}}}}
+    }
+    out = _normalize_filters({"field": "meta.tags", "operator": "==", "value": ["a", "b"]})
+    inner = out["bool"]["must"]
+    assert "terms_set" in inner
+    assert inner["terms_set"]["tags"]["terms"] == ["a", "b"]
+
+
+def test_not_equal_none_list_text_and_term():
+    ne_none = _normalize_filters({"field": "meta.k", "operator": "!=", "value": None})
+    assert ne_none == {"bool": {"must": {"exists": {"field": "k"}}}}
+    ne_list = _normalize_filters({"field": "meta.k", "operator": "!=", "value": [1, 2]})
+    assert ne_list == {"bool": {"must": {"bool": {"must_not": {"terms": {"k": [1, 2]}}}}}}
+
+    ne_text = _normalize_filters({"field": "text", "operator": "!=", "value": "hello"})
+    assert "must_not" in ne_text["bool"]["must"]["bool"]
+
+    ne_term = _normalize_filters({"field": "meta.k", "operator": "!=", "value": "v"})
+    assert ne_term == {"bool": {"must": {"bool": {"must_not": {"term": {"k": "v"}}}}}}
+
+
+@pytest.mark.parametrize(
+    ("op", "bound"),
+    [
+        (">", "gt"),
+        (">=", "gte"),
+        ("<", "lt"),
+        ("<=", "lte"),
+    ],
+)
+def test_range_operators_numeric_and_iso_string(op: str, bound: str):
+    body = _normalize_filters({"field": "meta.n", "operator": op, "value": 5})
+    assert body == {"bool": {"must": {"range": {"n": {bound: 5}}}}}
+
+    body_dt = _normalize_filters({"field": "meta.d", "operator": op, "value": "2020-01-01"})
+    assert body_dt["bool"]["must"]["range"]["d"][bound] == "2020-01-01"
+
+
+@pytest.mark.parametrize("op", [">", ">=", "<", "<="])
+def test_range_operators_none_yields_empty_match(op: str):
+    body = _normalize_filters({"field": "meta.x", "operator": op, "value": None})
+    inner = body["bool"]["must"]
+    assert "bool" in inner and "must" in inner["bool"]
+    assert len(inner["bool"]["must"]) == 2
+
+
+@pytest.mark.parametrize("op", [">", ">=", "<", "<="])
+def test_range_operators_reject_non_iso_string(op: str):
+    with pytest.raises(FilterError, match="ISO formatted dates"):
+        _normalize_filters({"field": "meta.x", "operator": op, "value": "not-a-date"})
+
+
+@pytest.mark.parametrize("op", [">", ">=", "<", "<="])
+def test_range_operators_reject_list_value(op: str):
+    with pytest.raises(FilterError, match="Filter value can't be of type"):
+        _normalize_filters({"field": "meta.x", "operator": op, "value": [1, 2]})
+
+
+def test_in_and_not_in_require_list():
+    with pytest.raises(FilterError, match="must be a list"):
+        _normalize_filters({"field": "meta.x", "operator": "in", "value": "single"})
+    with pytest.raises(FilterError, match="must be a list"):
+        _normalize_filters({"field": "meta.x", "operator": "not in", "value": 1})
+
+
+def test_not_in_with_list_value():
+    body = _normalize_filters({"field": "meta.x", "operator": "not in", "value": ["a", "b"]})
+    assert body == {"bool": {"must": {"bool": {"must_not": {"terms": {"x": ["a", "b"]}}}}}}

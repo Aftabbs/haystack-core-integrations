@@ -3,14 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
-import logging
 from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from haystack import default_from_dict, default_to_dict
+from haystack import default_from_dict, default_to_dict, logging
 from haystack.dataclasses import Document
 from haystack.document_stores.errors import DocumentStoreError, DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
@@ -458,11 +457,7 @@ class FAISSDocumentStore:
         """
         values = []
         for doc in self.documents.values():
-            val = (
-                FAISSDocumentStore._get_doc_value(doc, field_name)
-                if not field_name.startswith("meta.")
-                else doc.meta.get(field_name[5:])
-            )
+            val = FAISSDocumentStore._get_doc_value(doc, field_name)
             if val is not None:
                 values.append(val)
 
@@ -471,23 +466,51 @@ class FAISSDocumentStore:
 
         return {"min": min(values), "max": max(values)}
 
-    def get_metadata_field_unique_values(self, field_name: str) -> list[Any]:
+    def get_metadata_field_unique_values(
+        self,
+        metadata_field: str,
+        search_term: str | None = None,
+        from_: int = 0,
+        size: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], int]:
         """
-        Returns all unique values for a specific metadata field.
+        Returns unique values for a metadata field, optionally filtered by a search term, with pagination.
 
-        :param field_name: The name of the metadata field.
-        :returns: A list of unique values for the specified field.
+        :param metadata_field: The metadata field to get unique values for. Can include or omit the "meta." prefix.
+        :param search_term: Optional search term to filter values, matched as a case-insensitive substring
+            against the metadata field's value.
+        :param from_: The offset to start returning values from (for pagination).
+        :param size: The maximum number of unique values to return.
+        :param filters: Optional filters to restrict the documents considered.
+        :returns: A tuple containing list of unique values (in their original type) and total count of
+            unique values.
         """
-        values = set()
-        for doc in self.documents.values():
-            val = (
-                FAISSDocumentStore._get_doc_value(doc, field_name)
-                if not field_name.startswith("meta.")
-                else doc.meta.get(field_name[5:])
-            )
+        values = []
+        for doc in self.filter_documents(filters=filters):
+            val = FAISSDocumentStore._get_doc_value(doc, metadata_field)
             if val is not None:
-                values.add(val)
-        return list(values)
+                values.append(val)
+
+        if search_term:
+            search_term_lower = search_term.lower()
+            values = [val for val in values if search_term_lower in str(val).lower()]
+
+        # Values of different types can be equal in Python (`1 == True`, `1 == 1.0`), so a plain set
+        # would silently merge them. Dedupe by (type, value) instead to keep them distinct.
+        seen: set[tuple[type, Any]] = set()
+        unique_values = []
+        for val in values:
+            dedup_key = (type(val), val)
+            if dedup_key not in seen:
+                seen.add(dedup_key)
+                unique_values.append(val)
+        sorted_values = sorted(unique_values, key=str)
+        total_count = len(sorted_values)
+        end = from_ + size
+        paginated_values = sorted_values[from_:end]
+
+        return paginated_values, total_count
 
     def count_unique_metadata_by_filter(self, filters: dict[str, Any], metadata_fields: list[str]) -> dict[str, int]:
         """
@@ -501,11 +524,13 @@ class FAISSDocumentStore:
         counts = {}
 
         for field in metadata_fields:
-            unique_vals = set()
+            # Values of different types can be equal in Python (`1 == True`, `1 == 1.0`), so a plain
+            # set would silently merge them. Dedupe by (type, value) instead to keep them distinct.
+            unique_vals: set[tuple[type, Any]] = set()
             for doc in filtered_docs:
                 val = FAISSDocumentStore._get_doc_value(doc, field)
                 if val is not None:
-                    unique_vals.add(val)
+                    unique_vals.add((type(val), val))
             counts[field] = len(unique_vals)
 
         return dict(counts)
@@ -573,7 +598,7 @@ class FAISSDocumentStore:
         # Verify sync
         if len(self.documents) != len(self.id_map):
             logger.warning(
-                "Loaded %d documents but %d ID mappings. Index might be out of sync.",
-                len(self.documents),
-                len(self.id_map),
+                "Loaded {documents_count} documents but {mappings_count} ID mappings. Index might be out of sync.",
+                documents_count=len(self.documents),
+                mappings_count=len(self.id_map),
             )

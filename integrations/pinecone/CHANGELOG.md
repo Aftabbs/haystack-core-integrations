@@ -1,5 +1,82 @@
 # Changelog
 
+## [integrations/pinecone-v6.4.1] - 2026-09-14
+
+### 🐛 Bug Fixes
+
+- *(pinecone)* Infer boolean for list-valued bool metadata (#3920)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+
+## [integrations/pinecone-v6.4.0] - 2026-09-01
+
+### 🐛 Bug Fixes
+
+- `PineCone` normalisation of .meta usage in `get_metadata_field_unique_values()` (#3641)
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- `PineConeDocumentStore` get_metadata_field_unique_values setting list of values to return to `Any` (#3711)
+- PineCone adding optional parameter `filters` to `get_metadata_field_unique_values()` (#3736)
+- Standardize license files (#3771)
+
+### 🧪 Testing
+
+- `PineConeDocumentStore` removing duplicated tests already covered by haystack Mixin tests (#3784)
+
+### 🧹 Chores
+
+- Re-standardize READMEs (#3768)
+
+
+## [integrations/pinecone-v6.3.0] - 2026-07-22
+
+### 🐛 Bug Fixes
+
+- Replace in-place dataclass mutations in anthropic, llama_cpp, olama, pinecone tests (#3551)
+
+### 🚜 Refactor
+
+- Align Pinecone closing methods to standard (#3629)
+
+### 📚 Documentation
+
+- Replace old haystack core imports with haystack_integrations paths (#3545)
+
+
+## [integrations/pinecone-v6.2.0] - 2026-05-08
+
+### 🐛 Bug Fixes
+
+- Replace in-place dataclass mutations in document stores (#3114)
+
+### 🚜 Refactor
+
+- *(pinecone)* Make get_metadata_field_min_max more consistent; use async DocumentStore mixin tests (#3231)
+
+### 📚 Documentation
+
+- Simplify pydoc configs (#2855)
+
+### 🧪 Testing
+
+- Replacing each `DocumentStore` specific tests and used the generalised ones from `haystack.testing.document_store` (#2812)
+- Test compatible integrations with python 3.14; update pyproject (#3001)
+- `PineconeDocumentStore` use Mixin tests (#3020)
+- Track test coverage for all integrations (#3065)
+- Pinecone - add unit tests (#3218)
+- Pinecone - remove namespaces when tests ends (#3248)
+
+### 🧹 Chores
+
+- Exposing `PineconeDocumentStore` `show_progress` bar parameter and disabling it for tests (#2799)
+- Remove unused allow-direct-references (#2866)
+- Add ANN ruff ruleset to optimum, paddleocr, pgvector, pinecone, pyversity, qdrant, ragas, snowflake (#2992)
+- Enforce ruff docstring rules in integrations 31-40 (openrouter, opensearch, optimum, paddleocr, pgvector, pinecone, pyversity, qdrant, ragas, snowflake) (#3011)
+- Pinecone - fix types for Pinecone 9 (#3277)
+
+
 ## [integrations/pinecone-v6.1.2] - 2026-01-28
 
 ### 🐛 Bug Fixes
@@ -153,7 +230,6 @@
 
 ### 🧹 Chores
 
-- Pinecone - remove legacy filter support (#1069)
 - Update changelog after removing legacy filters (#1083)
 - Update ruff linting scripts and settings (#1105)
 - Inherit from `FilterDocumentsTestWithDataframe` in Document Stores (#1290)
@@ -163,22 +239,49 @@
 - Test: Pinecone - increase sleep time (#1307)
 - Chore!: pinecone - remove dataframe support (#1372)
 
+## [integrations/pinecone-v2.0.0] - 2024-09-12
+
+### 🧹 Chores
+
+- Pinecone - remove legacy filter support (#1069)
+
+
 ## [integrations/pinecone-v1.2.3] - 2024-08-29
+
+### 🐛 Bug Fixes
+
+- Converting `Pinecone` metadata fields from float back to int (#1034)
+
+
+## [integrations/pinecone-v1.2.2] - 2024-08-21
+
+### 🐛 Bug Fixes
+
+- Skip unsupported meta fields in PineconeDB (#1009)
+
+### 🧪 Testing
+
+- Do not retry tests in `hatch run test` command (#954)
+
+### 🌀 Miscellaneous
+
+- Chore: Pinecone - fix import in conftest (#914)
+
+## [integrations/pinecone-v1.2.1] - 2024-07-17
+
+### 🐛 Bug Fixes
+
+- `pinecone` - Fallback to default filter policy when deserializing retrievers without the init parameter (#901)
+
+## [integrations/pinecone-v1.2.0] - 2024-07-15
 
 ### 🚀 Features
 
 - Add filter_policy to pinecone integration (#821)
 
-### 🐛 Bug Fixes
-
-- `pinecone` - Fallback to default filter policy when deserializing retrievers without the init parameter (#901)
-- Skip unsupported meta fields in PineconeDB (#1009)
-- Converting `Pinecone` metadata fields from float back to int (#1034)
-
 ### 🧪 Testing
 
 - Pinecone - fix `test_serverless_index_creation_from_scratch` (#806)
-- Do not retry tests in `hatch run test` command (#954)
 
 ### ⚙️ CI
 
@@ -192,7 +295,6 @@
 
 - Ci: add retry config to Pinecone test (#848)
 - Chore: Minor retriever pydoc fix (#884)
-- Chore: Pinecone - fix import in conftest (#914)
 
 ## [integrations/pinecone-v1.1.0] - 2024-06-11
 
@@ -226,6 +328,24 @@
 - Update category slug (#442)
 - Disable-class-def (#556)
 
+### 🌀 Miscellaneous
+
+- Pinecone - review docstrings and API reference (#503)
+- Make tests show coverage (#566)
+- Temporarily skip failing tests (#593)
+- Remove references to Python 3.7 (#601)
+- Make Document Stores initially skip `SparseEmbedding` (#606)
+- Skip `test_write_documents_duplicate_overwrite` test (#637)
+
+## [integrations/pinecone-v0.4.0] - 2024-02-15
+
+### 🌀 Miscellaneous
+
+- Fix imports in example (#398)
+- [Pinecone] Use Haystack Secrets (#420)
+
+## [integrations/pinecone-v0.3.0] - 2024-02-12
+
 ### ⚙️ CI
 
 - Generate API docs for Pinecone (#359)
@@ -234,14 +354,6 @@
 
 - Pinecone - decrease concurrency in tests (#323)
 - Rename retriever (#396)
-- Fix imports in example (#398)
-- [Pinecone] Use Haystack Secrets (#420)
-- Pinecone - review docstrings and API reference (#503)
-- Make tests show coverage (#566)
-- Temporarily skip failing tests (#593)
-- Remove references to Python 3.7 (#601)
-- Make Document Stores initially skip `SparseEmbedding` (#606)
-- Skip `test_write_documents_duplicate_overwrite` test (#637)
 
 ## [integrations/pinecone-v0.2.1] - 2024-01-31
 
@@ -258,8 +370,13 @@
 
 ### 🌀 Miscellaneous
 
-- Pinecone - update import for beta5 (#236)
 - Change import paths (#256)
+
+## [integrations/pinecone-v0.1.1] - 2024-01-18
+
+### 🌀 Miscellaneous
+
+- Pinecone - update import for beta5 (#236)
 
 ## [integrations/pinecone-v0.1.0] - 2024-01-17
 

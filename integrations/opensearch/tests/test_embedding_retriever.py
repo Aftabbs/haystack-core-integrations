@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from haystack.dataclasses import Document
@@ -137,6 +137,28 @@ def test_from_dict(_mock_opensearch_client):
     }
     retriever = OpenSearchEmbeddingRetriever.from_dict(data)
     assert retriever._filter_policy == FilterPolicy.REPLACE
+
+
+def test_close():
+    mock_store = Mock(spec=OpenSearchDocumentStore)
+    retriever = OpenSearchEmbeddingRetriever(document_store=mock_store)
+
+    retriever.close()
+
+    mock_store.close.assert_called_once_with()
+    assert retriever._document_store is mock_store
+
+
+@pytest.mark.asyncio
+async def test_close_async():
+    mock_store = Mock(spec=OpenSearchDocumentStore)
+    mock_store.close_async = AsyncMock()
+    retriever = OpenSearchEmbeddingRetriever(document_store=mock_store)
+
+    await retriever.close_async()
+
+    mock_store.close_async.assert_awaited_once_with()
+    assert retriever._document_store is mock_store
 
 
 def test_run():
@@ -281,6 +303,22 @@ def test_run_ignore_errors(caplog):
     assert len(res) == 1
     assert res["documents"] == []
     assert "Some error" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_run_async_ignore_errors(caplog):
+    mock_store = Mock(spec=OpenSearchDocumentStore)
+    mock_store._embedding_retrieval_async.side_effect = Exception("Some error")
+    retriever = OpenSearchEmbeddingRetriever(document_store=mock_store, raise_on_failure=False)
+    res = await retriever.run_async(query_embedding=[0.5, 0.7])
+    assert len(res) == 1
+    assert res["documents"] == []
+    assert "Some error" in caplog.text
+
+
+def test_init_raises_on_invalid_document_store():
+    with pytest.raises(ValueError, match="document_store must be an instance of OpenSearchDocumentStore"):
+        OpenSearchEmbeddingRetriever(document_store="not a document store")
 
 
 def test_run_with_runtime_document_store():

@@ -1,20 +1,82 @@
 # Changelog
 
-## [integrations/fastembed-v2.1.0] - 2026-02-13
+## [integrations/fastembed-v2.7.0] - 2026-08-24
+
+### 🚀 Features
+
+- *(fastembed)* Add Python 3.14 support (#3829)
+
+
+## [integrations/fastembed-v2.6.0] - 2026-08-12
+
+### 🚀 Features
+
+- Add GPU/XPU support to fastembed rankers via `model_kwargs` (#3728)
+
+
+## [integrations/fastembed-v2.5.0] - 2026-08-11
+
+### 🐛 Bug Fixes
+
+- `FastembedLateInteractionRanker` reordered the top_k fallback to happen after validation (#3746)
+- `FastEmbedder` reordered the top_k fallback to happen after validation (#3745)
+
+### 📚 Documentation
+
+- Fix TypeError in FastembedSparseDocumentEmbedder usage example (#3731)
+
+
+## [integrations/fastembed-v2.4.0] - 2026-07-30
+
+### 🚀 Features
+
+- *(fastembed)* Allow passing model_kwargs to dense embedders (#3558)
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+
+### 📚 Documentation
+
+- Fix wrong class references in Fastembed sparse embedder messages and docstrings (#3610)
+
+
+## [integrations/fastembed-v2.3.0] - 2026-04-30
+
+### 🚀 Features
+
+- Add score_threshold parameter to FastembedRanker (#3235)
+
+
+## [integrations/fastembed-v2.2.0] - 2026-04-16
+
+### 🚀 Features
+
+- Update `FastembedRanker` to auto call `warm_up` on first run (#2834)
+- Add FastembedLateInteractionRanker for ColBERT late-interaction reranking (#3135)
+
+### 🐛 Bug Fixes
+
+- Replace in-place dataclass mutations with dataclasses.replace() (#3112)
 
 ### 📚 Documentation
 
 - *(fastembed)* Remove explicit warm_up from examples (#2830)
+- Simplify pydoc configs (#2855)
+
+### 🧪 Testing
+
+- Track test coverage for all integrations (#3065)
+
+### 🧹 Chores
+
+- Add ANN type annotations to faiss, fastembed, firecrawl, github, google_ai (#2988)
+- Enforce ruff docstring rules (D102/D103/D205/D209/D213/D417/D419) in integrations 11-20 (#3009)
 
 ### 🌀 Miscellaneous
 
-- Automatically call warm_up() if model is not loaded in FastembedRanker
-- Remove explicit call to warm_up() in ranker_example.py
-- Add unit tests
 - Fix typing issue
 - Fix tying
-- Update docstrings
-- Remove explicit warm_up calls from integration tests
 
 ## [integrations/fastembed-v2.0.0] - 2026-01-12
 
@@ -94,6 +156,16 @@
 
 - Do not retry tests in `hatch run test` command (#954)
 
+### 🧹 Chores
+
+- Update ruff linting scripts and settings (#1105)
+
+### 🌀 Miscellaneous
+
+- Chore: fastembed - ruff update, don't ruff tests (#997)
+
+## [integrations/fastembed-v1.2.0] - 2024-07-01
+
 ### ⚙️ CI
 
 - Retry tests to reduce flakyness (#836)
@@ -101,13 +173,11 @@
 ### 🧹 Chores
 
 - Update ruff invocation to include check parameter (#853)
-- Update ruff linting scripts and settings (#1105)
 
 ### 🌀 Miscellaneous
 
 - Ci: install `pytest-rerunfailures` where needed; add retry config to `test-cov` script (#845)
 - Typo on Sparse embedders. The parameter should be "progress_bar" … (#814)
-- Chore: fastembed - ruff update, don't ruff tests (#997)
 
 ## [integrations/fastembed-v1.1.0] - 2024-05-15
 

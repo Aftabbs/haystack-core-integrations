@@ -2,32 +2,105 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 import logging
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 from haystack.dataclasses.byte_stream import ByteStream
 from haystack.dataclasses.document import Document
 from haystack.document_stores.errors import DocumentStoreError
+from haystack.testing.document_store import create_filterable_docs
+from haystack.testing.document_store_async import (
+    CountDocumentsAsyncTest,
+    CountDocumentsByFilterAsyncTest,
+    CountUniqueMetadataByFilterAsyncTest,
+    DeleteAllAsyncTest,
+    DeleteByFilterAsyncTest,
+    DeleteDocumentsAsyncTest,
+    FilterDocumentsAsyncTest,
+    GetMetadataFieldMinMaxAsyncTest,
+    GetMetadataFieldsInfoAsyncTest,
+    GetMetadataFieldUniqueValuesAsyncTest,
+    UpdateByFilterAsyncTest,
+    WriteDocumentsAsyncTest,
+)
+from numpy import array as np_array
+from numpy import array_equal as np_array_equal
+from numpy import float32 as np_float32
 
 from haystack_integrations.document_stores.weaviate import WeaviateDocumentStore
 from haystack_integrations.document_stores.weaviate.document_store import DOCUMENT_COLLECTION_PROPERTIES
 
 
+@pytest.mark.asyncio
+async def test_close_async():
+    document_store = WeaviateDocumentStore()
+    mock_client = AsyncMock()
+    document_store._async_client = mock_client
+    document_store._async_collection = MagicMock()
+
+    await document_store.close_async()
+
+    mock_client.close.assert_awaited_once()
+    assert document_store._async_client is None
+    assert document_store._async_collection is None
+
+    await document_store.close_async()
+    mock_client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_async_is_exception_safe():
+    document_store = WeaviateDocumentStore()
+    mock_client = AsyncMock()
+    mock_client.close.side_effect = RuntimeError("boom")
+    document_store._async_client = mock_client
+    document_store._async_collection = MagicMock()
+
+    await document_store.close_async()
+
+    assert document_store._async_client is None
+    assert document_store._async_collection is None
+
+
 @pytest.mark.integration
-class TestWeaviateDocumentStoreAsync:
+class TestWeaviateDocumentStoreAsync(
+    CountDocumentsAsyncTest,
+    WriteDocumentsAsyncTest,
+    DeleteDocumentsAsyncTest,
+    DeleteAllAsyncTest,
+    DeleteByFilterAsyncTest,
+    FilterDocumentsAsyncTest,
+    UpdateByFilterAsyncTest,
+    CountDocumentsByFilterAsyncTest,
+    CountUniqueMetadataByFilterAsyncTest,
+    GetMetadataFieldsInfoAsyncTest,
+    GetMetadataFieldMinMaxAsyncTest,
+    GetMetadataFieldUniqueValuesAsyncTest,
+):
     @pytest_asyncio.fixture
     async def document_store(self, request) -> AsyncGenerator[WeaviateDocumentStore, None, None]:
         collection_settings = {
             "class": f"{request.node.name}",
-            "invertedIndexConfig": {"indexNullState": True},
+            "invertedIndexConfig": {"indexNullState": True, "stopwords": {"preset": "none"}},
             "properties": [
                 *DOCUMENT_COLLECTION_PROPERTIES,
+                {"name": "name", "dataType": ["text"]},
+                {"name": "page", "dataType": ["text"]},
+                {"name": "chapter", "dataType": ["text"]},
                 {"name": "category", "dataType": ["text"]},
                 {"name": "status", "dataType": ["text"]},
                 {"name": "number", "dataType": ["int"]},
+                {"name": "date", "dataType": ["date"]},
+                {"name": "no_embedding", "dataType": ["boolean"]},
+                {"name": "priority", "dataType": ["int"]},
+                {"name": "age", "dataType": ["int"]},
+                {"name": "rating", "dataType": ["number"]},
+                {"name": "year", "dataType": ["int"]},
             ],
         }
         store = WeaviateDocumentStore(
@@ -39,7 +112,73 @@ class TestWeaviateDocumentStoreAsync:
         await store.close_async()
 
     @pytest.mark.asyncio
-    async def test_close_async(self, document_store: WeaviateDocumentStore) -> None:
+    async def test_get_metadata_fields_info_empty_collection_async(self, document_store):
+        # Override: Weaviate derives field info from the collection schema, not from stored
+        # documents. Schema-defined fields are visible even on an empty collection, so the
+        # result is never {} as the standard interface expects.
+        assert await document_store.count_documents_async() == 0
+        fields_info = await document_store.get_metadata_fields_info_async()
+        assert "category" in fields_info
+        assert "status" in fields_info
+
+    @pytest.fixture
+    def filterable_docs(self) -> list[Document]:
+        """
+        Weaviate requires RFC 3339 date strings; the default fixture uses ISO 8601.
+        """
+        documents = create_filterable_docs()
+        for i in range(len(documents)):
+            if date := documents[i].meta.get("date"):
+                documents[i].meta["date"] = f"{date}Z"
+        return documents
+
+    def assert_documents_are_equal(self, received: list[Document], expected: list[Document]):
+        assert len(received) == len(expected)
+        received = sorted(received, key=lambda doc: doc.id)
+        expected = sorted(expected, key=lambda doc: doc.id)
+        for received_doc, expected_doc in zip(received, expected, strict=True):
+            received_doc_dict = dataclasses.replace(received_doc, score=None).to_dict(flatten=False)
+            expected_doc_dict = expected_doc.to_dict(flatten=False)
+
+            # Weaviate stores embeddings with lower precision floats so we handle that here.
+            assert np_array_equal(
+                np_array(received_doc_dict.pop("embedding", None), dtype=np_float32),
+                np_array(expected_doc_dict.pop("embedding", None), dtype=np_float32),
+                equal_nan=True,
+            )
+
+            received_meta = received_doc_dict.pop("meta", None)
+            expected_meta = expected_doc_dict.pop("meta", None)
+
+            assert received_doc_dict == expected_doc_dict
+
+            # If a meta field is not set in a saved document, it will be None when retrieved
+            # from Weaviate so we need to handle that.
+            meta_keys = set(received_meta.keys()).union(set(expected_meta.keys()))
+            for key in meta_keys:
+                assert received_meta.get(key) == expected_meta.get(key)
+
+    async def test_write_documents_async(self, document_store: WeaviateDocumentStore) -> None:
+        # Override: mixin raises NotImplementedError and requires each store to define its own
+        # default-policy behaviour. Weaviate's default overwrites existing documents.
+        doc = Document(content="test doc")
+        assert await document_store.write_documents_async([doc]) == 1
+        assert await document_store.count_documents_async() == 1
+
+        doc = dataclasses.replace(doc, content="test doc 2")
+        assert await document_store.write_documents_async([doc]) == 1
+        assert await document_store.count_documents_async() == 1
+
+    async def test_count_not_empty_async(self, document_store: WeaviateDocumentStore) -> None:
+        # Override: the mixin defines this without `self`, which breaks under asyncio_mode=auto.
+        # Body is identical to the mixin's version.
+        await document_store.write_documents_async(
+            [Document(content="test doc 1"), Document(content="test doc 2"), Document(content="test doc 3")]
+        )
+        assert await document_store.count_documents_async() == 3
+
+    @pytest.mark.asyncio
+    async def test_close_async_and_reopen(self, document_store: WeaviateDocumentStore) -> None:
         # Initialise client and collection
         assert await document_store.async_client is not None
         assert await document_store.async_collection is not None
@@ -69,18 +208,6 @@ class TestWeaviateDocumentStoreAsync:
         assert docs[0].blob == image
 
     @pytest.mark.asyncio
-    async def test_filter_documents_below_default_limit_async(self, document_store: WeaviateDocumentStore) -> None:
-        docs = []
-        for index in range(9998):
-            docs.append(Document(content="This is some content", meta={"index": index}))
-        await document_store.write_documents_async(docs)
-        result = await document_store.filter_documents_async(
-            {"field": "content", "operator": "==", "value": "This is some content"}
-        )
-
-        assert len(result) == 9998
-
-    @pytest.mark.asyncio
     async def test_filter_documents_over_default_limit(self, document_store: WeaviateDocumentStore) -> None:
         docs = []
         for index in range(10000):
@@ -90,19 +217,6 @@ class TestWeaviateDocumentStoreAsync:
             await document_store.filter_documents_async(
                 {"field": "content", "operator": "==", "value": "This is some content"}
             )
-
-    @pytest.mark.asyncio
-    async def test_write_documents_async(self, document_store: WeaviateDocumentStore) -> None:
-        """
-        Test write_documents() with default policy overwrites existing documents.
-        """
-        doc = Document(content="test doc")
-        assert await document_store.write_documents_async([doc]) == 1
-        assert await document_store.count_documents_async() == 1
-
-        doc.content = "test doc 2"
-        assert await document_store.write_documents_async([doc]) == 1
-        assert await document_store.count_documents_async() == 1
 
     @pytest.mark.asyncio
     async def test_write_documents_with_blob_data_async(
@@ -250,52 +364,6 @@ class TestWeaviateDocumentStoreAsync:
         assert result_vector[0].score > 0.0
 
     @pytest.mark.asyncio
-    async def test_delete_by_filter_async(self, document_store):
-        docs = [
-            Document(content="Doc 1", meta={"category": "TypeA"}),
-            Document(content="Doc 2", meta={"category": "TypeB"}),
-            Document(content="Doc 3", meta={"category": "TypeA"}),
-        ]
-        await document_store.write_documents_async(docs)
-
-        # delete documents with category="TypeA"
-        deleted_count = await document_store.delete_by_filter_async(
-            filters={"field": "meta.category", "operator": "==", "value": "TypeA"}
-        )
-        assert deleted_count == 2
-        assert document_store.count_documents() == 1
-
-        # verify only category TypeB remains
-        remaining_docs = await document_store.filter_documents_async()
-        assert len(remaining_docs) == 1
-        assert remaining_docs[0].meta["category"] == "TypeB"
-
-    @pytest.mark.asyncio
-    async def test_update_by_filter_async(self, document_store):
-        docs = [
-            Document(content="Doc 1", meta={"category": "TypeA", "status": "draft"}),
-            Document(content="Doc 2", meta={"category": "TypeB", "status": "draft"}),
-            Document(content="Doc 3", meta={"category": "TypeA", "status": "draft"}),
-        ]
-        await document_store.write_documents_async(docs)
-        assert document_store.count_documents() == 3
-
-        # update status for category="TypeA" documents
-        updated_count = await document_store.update_by_filter_async(
-            filters={"field": "meta.category", "operator": "==", "value": "TypeA"}, meta={"status": "published"}
-        )
-        assert updated_count == 2
-
-        # Verify the updates
-        published_docs = await document_store.filter_documents_async(
-            filters={"field": "meta.status", "operator": "==", "value": "published"}
-        )
-        assert len(published_docs) == 2
-        for doc in published_docs:
-            assert doc.meta["category"] == "TypeA"
-            assert doc.meta["status"] == "published"
-
-    @pytest.mark.asyncio
     async def test_update_by_filter_async_with_pagination(self, document_store, monkeypatch):
         # Reduce DEFAULT_QUERY_LIMIT to test pagination without creating 10000+ documents
         monkeypatch.setattr("haystack_integrations.document_stores.weaviate.document_store.DEFAULT_QUERY_LIMIT", 100)
@@ -328,84 +396,6 @@ class TestWeaviateDocumentStoreAsync:
             assert 0 <= doc.meta["index"] < 250
 
     @pytest.mark.asyncio
-    async def test_count_documents_async(self, document_store: WeaviateDocumentStore) -> None:
-        docs = [
-            Document(content="Doc 1", meta={"category": "TypeA"}),
-            Document(content="Doc 2", meta={"category": "TypeB"}),
-            Document(content="Doc 3", meta={"category": "TypeA"}),
-            Document(content="Doc 4", meta={"category": "TypeA"}),
-        ]
-        await document_store.write_documents_async(docs)
-        assert await document_store.count_documents_async() == 4
-
-    @pytest.mark.asyncio
-    async def test_count_documents_by_filter_async(self, document_store):
-        docs = [
-            Document(content="Doc 1", meta={"category": "TypeA"}),
-            Document(content="Doc 2", meta={"category": "TypeB"}),
-            Document(content="Doc 3", meta={"category": "TypeA"}),
-            Document(content="Doc 4", meta={"category": "TypeA"}),
-        ]
-        await document_store.write_documents_async(docs)
-        assert await document_store.count_documents_async() == 4
-
-        count = await document_store.count_documents_by_filter_async(
-            filters={"field": "meta.category", "operator": "==", "value": "TypeA"}
-        )
-        assert count == 3
-
-        count = await document_store.count_documents_by_filter_async(
-            filters={"field": "meta.category", "operator": "==", "value": "TypeB"}
-        )
-        assert count == 1
-
-        count = await document_store.count_documents_by_filter_async(
-            filters={"field": "meta.category", "operator": "==", "value": "TypeC"}
-        )
-        assert count == 0
-
-    @pytest.mark.asyncio
-    async def test_get_metadata_fields_info_async(self, document_store):
-        fields_info = await document_store.get_metadata_fields_info_async()
-
-        assert "_original_id" not in fields_info
-        assert "content" not in fields_info
-        assert "blob_data" not in fields_info
-        assert "blob_mime_type" not in fields_info
-        assert "score" not in fields_info
-
-        assert "category" in fields_info
-        assert fields_info["category"]["type"] == "text"
-        assert "status" in fields_info
-        assert fields_info["status"]["type"] == "text"
-
-    @pytest.mark.asyncio
-    async def test_get_metadata_field_min_max_async(self, document_store):
-        docs = [
-            Document(content="Doc 1", meta={"number": 10}),
-            Document(content="Doc 2", meta={"number": 5}),
-            Document(content="Doc 3", meta={"number": 20}),
-            Document(content="Doc 4", meta={"number": 15}),
-        ]
-        await document_store.write_documents_async(docs)
-
-        result = await document_store.get_metadata_field_min_max_async("number")
-        assert result["min"] == 5
-        assert result["max"] == 20
-
-    @pytest.mark.asyncio
-    async def test_get_metadata_field_min_max_async_with_meta_prefix(self, document_store):
-        docs = [
-            Document(content="Doc 1", meta={"number": 100}),
-            Document(content="Doc 2", meta={"number": 200}),
-        ]
-        await document_store.write_documents_async(docs)
-
-        result = await document_store.get_metadata_field_min_max_async("meta.number")
-        assert result["min"] == 100
-        assert result["max"] == 200
-
-    @pytest.mark.asyncio
     async def test_get_metadata_field_min_max_async_unsupported_type(self, document_store):
         with pytest.raises(ValueError, match="doesn't support min/max aggregation"):
             await document_store.get_metadata_field_min_max_async("category")
@@ -414,35 +404,6 @@ class TestWeaviateDocumentStoreAsync:
     async def test_get_metadata_field_min_max_async_field_not_found(self, document_store):
         with pytest.raises(ValueError, match="not found in collection schema"):
             await document_store.get_metadata_field_min_max_async("nonexistent_field")
-
-    @pytest.mark.asyncio
-    async def test_count_unique_metadata_by_filter_async(self, document_store):
-        docs = [
-            Document(content="Doc 1", meta={"category": "TypeA", "status": "draft"}),
-            Document(content="Doc 2", meta={"category": "TypeB", "status": "published"}),
-            Document(content="Doc 3", meta={"category": "TypeA", "status": "draft"}),
-            Document(content="Doc 4", meta={"category": "TypeC", "status": "published"}),
-            Document(content="Doc 5", meta={"category": "TypeA", "status": "archived"}),
-        ]
-        await document_store.write_documents_async(docs)
-
-        result = await document_store.count_unique_metadata_by_filter_async(
-            filters={"field": "meta.category", "operator": "==", "value": "TypeA"}, metadata_fields=["status"]
-        )
-        assert result["status"] == 2
-
-        result = await document_store.count_unique_metadata_by_filter_async(
-            filters={
-                "operator": "OR",
-                "conditions": [
-                    {"field": "meta.category", "operator": "==", "value": "TypeA"},
-                    {"field": "meta.category", "operator": "==", "value": "TypeB"},
-                ],
-            },
-            metadata_fields=["category", "status"],
-        )
-        assert result["category"] == 2
-        assert result["status"] == 3
 
     @pytest.mark.asyncio
     async def test_count_unique_metadata_by_filter_async_with_meta_prefix(self, document_store):
@@ -479,103 +440,69 @@ class TestWeaviateDocumentStoreAsync:
                 metadata_fields=["nonexistent_field"],
             )
 
+    # --- Overrides of mixin tests to account for Weaviate-specific behaviour ---
+
     @pytest.mark.asyncio
-    async def test_get_metadata_field_unique_values_async(self, document_store):
+    async def test_get_metadata_field_unique_values_preserves_type_async(self, document_store):
+        """
+        Override: weaviate-client has no wire-protocol field for a scalar int - google.protobuf.Struct's
+        Value type only has `number_value` (a double), so a metadata int is indistinguishable from a
+        float by the time it reaches Weaviate. GroupByAggregate consequently always returns numeric
+        group keys as float, regardless of the field's declared schema type.
+        """
         docs = [
-            Document(content="Doc 1", meta={"category": "TypeA"}),
-            Document(content="Doc 2", meta={"category": "TypeB"}),
-            Document(content="Doc 3", meta={"category": "TypeA"}),
-            Document(content="Doc 4", meta={"category": "TypeC"}),
-            Document(content="Doc 5", meta={"category": "TypeB"}),
+            Document(content="Doc 1", meta={"priority": 1}),
+            Document(content="Doc 2", meta={"priority": 2}),
+            Document(content="Doc 3", meta={"priority": 1}),
         ]
         await document_store.write_documents_async(docs)
 
-        values, total_count = await document_store.get_metadata_field_unique_values_async("category")
-        assert total_count == 3
-        assert set(values) == {"TypeA", "TypeB", "TypeC"}
+        values, total_count = await document_store.get_metadata_field_unique_values_async(metadata_field="priority")
 
-    @pytest.mark.asyncio
-    async def test_get_metadata_field_unique_values_async_with_meta_prefix(self, document_store):
-        docs = [
-            Document(content="Doc 1", meta={"category": "TypeA"}),
-            Document(content="Doc 2", meta={"category": "TypeB"}),
-        ]
-        await document_store.write_documents_async(docs)
-
-        values, total_count = await document_store.get_metadata_field_unique_values_async("meta.category")
+        assert set(values) == {1, 2}
+        assert all(isinstance(value, float) for value in values)  # not int - see docstring
         assert total_count == 2
-        assert set(values) == {"TypeA", "TypeB"}
 
     @pytest.mark.asyncio
-    async def test_get_metadata_field_unique_values_async_with_search_term(self, document_store):
+    async def test_get_metadata_field_unique_values_distinct_types_async(self, document_store):
+        """
+        Override: the base mixin test stores int, float, str and bool under the *same* metadata field
+        name and expects all four back as distinct values. Weaviate's collection schema fields are
+        strongly single-typed, so a field can't simultaneously hold int/str/float/bool values.
+
+        This adapts the same intent - int, float, str and bool must come back as distinct, unmangled
+        types via get_metadata_field_unique_values_async() - using one field per type instead of one
+        shared field, which is what Weaviate can actually support.
+        """
         docs = [
-            Document(content="Python programming language", meta={"category": "TypeA"}),
-            Document(content="Java programming language", meta={"category": "TypeB"}),
-            Document(content="Python is great", meta={"category": "TypeC"}),
-            Document(content="JavaScript tutorial", meta={"category": "TypeD"}),
+            Document(content="Doc 1", meta={"priority_int": 1}),
+            Document(content="Doc 2", meta={"priority_str": "1"}),
+            Document(content="Doc 3", meta={"priority_float": 1.5}),
+            Document(content="Doc 4", meta={"priority_bool": True}),
         ]
         await document_store.write_documents_async(docs)
 
-        values, total_count = await document_store.get_metadata_field_unique_values_async(
-            "category", search_term="Python"
+        int_values, int_count = await document_store.get_metadata_field_unique_values_async(
+            metadata_field="priority_int"
         )
-        assert total_count == 2
-        assert set(values) == {"TypeA", "TypeC"}
+        str_values, str_count = await document_store.get_metadata_field_unique_values_async(
+            metadata_field="priority_str"
+        )
+        float_values, float_count = await document_store.get_metadata_field_unique_values_async(
+            metadata_field="priority_float"
+        )
+        bool_values, bool_count = await document_store.get_metadata_field_unique_values_async(
+            metadata_field="priority_bool"
+        )
 
-    @pytest.mark.asyncio
-    async def test_get_metadata_field_unique_values_async_with_pagination(self, document_store):
-        docs = [
-            Document(content="Doc 1", meta={"category": "TypeA"}),
-            Document(content="Doc 2", meta={"category": "TypeB"}),
-            Document(content="Doc 3", meta={"category": "TypeC"}),
-            Document(content="Doc 4", meta={"category": "TypeD"}),
-            Document(content="Doc 5", meta={"category": "TypeE"}),
-        ]
-        await document_store.write_documents_async(docs)
-
-        values, total_count = await document_store.get_metadata_field_unique_values_async("category", from_=0, size=2)
-        assert total_count == 5
-        assert len(values) == 2
-
-        values2, total_count2 = await document_store.get_metadata_field_unique_values_async("category", from_=2, size=2)
-        assert total_count2 == 5
-        assert len(values2) == 2
-
-        assert set(values).isdisjoint(set(values2))
-
-    @pytest.mark.asyncio
-    async def test_get_metadata_field_unique_values_async_field_not_found(self, document_store):
-        with pytest.raises(ValueError, match="not found in collection schema"):
-            await document_store.get_metadata_field_unique_values_async("nonexistent_field")
-
-    @pytest.mark.asyncio
-    async def test_get_metadata_field_unique_values_async_empty_result(self, document_store):
-        values, total_count = await document_store.get_metadata_field_unique_values_async("category")
-        assert total_count == 0
-        assert values == []
-
-    @pytest.mark.asyncio
-    async def test_delete_all_documents_recreate_async(self, document_store: WeaviateDocumentStore) -> None:
-        docs = [Document(content="test doc 1"), Document(content="test doc 2")]
-        assert await document_store.write_documents_async(docs) == 2
-        assert await document_store.count_documents_async() == 2
-
-        cls = document_store._collection_settings["class"]
-        collection = (await document_store.async_client).collections.get(cls)
-        previous_config = (await collection.config.get()).to_dict()
-
-        await document_store.delete_all_documents_async(recreate_index=True)
-        assert await document_store.count_documents_async() == 0
-
-        new_config = (await (await document_store.async_client).collections.get(cls).config.get()).to_dict()
-        assert previous_config == new_config
-
-    @pytest.mark.asyncio
-    async def test_delete_all_documents_batch_size_async(self, document_store: WeaviateDocumentStore) -> None:
-        docs = [Document(content=str(i)) for i in range(0, 5)]
-        assert await document_store.write_documents_async(docs) == 5
-        await document_store.delete_all_documents_async(batch_size=2)
-        assert await document_store.count_documents_async() == 0
+        assert (int_count, str_count, float_count, bool_count) == (1, 1, 1, 1)
+        # int type fidelity isn't asserted here: GroupByAggregate returns numeric group keys as float
+        # regardless of the field's declared schema type, the same known gap covered by
+        # test_get_metadata_field_unique_values_preserves_type_async - not specific to field-sharing.
+        assert int_values == [1]
+        assert str_values == ["1"] and type(str_values[0]) is str
+        assert float_values == [1.5] and type(float_values[0]) is float
+        assert bool_values == [True] and type(bool_values[0]) is bool
 
     @pytest.mark.asyncio
     async def test_delete_all_documents_excessive_batch_size_async(

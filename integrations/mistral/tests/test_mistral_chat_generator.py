@@ -1,25 +1,34 @@
 import json
+import logging
 import os
-from datetime import datetime
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
-import pytz
 from haystack import Pipeline
 from haystack.components.generators.utils import print_streaming_chunk
-from haystack.components.tools import ToolInvoker
-from haystack.dataclasses import ChatMessage, ChatRole, ComponentInfo, StreamingChunk, ToolCall, ToolCallDelta
+from haystack.dataclasses import (
+    ChatMessage,
+    ChatRole,
+    ComponentInfo,
+    ReasoningContent,
+    StreamingChunk,
+    ToolCall,
+    ToolCallDelta,
+)
 from haystack.tools import Tool, Toolset
 from haystack.utils.auth import Secret
 from openai import OpenAIError
-from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
-from openai.types.chat.chat_completion import Choice
+from openai.types.chat import ChatCompletionChunk
 from openai.types.chat.chat_completion_chunk import Choice as ChoiceChunk
 from openai.types.chat.chat_completion_chunk import ChoiceDelta, ChoiceDeltaToolCall, ChoiceDeltaToolCallFunction
 from openai.types.completion_usage import CompletionUsage
 from pydantic import BaseModel
 
-from haystack_integrations.components.generators.mistral.chat.chat_generator import MistralChatGenerator
+from haystack_integrations.components.generators.mistral.chat.chat_generator import (
+    MistralChatGenerator,
+    _convert_mistral_response_to_chat_messages,
+    _parse_mistral_content,
+)
 
 
 class CollectorCallback:
@@ -90,23 +99,25 @@ def mock_chat_completion():
     Mock the OpenAI API completion response and reuse it for tests
     """
     with patch("openai.resources.chat.completions.Completions.create") as mock_chat_completion_create:
-        completion = ChatCompletion(
-            id="foo",
-            model="mistral-small-latest",
-            object="chat.completion",
-            choices=[
-                Choice(
-                    finish_reason="stop",
-                    logprobs=None,
-                    index=0,
-                    message=ChatCompletionMessage(content="Hello world!", role="assistant"),
-                )
-            ],
-            created=int(datetime.now(tz=pytz.timezone("UTC")).timestamp()),
-            usage={"prompt_tokens": 57, "completion_tokens": 40, "total_tokens": 97},
+        mock_response = type("MockRawResponse", (), {})()
+        mock_response.text = json.dumps(
+            {
+                "id": "foo",
+                "model": "mistral-small-latest",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Hello world!"},
+                    }
+                ],
+                "created": 1234567890,
+                "usage": {"prompt_tokens": 57, "completion_tokens": 40, "total_tokens": 97},
+            }
         )
 
-        mock_chat_completion_create.return_value = completion
+        mock_chat_completion_create.return_value = mock_response
         yield mock_chat_completion_create
 
 
@@ -121,16 +132,24 @@ class TestMistralChatGenerator:
     def test_init_default(self, monkeypatch):
         monkeypatch.setenv("MISTRAL_API_KEY", "test-api-key")
         component = MistralChatGenerator()
-        assert component.client.api_key == "test-api-key"
+        assert component.api_key.resolve_value() == "test-api-key"
         assert component.model == "mistral-small-latest"
         assert component.api_base_url == "https://api.mistral.ai/v1"
         assert component.streaming_callback is None
         assert not component.generation_kwargs
 
-    def test_init_fail_wo_api_key(self, monkeypatch):
+    def test_warm_up(self, monkeypatch):
+        monkeypatch.setenv("MISTRAL_API_KEY", "test-api-key")
+        component = MistralChatGenerator()
+        component.warm_up()
+        assert component.client.api_key == "test-api-key"
+        assert component.client is not None
+
+    def test_warm_up_fail_wo_api_key(self, monkeypatch):
         monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
         with pytest.raises(ValueError, match=r"None of the .* environment variables are set"):
-            MistralChatGenerator()
+            component = MistralChatGenerator()
+            component.warm_up()
 
     def test_init_with_parameters(self):
         component = MistralChatGenerator(
@@ -140,7 +159,7 @@ class TestMistralChatGenerator:
             api_base_url="test-base-url",
             generation_kwargs={"max_tokens": 10, "some_test_param": "test-params"},
         )
-        assert component.client.api_key == "test-api-key"
+        assert component.api_key.resolve_value() == "test-api-key"
         assert component.model == "mistral-small"
         assert component.streaming_callback is print_streaming_chunk
         assert component.generation_kwargs == {"max_tokens": 10, "some_test_param": "test-params"}
@@ -244,21 +263,6 @@ class TestMistralChatGenerator:
         assert component.generation_kwargs == {"max_tokens": 10, "some_test_param": "test-params"}
         assert component.api_key == Secret.from_env_var("MISTRAL_API_KEY")
 
-    def test_from_dict_fail_wo_env_var(self, monkeypatch):
-        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
-        data = {
-            "type": "haystack_integrations.components.generators.mistral.chat.chat_generator.MistralChatGenerator",
-            "init_parameters": {
-                "api_key": {"env_vars": ["MISTRAL_API_KEY"], "strict": True, "type": "env_var"},
-                "model": "mistral-small",
-                "api_base_url": "test-base-url",
-                "streaming_callback": "haystack.components.generators.utils.print_streaming_chunk",
-                "generation_kwargs": {"max_tokens": 10, "some_test_param": "test-params"},
-            },
-        }
-        with pytest.raises(ValueError, match=r"None of the .* environment variables are set"):
-            MistralChatGenerator.from_dict(data)
-
     def test_init_with_mixed_tools(self, monkeypatch):
         monkeypatch.setenv("MISTRAL_API_KEY", "test-api-key")
 
@@ -281,6 +285,8 @@ class TestMistralChatGenerator:
         assert component.tools == [weather_tool, toolset]
 
     def test_handle_stream_response(self):
+        streamed_usage = CompletionUsage(completion_tokens=35, prompt_tokens=77, total_tokens=112)
+
         mistral_chunks = [
             ChatCompletionChunk(
                 id="76535283139540de943bc2036121d4c5",
@@ -316,11 +322,7 @@ class TestMistralChatGenerator:
                 created=1750076261,
                 model="mistral-small-latest",
                 object="chat.completion.chunk",
-                usage=CompletionUsage(
-                    completion_tokens=35,
-                    prompt_tokens=77,
-                    total_tokens=112,
-                ),
+                usage=streamed_usage,
             ),
         ]
 
@@ -365,13 +367,7 @@ class TestMistralChatGenerator:
                 ],
                 "finish_reason": "tool_calls",
                 "received_at": ANY,
-                "usage": {
-                    "completion_tokens": 35,
-                    "prompt_tokens": 77,
-                    "total_tokens": 112,
-                    "completion_tokens_details": None,
-                    "prompt_tokens_details": None,
-                },
+                "usage": streamed_usage.model_dump(),
             },
             component_info=ComponentInfo(
                 type="haystack_integrations.components.generators.mistral.chat.chat_generator.MistralChatGenerator",
@@ -403,13 +399,7 @@ class TestMistralChatGenerator:
         assert result.meta["finish_reason"] == "tool_calls"
         assert result.meta["index"] == 0
         assert result.meta["completion_start_time"] is not None
-        assert result.meta["usage"] == {
-            "completion_tokens": 35,
-            "prompt_tokens": 77,
-            "total_tokens": 112,
-            "completion_tokens_details": None,
-            "prompt_tokens_details": None,
-        }
+        assert result.meta["usage"] == streamed_usage.model_dump()
 
     def test_run(self, chat_messages, mock_chat_completion, monkeypatch):  # noqa: ARG002
         monkeypatch.setenv("MISTRAL_API_KEY", "fake-api-key")
@@ -422,6 +412,55 @@ class TestMistralChatGenerator:
         assert isinstance(response["replies"], list)
         assert len(response["replies"]) == 1
         assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+
+    def test_run_with_string_input(self, mock_chat_completion, monkeypatch):
+        monkeypatch.setenv("MISTRAL_API_KEY", "fake-api-key")
+        component = MistralChatGenerator()
+        response = component.run("What's the capital of France?")
+
+        # check that the backend received exactly one user message
+        _, kwargs = mock_chat_completion.call_args
+        assert kwargs["messages"] == [{"role": "user", "content": "What's the capital of France?"}]
+
+        # check that the component returns the correct ChatMessage response
+        assert isinstance(response["replies"], list)
+        assert len(response["replies"]) == 1
+        assert isinstance(response["replies"][0], ChatMessage)
+
+    @pytest.mark.asyncio
+    async def test_run_async_with_string_input(self, monkeypatch):
+        monkeypatch.setenv("MISTRAL_API_KEY", "fake-api-key")
+        component = MistralChatGenerator()
+
+        mock_raw_response = type("MockRawResponse", (), {})()
+        mock_raw_response.text = json.dumps(
+            {
+                "id": "foo",
+                "model": "mistral-small-latest",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Paris"},
+                    }
+                ],
+                "created": 1234567890,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }
+        )
+
+        with patch(
+            "openai.resources.chat.completions.AsyncCompletions.create", new_callable=AsyncMock
+        ) as mock_async_create:
+            mock_async_create.return_value = mock_raw_response
+            result = await component.run_async("What's the capital of France?")
+
+        _, kwargs = mock_async_create.call_args
+        assert kwargs["messages"] == [{"role": "user", "content": "What's the capital of France?"}]
+        assert isinstance(result["replies"], list)
+        assert len(result["replies"]) == 1
+        assert isinstance(result["replies"][0], ChatMessage)
 
     def test_run_with_params(self, chat_messages, mock_chat_completion, monkeypatch):
         monkeypatch.setenv("MISTRAL_API_KEY", "fake-api-key")
@@ -439,6 +478,15 @@ class TestMistralChatGenerator:
         assert isinstance(response["replies"], list)
         assert len(response["replies"]) == 1
         assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+
+    def test_run_with_generation_kwargs(self, chat_messages, mock_chat_completion, monkeypatch):
+        monkeypatch.setenv("MISTRAL_API_KEY", "fake-api-key")
+        component = MistralChatGenerator(generation_kwargs={"max_tokens": 10, "temperature": 0.5})
+        component.run(chat_messages, generation_kwargs={"temperature": 0.9})
+
+        _, kwargs = mock_chat_completion.call_args
+        assert kwargs["max_tokens"] == 10
+        assert kwargs["temperature"] == 0.9
 
     @pytest.mark.skipif(
         not os.environ.get("MISTRAL_API_KEY", None),
@@ -666,35 +714,6 @@ class TestMistralChatGenerator:
         assert sorted(arguments, key=lambda x: x["city"]) == [{"city": "Berlin"}, {"city": "Paris"}]
         assert tool_message.meta["finish_reason"] == "tool_calls"
 
-    @pytest.mark.skipif(
-        not os.environ.get("MISTRAL_API_KEY", None),
-        reason="Export an env var called MISTRAL_API_KEY containing the OpenAI API key to run this test.",
-    )
-    @pytest.mark.integration
-    def test_pipeline_with_mistral_chat_generator(self, tools):
-        """
-        Test that the MistralChatGenerator component can be used in a pipeline
-        """
-        pipeline = Pipeline()
-        pipeline.add_component("generator", MistralChatGenerator(tools=tools))
-        pipeline.add_component("tool_invoker", ToolInvoker(tools=tools))
-
-        pipeline.connect("generator", "tool_invoker")
-
-        results = pipeline.run(
-            data={
-                "generator": {
-                    "messages": [ChatMessage.from_user("What's the weather like in Paris?")],
-                    "generation_kwargs": {"tool_choice": "any"},
-                }
-            }
-        )
-
-        assert (
-            "The weather in Paris is sunny and 32°C"
-            == results["tool_invoker"]["tool_messages"][0].tool_call_result.result
-        )
-
     def test_serde_in_pipeline(self, monkeypatch):
         """
         Test serialization/deserialization of MistralChatGenerator in a Pipeline,
@@ -725,6 +744,11 @@ class TestMistralChatGenerator:
 
         # Get pipeline dictionary and verify its structure
         pipeline_dict = pipeline.to_dict()
+
+        # the Tool serialization format is owned by haystack-ai and varies across its versions; the
+        # dumps/loads round-trip below covers the tools, so exclude them from the pinned-dict comparison
+        tools_entries = pipeline_dict["components"]["generator"]["init_parameters"].pop("tools")
+        assert len(tools_entries) == 1
         expected_dict = {
             "metadata": {},
             "max_runs_per_component": 100,
@@ -738,17 +762,6 @@ class TestMistralChatGenerator:
                         "streaming_callback": "haystack.components.generators.utils.print_streaming_chunk",
                         "api_base_url": "https://api.mistral.ai/v1",
                         "generation_kwargs": {"temperature": 0.7},
-                        "tools": [
-                            {
-                                "type": "haystack.tools.tool.Tool",
-                                "data": {
-                                    "name": "weather",
-                                    "description": "useful to determine the weather in a given location",
-                                    "parameters": {"city": {"type": "string"}},
-                                    "function": "tests.test_mistral_chat_generator.weather",
-                                },
-                            }
-                        ],
                         "http_client_kwargs": None,
                         "timeout": None,
                         "max_retries": None,
@@ -757,24 +770,6 @@ class TestMistralChatGenerator:
             },
             "connections": [],
         }
-
-        if not hasattr(pipeline, "_connection_type_validation"):
-            expected_dict.pop("connection_type_validation")
-
-        # add outputs_to_string, inputs_from_state and outputs_to_state tool parameters for compatibility with
-        # haystack-ai>=2.12.0
-        if hasattr(tool, "outputs_to_string"):
-            expected_dict["components"]["generator"]["init_parameters"]["tools"][0]["data"]["outputs_to_string"] = (
-                tool.outputs_to_string
-            )
-        if hasattr(tool, "inputs_from_state"):
-            expected_dict["components"]["generator"]["init_parameters"]["tools"][0]["data"]["inputs_from_state"] = (
-                tool.inputs_from_state
-            )
-        if hasattr(tool, "outputs_to_state"):
-            expected_dict["components"]["generator"]["init_parameters"]["tools"][0]["data"]["outputs_to_state"] = (
-                tool.outputs_to_state
-            )
 
         assert pipeline_dict == expected_dict
 
@@ -837,3 +832,381 @@ class TestMistralChatGenerator:
             assert "city" in tool_call.arguments
             assert tool_call.arguments["city"] in ["Paris", "Berlin"]
             assert tool_call_message.meta["finish_reason"] == "tool_calls"
+
+    @pytest.mark.skipif(
+        not os.environ.get("MISTRAL_API_KEY", None),
+        reason="Export an env var called MISTRAL_API_KEY containing the Mistral API key to run this test.",
+    )
+    @pytest.mark.integration
+    def test_live_run_with_reasoning(self):
+        chat_messages = [ChatMessage.from_user("If x + 3 = 7, what is x?")]
+        component = MistralChatGenerator(generation_kwargs={"reasoning_effort": "high"})
+        results = component.run(chat_messages)
+
+        assert len(results["replies"]) == 1
+        message: ChatMessage = results["replies"][0]
+        assert message.reasoning is not None
+        assert message.reasoning.reasoning_text
+        assert message.text
+        assert "4" in message.text
+        assert message.meta["finish_reason"] == "stop"
+
+
+@pytest.fixture
+def mock_reasoning_response():
+    """Mock that returns a raw-response-like object with reasoning array content."""
+    with patch("openai.resources.chat.completions.Completions.create") as mock_create:
+        mock_response = type("MockRawResponse", (), {})()
+        mock_response.text = json.dumps(
+            {
+                "id": "test-reasoning",
+                "model": "mistral-small-latest",
+                "object": "chat.completion",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "thinking",
+                                    "thinking": [{"type": "text", "text": "Let me solve this step by step. 2+2=4."}],
+                                },
+                                {"type": "text", "text": "The answer is 4."},
+                            ],
+                        },
+                    }
+                ],
+                "created": 1234567890,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60},
+            }
+        )
+        mock_create.return_value = mock_response
+        yield mock_create
+
+
+class TestReasoningSupport:
+    def test_parse_mistral_content_string(self):
+        text, reasoning = _parse_mistral_content("Hello world")
+        assert text == "Hello world"
+        assert reasoning is None
+
+    def test_parse_mistral_content_none(self):
+        text, reasoning = _parse_mistral_content(None)
+        assert text is None
+        assert reasoning is None
+
+    def test_parse_mistral_content_empty_string(self):
+        text, reasoning = _parse_mistral_content("")
+        assert text is None
+        assert reasoning is None
+
+    def test_parse_mistral_content_array_with_reasoning(self):
+        content = [
+            {"type": "thinking", "thinking": [{"type": "text", "text": "Step 1: analyze. Step 2: solve."}]},
+            {"type": "text", "text": "The answer is 42."},
+        ]
+        text, reasoning = _parse_mistral_content(content)
+        assert text == "The answer is 42."
+        assert reasoning is not None
+        assert reasoning.reasoning_text == "Step 1: analyze. Step 2: solve."
+
+    def test_parse_mistral_content_array_text_only(self):
+        content = [
+            {"type": "text", "text": "Just a plain response."},
+        ]
+        text, reasoning = _parse_mistral_content(content)
+        assert text == "Just a plain response."
+        assert reasoning is None
+
+    def test_parse_mistral_content_array_thinking_only(self):
+        content = [
+            {"type": "thinking", "thinking": [{"type": "text", "text": "Internal reasoning only."}]},
+        ]
+        text, reasoning = _parse_mistral_content(content)
+        assert text is None
+        assert reasoning is not None
+        assert reasoning.reasoning_text == "Internal reasoning only."
+
+    def test_parse_mistral_content_multiple_thinking_blocks(self):
+        content = [
+            {"type": "thinking", "thinking": [{"type": "text", "text": "First thought. "}]},
+            {"type": "thinking", "thinking": [{"type": "text", "text": "Second thought."}]},
+            {"type": "text", "text": "Final answer."},
+        ]
+        text, reasoning = _parse_mistral_content(content)
+        assert text == "Final answer."
+        assert reasoning is not None
+        assert reasoning.reasoning_text == "First thought. Second thought."
+
+    def test_parse_mistral_content_non_dict_blocks(self):
+        content = [
+            "stray string",
+            42,
+            {"type": "text", "text": "Valid block."},
+        ]
+        text, reasoning = _parse_mistral_content(content)
+        assert text == "Valid block."
+        assert reasoning is None
+
+    def test_convert_response_with_reasoning(self):
+        response_data = {
+            "id": "test",
+            "model": "mistral-small-latest",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": [{"type": "text", "text": "Reasoning here."}]},
+                            {"type": "text", "text": "Answer here."},
+                        ],
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        }
+        messages = _convert_mistral_response_to_chat_messages(response_data)
+        assert len(messages) == 1
+        msg = messages[0]
+        assert msg.text == "Answer here."
+        assert msg.reasoning is not None
+        assert msg.reasoning.reasoning_text == "Reasoning here."
+        assert msg.meta["model"] == "mistral-small-latest"
+        assert msg.meta["finish_reason"] == "stop"
+
+    def test_convert_response_without_reasoning(self):
+        response_data = {
+            "id": "test",
+            "model": "mistral-small-latest",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Plain text response."},
+                }
+            ],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15},
+        }
+        messages = _convert_mistral_response_to_chat_messages(response_data)
+        assert len(messages) == 1
+        msg = messages[0]
+        assert msg.text == "Plain text response."
+        assert msg.reasoning is None
+
+    def test_convert_response_with_tool_calls(self):
+        response_data = {
+            "id": "test",
+            "model": "mistral-small-latest",
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_123",
+                                "function": {"name": "weather", "arguments": '{"city": "Paris"}'},
+                            }
+                        ],
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 15, "total_tokens": 25},
+        }
+        messages = _convert_mistral_response_to_chat_messages(response_data)
+        assert len(messages) == 1
+        msg = messages[0]
+        assert msg.text is None
+        assert len(msg.tool_calls) == 1
+        assert msg.tool_calls[0].tool_name == "weather"
+        assert msg.tool_calls[0].arguments == {"city": "Paris"}
+
+    def test_convert_response_malformed_tool_call_json(self):
+        response_data = {
+            "id": "test",
+            "model": "mistral-small-latest",
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_bad",
+                                "function": {"name": "weather", "arguments": "{invalid json}"},
+                            },
+                            {
+                                "id": "call_good",
+                                "function": {"name": "weather", "arguments": '{"city": "Paris"}'},
+                            },
+                        ],
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 15, "total_tokens": 25},
+        }
+        messages = _convert_mistral_response_to_chat_messages(response_data)
+        assert len(messages) == 1
+        msg = messages[0]
+        assert len(msg.tool_calls) == 1
+        assert msg.tool_calls[0].id == "call_good"
+
+    def test_convert_response_with_reasoning_and_tool_calls(self):
+        response_data = {
+            "id": "test",
+            "model": "mistral-small-latest",
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": [{"type": "text", "text": "I should check the weather."}]},
+                            {"type": "text", "text": "Let me look that up."},
+                        ],
+                        "tool_calls": [
+                            {
+                                "id": "call_123",
+                                "function": {"name": "weather", "arguments": '{"city": "Paris"}'},
+                            }
+                        ],
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        }
+        messages = _convert_mistral_response_to_chat_messages(response_data)
+        assert len(messages) == 1
+        msg = messages[0]
+        assert msg.text == "Let me look that up."
+        assert msg.reasoning is not None
+        assert msg.reasoning.reasoning_text == "I should check the weather."
+        assert len(msg.tool_calls) == 1
+        assert msg.tool_calls[0].tool_name == "weather"
+        assert msg.tool_calls[0].arguments == {"city": "Paris"}
+        assert msg.meta["finish_reason"] == "tool_calls"
+
+    def test_run_with_reasoning(self, chat_messages, mock_reasoning_response, monkeypatch):  # noqa: ARG002
+        monkeypatch.setenv("MISTRAL_API_KEY", "fake-api-key")
+        component = MistralChatGenerator()
+        response = component.run(chat_messages)
+
+        assert isinstance(response, dict)
+        assert "replies" in response
+        assert len(response["replies"]) == 1
+
+        msg = response["replies"][0]
+        assert msg.text == "The answer is 4."
+        assert msg.reasoning is not None
+        assert msg.reasoning.reasoning_text == "Let me solve this step by step. 2+2=4."
+
+    def test_prepare_api_call_routes_reasoning_effort(self, monkeypatch):
+        monkeypatch.setenv("MISTRAL_API_KEY", "fake-api-key")
+        component = MistralChatGenerator(
+            generation_kwargs={"reasoning_effort": "high", "temperature": 0.7},
+        )
+        messages = [ChatMessage.from_user("test")]
+        api_args = component._prepare_api_call(messages=messages)
+
+        assert "reasoning_effort" not in api_args
+        assert api_args["extra_body"]["reasoning_effort"] == "high"
+        assert api_args["temperature"] == 0.7
+
+    def test_prepare_api_call_routes_prompt_mode(self, monkeypatch):
+        monkeypatch.setenv("MISTRAL_API_KEY", "fake-api-key")
+        component = MistralChatGenerator(
+            model="magistral-small-latest",
+            generation_kwargs={"prompt_mode": "reasoning"},
+        )
+        messages = [ChatMessage.from_user("test")]
+        api_args = component._prepare_api_call(messages=messages)
+
+        assert "prompt_mode" not in api_args
+        assert api_args["extra_body"]["prompt_mode"] == "reasoning"
+
+    def test_streaming_with_reasoning_logs_warning(self, monkeypatch, caplog):
+        monkeypatch.setenv("MISTRAL_API_KEY", "fake-api-key")
+        component = MistralChatGenerator(
+            generation_kwargs={"reasoning_effort": "high"},
+            streaming_callback=print_streaming_chunk,
+        )
+
+        with (
+            caplog.at_level(logging.WARNING),
+            patch.object(component, "_prepare_api_call", side_effect=RuntimeError),
+            pytest.raises(RuntimeError),
+        ):
+            component.run([ChatMessage.from_user("test")])
+
+    def test_prepare_api_call_preserves_reasoning(self, monkeypatch):
+        monkeypatch.setenv("MISTRAL_API_KEY", "fake-api-key")
+        component = MistralChatGenerator()
+        messages = [
+            ChatMessage.from_user("What is 2+2?"),
+            ChatMessage.from_assistant(
+                text="The answer is 4.",
+                reasoning=ReasoningContent(reasoning_text="2+2 equals 4"),
+            ),
+            ChatMessage.from_user("Are you sure?"),
+        ]
+        api_args = component._prepare_api_call(messages=messages)
+
+        assistant_msg = api_args["messages"][1]
+        assert isinstance(assistant_msg["content"], list)
+        assert len(assistant_msg["content"]) == 2
+        assert assistant_msg["content"][0]["type"] == "thinking"
+        assert assistant_msg["content"][0]["thinking"][0]["text"] == "2+2 equals 4"
+        assert assistant_msg["content"][1]["type"] == "text"
+        assert assistant_msg["content"][1]["text"] == "The answer is 4."
+
+    def test_parse_mistral_content_unexpected_type(self):
+        text, reasoning = _parse_mistral_content(42)
+        assert text == "42"
+        assert reasoning is None
+
+    def test_parse_mistral_content_unexpected_object(self):
+        text, reasoning = _parse_mistral_content(3.14)
+        assert text == "3.14"
+        assert reasoning is None
+
+    def test_run_empty_messages(self, monkeypatch):
+        monkeypatch.setenv("MISTRAL_API_KEY", "fake-api-key")
+        component = MistralChatGenerator()
+        response = component.run([])
+        assert response == {"replies": []}
+
+    def test_convert_response_from_json_string(self):
+        json_str = json.dumps(
+            {
+                "id": "test",
+                "model": "mistral-small-latest",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": [{"type": "text", "text": "Thinking."}]},
+                                {"type": "text", "text": "Answer."},
+                            ],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15},
+            }
+        )
+        messages = _convert_mistral_response_to_chat_messages(json_str)
+        assert len(messages) == 1
+        assert messages[0].text == "Answer."
+        assert messages[0].reasoning is not None
+        assert messages[0].reasoning.reasoning_text == "Thinking."

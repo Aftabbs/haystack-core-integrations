@@ -1,5 +1,27 @@
 # Changelog
 
+## [integrations/jina-v1.3.1] - 2026-07-20
+
+### 🐛 Bug Fixes
+
+- JinaRanker - add missing output edge (#3605)
+
+### 🧪 Testing
+
+- Jina - add unit tests (#3214)
+
+
+## [integrations/jina-v1.3.0] - 2026-04-14
+
+### 🚀 Features
+
+- *(jina)* Add async support and migrate from requests to httpx (#3144)
+
+### 🧪 Testing
+
+- Track test coverage for all integrations (#3065)
+
+
 ## [integrations/jina-v1.2.0] - 2026-03-24
 
 ### 🐛 Bug Fixes

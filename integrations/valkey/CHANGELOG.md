@@ -1,5 +1,77 @@
 # Changelog
 
+## [integrations/valkey-v0.5.0] - 2026-10-05
+
+### 🚀 Features
+
+- *(valkey)* Set client_info_tag for CLIENT SETINFO LIB-NAME attribution (#4044)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+
+## [integrations/valkey-v0.4.0] - 2026-09-01
+
+### 🐛 Bug Fixes
+
+- *(valkey)* Report accurate written count when async batch writes partially fail (#3618)
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- `ValkeyDocumentStore` get_metadata_field_unique_values setting list of values to return to `Any` (#3712)
+- Valkey adding optional parameter `filters` to `get_metadata_field_unique_values()` (#3737)
+
+### 🧪 Testing
+
+- `ValkeyDocumentStore` removing duplicated tests already covered by haystack Mixin tests + allow non-schema-typed metadata values in Valkey get_metadata_field_unique_value (#3786)
+
+### 🧹 Chores
+
+- Re-standardize READMEs (#3768)
+
+
+## [integrations/valkey-v0.3.0] - 2026-07-22
+
+### 🚜 Refactor
+
+- Align Valkey closing methods to standard (#3631)
+
+### 📚 Documentation
+
+- Replace old haystack core imports with haystack_integrations paths (#3545)
+
+
+## [integrations/valkey-v0.2.2] - 2026-06-10
+
+### 🐛 Bug Fixes
+
+- *(valkey)* Add client_name to Valkey connection configuration (#3418)
+
+
+## [integrations/valkey-v0.2.1] - 2026-05-26
+
+### 🐛 Bug Fixes
+
+- Skip valkey-glide version 2.4.0 (#3350)
+
+### 🚜 Refactor
+
+-   refactor(valkey): use async DocumentStore mixin tests (#3060)
+
+### 🧪 Testing
+
+- `ValkeyDocumentStore` using Mixin Test (#3019)
+- Track test coverage for all integrations (#3065)
+- Better categorize some Document Stores tests (#3085)
+- Valkey - add unit tests (#3210)
+
+### 🧹 Chores
+
+- Add ANN type annotations to stackit, togetherai, unstructured, valkey, watsonx, weave, weaviate (#2994)
+- Increase lower pins for 3.14 support in some integrations + test with 3.14 (#3033)
+- Enforce ruff docstring rules (D102/D103/D205/D209/D213/D417/D419) in integrations 41-47 (#3012)
+- Valkey - improve typing (#3285)
+
+
 ## [integrations/valkey-v0.2.0] - 2026-03-06
 
 ### 🚀 Features

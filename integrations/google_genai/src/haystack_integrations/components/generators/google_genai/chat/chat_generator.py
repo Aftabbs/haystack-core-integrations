@@ -2,14 +2,17 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, ClassVar, Literal
 
-from google.genai import types
+from google.genai import Client, types
+from google.genai.client import AsyncClient
 from haystack import logging
+from haystack.components.generators.utils import _normalize_messages
 from haystack.core.component import component
 from haystack.core.serialization import default_from_dict, default_to_dict
-from haystack.dataclasses import AsyncStreamingCallbackT, ComponentInfo, StreamingCallbackT, select_streaming_callback
+from haystack.dataclasses import ComponentInfo, StreamingCallbackT, select_streaming_callback
 from haystack.dataclasses.chat_message import ChatMessage, ChatRole
 from haystack.tools import (
     ToolsType,
@@ -18,10 +21,10 @@ from haystack.tools import (
     flatten_tools_or_toolsets,
     serialize_tools_or_toolset,
 )
-from haystack.utils import Secret, deserialize_callable, deserialize_secrets_inplace, serialize_callable
+from haystack.utils import Secret, deserialize_callable, serialize_callable
 from pydantic import BaseModel
 
-from haystack_integrations.components.common.google_genai.utils import _get_client
+from haystack_integrations.common.google_genai.utils import _get_client
 from haystack_integrations.components.generators.google_genai.chat.utils import (
     _aggregate_streaming_chunks_with_reasoning,
     _convert_google_chunk_to_streaming_chunk,
@@ -40,10 +43,10 @@ class GoogleGenAIChatGenerator:
     """
     A component for generating chat completions using Google's Gemini models via the Google Gen AI SDK.
 
-    Supports models like gemini-2.5-flash and other Gemini variants. For Gemini 2.5 series models,
+    Supports models like gemini-3.8-flash and other Gemini variants. For Gemini 2.5 series models,
     enables thinking features via `generation_kwargs={"thinking_budget": value}`.
 
-    ### Thinking Support (Gemini 2.5 Series)
+    ### Thinking Support (Gemini 2.5 and Gemini 3 Series)
     - **Reasoning transparency**: Models can show their reasoning process
     - **Thought signatures**: Maintains thought context across multi-turn conversations with tools
     - **Configurable thinking budgets**: Control token allocation for reasoning
@@ -68,7 +71,7 @@ class GoogleGenAIChatGenerator:
     from haystack_integrations.components.generators.google_genai import GoogleGenAIChatGenerator
 
     # export the environment variable (GOOGLE_API_KEY or GEMINI_API_KEY)
-    chat_generator = GoogleGenAIChatGenerator(model="gemini-2.5-flash")
+    chat_generator = GoogleGenAIChatGenerator(model="gemini-3.8-flash")
     ```
 
     **2. Vertex AI (Application Default Credentials)**
@@ -80,7 +83,7 @@ class GoogleGenAIChatGenerator:
         api="vertex",
         vertex_ai_project="my-project",
         vertex_ai_location="us-central1",
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
     )
     ```
 
@@ -91,7 +94,7 @@ class GoogleGenAIChatGenerator:
     # export the environment variable (GOOGLE_API_KEY or GEMINI_API_KEY)
     chat_generator = GoogleGenAIChatGenerator(
         api="vertex",
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
     )
     ```
 
@@ -104,7 +107,7 @@ class GoogleGenAIChatGenerator:
 
     # Initialize the chat generator with thinking support
     chat_generator = GoogleGenAIChatGenerator(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         generation_kwargs={"thinking_budget": 1024}  # Enable thinking with 1024 token budget
     )
 
@@ -132,7 +135,7 @@ class GoogleGenAIChatGenerator:
 
     # Can use either List[Tool] or Toolset
     chat_generator_with_tools = GoogleGenAIChatGenerator(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         tools=[weather_tool],  # or tools=Toolset([weather_tool])
         generation_kwargs={"thinking_budget": -1}  # Dynamic thinking allocation
     )
@@ -154,7 +157,7 @@ class GoogleGenAIChatGenerator:
         population: int
 
     chat_generator = GoogleGenAIChatGenerator(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         generation_kwargs={"response_format": City}
     )
 
@@ -177,9 +180,15 @@ class GoogleGenAIChatGenerator:
     """
 
     SUPPORTED_MODELS: ClassVar[list[str]] = [
+        "gemini-4-argon",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
         "gemini-3.1-pro-preview",
+        "gemini-3.1-flash-lite",
         "gemini-3-flash-preview",
-        "gemini-3.1-flash-lite-preview",
         "gemini-2.5-pro",
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
@@ -196,7 +205,7 @@ class GoogleGenAIChatGenerator:
         api: Literal["gemini", "vertex"] = "gemini",
         vertex_ai_project: str | None = None,
         vertex_ai_location: str | None = None,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3.8-flash",
         generation_kwargs: dict[str, Any] | None = None,
         safety_settings: list[dict[str, Any]] | None = None,
         streaming_callback: StreamingCallbackT | None = None,
@@ -216,7 +225,7 @@ class GoogleGenAIChatGenerator:
             Application Default Credentials.
         :param vertex_ai_location: Google Cloud location for Vertex AI (e.g., "us-central1", "europe-west1").
             Required when using Vertex AI with Application Default Credentials.
-        :param model: Name of the model to use (e.g., "gemini-2.5-flash")
+        :param model: Name of the model to use (e.g., "gemini-3.8-flash")
         :param generation_kwargs: Configuration for generation (temperature, max_tokens, etc.).
             For Gemini 2.5 series, supports `thinking_budget` to configure thinking behavior:
             - `thinking_budget`: int, controls thinking token allocation
@@ -245,15 +254,6 @@ class GoogleGenAIChatGenerator:
         """
         _check_duplicate_tool_names(flatten_tools_or_toolsets(tools))
 
-        self._client = _get_client(
-            api_key=api_key,
-            api=api,
-            vertex_ai_project=vertex_ai_project,
-            vertex_ai_location=vertex_ai_location,
-            timeout=timeout,
-            max_retries=max_retries,
-        )
-
         self._api_key = api_key
         self._api = api
         self._vertex_ai_project = vertex_ai_project
@@ -265,6 +265,45 @@ class GoogleGenAIChatGenerator:
         self._tools = tools
         self._timeout = timeout
         self._max_retries = max_retries
+        self._client: Client | None = None
+        self._async_client: AsyncClient | None = None
+
+    def warm_up(self) -> None:
+        """Create the synchronous Google Gen AI client."""
+        if self._client is None:
+            self._client = _get_client(
+                api_key=self._api_key,
+                api=self._api,
+                vertex_ai_project=self._vertex_ai_project,
+                vertex_ai_location=self._vertex_ai_location,
+                timeout=self._timeout,
+                max_retries=self._max_retries,
+            )
+
+    async def warm_up_async(self) -> None:
+        """Create the asynchronous Google Gen AI client."""
+        if self._async_client is None:
+            self._async_client = _get_client(
+                api_key=self._api_key,
+                api=self._api,
+                vertex_ai_project=self._vertex_ai_project,
+                vertex_ai_location=self._vertex_ai_location,
+                timeout=self._timeout,
+                max_retries=self._max_retries,
+                async_client=True,
+            )
+
+    def close(self) -> None:
+        """Close the synchronous Google Gen AI client."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    async def close_async(self) -> None:
+        """Close the asynchronous Google Gen AI client."""
+        if self._async_client is not None:
+            await self._async_client.aclose()
+            self._async_client = None
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -303,7 +342,6 @@ class GoogleGenAIChatGenerator:
         :param data: Dictionary to deserialize from.
         :returns: Deserialized component.
         """
-        deserialize_secrets_inplace(data["init_parameters"], keys=["api_key"])
         deserialize_tools_or_toolset_inplace(data["init_parameters"], key="tools")
         init_params = data.get("init_parameters", {})
         if "streaming_callback" in init_params and init_params["streaming_callback"] is not None:
@@ -324,11 +362,17 @@ class GoogleGenAIChatGenerator:
 
         try:
             chunks = []
+            tool_calls_seen = False
 
             for i, chunk in enumerate(response_stream):
                 streaming_chunk = _convert_google_chunk_to_streaming_chunk(
-                    chunk=chunk, index=i, component_info=component_info, model=self._model
+                    chunk=chunk,
+                    index=i,
+                    component_info=component_info,
+                    model=self._model,
+                    tool_calls_seen=tool_calls_seen,
                 )
+                tool_calls_seen = tool_calls_seen or bool(streaming_chunk.tool_calls)
                 chunks.append(streaming_chunk)
 
                 # Stream the chunk
@@ -343,7 +387,7 @@ class GoogleGenAIChatGenerator:
             raise RuntimeError(msg) from e
 
     async def _handle_streaming_response_async(
-        self, response_stream: AsyncIterator[types.GenerateContentResponse], streaming_callback: AsyncStreamingCallbackT
+        self, response_stream: AsyncIterator[types.GenerateContentResponse], streaming_callback: StreamingCallbackT
     ) -> dict[str, list[ChatMessage]]:
         """
         Handle async streaming response from Google Gen AI generate_content_stream.
@@ -356,19 +400,27 @@ class GoogleGenAIChatGenerator:
 
         try:
             chunks = []
+            tool_calls_seen = False
 
             i = 0
             chunk = None
             async for chunk in response_stream:
-                i += 1
-
                 streaming_chunk = _convert_google_chunk_to_streaming_chunk(
-                    chunk=chunk, index=i, component_info=component_info, model=self._model
+                    chunk=chunk,
+                    index=i,
+                    component_info=component_info,
+                    model=self._model,
+                    tool_calls_seen=tool_calls_seen,
                 )
+                tool_calls_seen = tool_calls_seen or bool(streaming_chunk.tool_calls)
                 chunks.append(streaming_chunk)
 
                 # Stream the chunk
-                await streaming_callback(streaming_chunk)
+                # sync callbacks are allowed in async contexts with Haystack >= 3.0, so only await async ones
+                callback_result = streaming_callback(streaming_chunk)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
+                i += 1
 
             # Use custom aggregation that supports reasoning content
             message = _aggregate_streaming_chunks_with_reasoning(chunks)
@@ -381,7 +433,7 @@ class GoogleGenAIChatGenerator:
     @component.output_types(replies=list[ChatMessage])
     def run(
         self,
-        messages: list[ChatMessage],
+        messages: list[ChatMessage] | str,
         generation_kwargs: dict[str, Any] | None = None,
         safety_settings: list[dict[str, Any]] | None = None,
         streaming_callback: StreamingCallbackT | None = None,
@@ -391,8 +443,11 @@ class GoogleGenAIChatGenerator:
         Run the Google Gen AI chat generator on the given input data.
 
         :param messages: A list of ChatMessage instances representing the input messages.
-        :param generation_kwargs: Configuration for generation. If provided, it will override
-        the default config. Supports `thinking_budget` for Gemini 2.5 series thinking configuration.
+            If a string is provided, it is converted to a list containing a ChatMessage with user role.
+        :param generation_kwargs: Configuration for generation. These are merged per key with the
+        `generation_kwargs` passed during component initialization: keys provided here take precedence,
+        keys set only at initialization are kept. Supports `thinking_budget` for Gemini 2.5 series
+        thinking configuration.
         :param safety_settings: Safety settings for content filtering. If provided, it will override the
         default settings.
         :param streaming_callback: A callback function that is called when a new token is
@@ -406,8 +461,12 @@ class GoogleGenAIChatGenerator:
         :raises ValueError: If a ChatMessage does not contain at least one of TextContent, ToolCall, or
         ToolCallResult or if the role in ChatMessage is different from User, System, Assistant.
         """
-        # Use provided configs or fall back to instance defaults
-        generation_kwargs = generation_kwargs or self._generation_kwargs
+        self.warm_up()
+        assert self._client is not None  # noqa: S101
+
+        messages = _normalize_messages(messages)
+        # Merge generation_kwargs with instance defaults; other configs fall back to instance defaults
+        generation_kwargs = {**self._generation_kwargs, **(generation_kwargs or {})}
         safety_settings = safety_settings or self._safety_settings
         tools = tools or self._tools
 
@@ -491,7 +550,7 @@ class GoogleGenAIChatGenerator:
     @component.output_types(replies=list[ChatMessage])
     async def run_async(
         self,
-        messages: list[ChatMessage],
+        messages: list[ChatMessage] | str,
         generation_kwargs: dict[str, Any] | None = None,
         safety_settings: list[dict[str, Any]] | None = None,
         streaming_callback: StreamingCallbackT | None = None,
@@ -501,8 +560,11 @@ class GoogleGenAIChatGenerator:
         Async version of the run method. Run the Google Gen AI chat generator on the given input data.
 
         :param messages: A list of ChatMessage instances representing the input messages.
-        :param generation_kwargs: Configuration for generation. If provided, it will override
-        the default config. Supports `thinking_budget` for Gemini 2.5 series thinking configuration.
+            If a string is provided, it is converted to a list containing a ChatMessage with user role.
+        :param generation_kwargs: Configuration for generation. These are merged per key with the
+        `generation_kwargs` passed during component initialization: keys provided here take precedence,
+        keys set only at initialization are kept. Supports `thinking_budget` for Gemini 2.5 series
+        thinking configuration.
         See https://ai.google.dev/gemini-api/docs/thinking for possible values.
         :param safety_settings: Safety settings for content filtering. If provided, it will override the
         default settings.
@@ -517,8 +579,12 @@ class GoogleGenAIChatGenerator:
         :raises ValueError: If a ChatMessage does not contain at least one of TextContent, ToolCall, or
         ToolCallResult or if the role in ChatMessage is different from User, System, Assistant.
         """
-        # Use provided configs or fall back to instance defaults
-        generation_kwargs = generation_kwargs or self._generation_kwargs
+        await self.warm_up_async()
+        assert self._async_client is not None  # noqa: S101
+
+        messages = _normalize_messages(messages)
+        # Merge generation_kwargs with instance defaults; other configs fall back to instance defaults
+        generation_kwargs = {**self._generation_kwargs, **(generation_kwargs or {})}
         safety_settings = safety_settings or self._safety_settings
         tools = tools or self._tools
 
@@ -567,7 +633,7 @@ class GoogleGenAIChatGenerator:
 
             if streaming_callback:
                 # Use streaming
-                response_stream = await self._client.aio.models.generate_content_stream(
+                response_stream = await self._async_client.models.generate_content_stream(
                     model=self._model,
                     contents=contents,
                     config=config,
@@ -575,7 +641,7 @@ class GoogleGenAIChatGenerator:
                 return await self._handle_streaming_response_async(response_stream, streaming_callback)
             else:
                 # Use non-streaming
-                response = await self._client.aio.models.generate_content(
+                response = await self._async_client.models.generate_content(
                     model=self._model,
                     contents=contents,
                     config=config,

@@ -23,7 +23,9 @@ class AmazonBedrockTextEmbedder:
     Usage example:
     ```python
     import os
-    from haystack_integrations.components.embedders.amazon_bedrock import AmazonBedrockTextEmbedder
+    from haystack_integrations.components.embedders.amazon_bedrock import (
+        AmazonBedrockTextEmbedder,
+    )
 
     os.environ["AWS_ACCESS_KEY_ID"] = "..."
     os.environ["AWS_SECRET_ACCESS_KEY_ID"] = "..."
@@ -48,7 +50,7 @@ class AmazonBedrockTextEmbedder:
             "AWS_SECRET_ACCESS_KEY", strict=False
         ),
         aws_session_token: Secret | None = Secret.from_env_var("AWS_SESSION_TOKEN", strict=False),  # noqa: B008
-        aws_region_name: Secret | None = Secret.from_env_var("AWS_DEFAULT_REGION", strict=False),  # noqa: B008
+        aws_region_name: Secret | str | None = Secret.from_env_var("AWS_DEFAULT_REGION", strict=False),  # noqa: B008
         aws_profile_name: Secret | None = Secret.from_env_var("AWS_PROFILE", strict=False),  # noqa: B008
         boto3_config: dict[str, Any] | None = None,
         **kwargs: Any,
@@ -80,7 +82,7 @@ class AmazonBedrockTextEmbedder:
             Can be used to tune [retry behavior](https://docs.aws.amazon.com/boto3/latest/guide/retries.html)
             and other low-level settings like timeouts and connection management.
         :param kwargs: Additional parameters to pass for model inference. For example, `input_type` and `truncate` for
-            Cohere models.
+            Cohere models, or `dimensions` and `normalize` for Amazon Titan Text Embeddings V2.
         :raises ValueError: If the model is not supported.
         :raises AmazonBedrockConfigurationError: If the AWS environment is not configured correctly.
         """
@@ -97,16 +99,23 @@ class AmazonBedrockTextEmbedder:
         self.boto3_config = boto3_config
         self.kwargs = kwargs
 
-        def resolve_secret(secret: Secret | None) -> str | None:
-            return secret.resolve_value() if secret else None
+        self._client: Any = None
+
+    def warm_up(self) -> None:
+        """Create the Amazon Bedrock client."""
+        if self._client is not None:
+            return
+
+        def resolve_secret(secret: Secret | str | None) -> str | None:
+            return secret.resolve_value() if isinstance(secret, Secret) else secret
 
         try:
             session = get_aws_session(
-                aws_access_key_id=resolve_secret(aws_access_key_id),
-                aws_secret_access_key=resolve_secret(aws_secret_access_key),
-                aws_session_token=resolve_secret(aws_session_token),
-                aws_region_name=resolve_secret(aws_region_name),
-                aws_profile_name=resolve_secret(aws_profile_name),
+                aws_access_key_id=resolve_secret(self.aws_access_key_id),
+                aws_secret_access_key=resolve_secret(self.aws_secret_access_key),
+                aws_session_token=resolve_secret(self.aws_session_token),
+                aws_region_name=resolve_secret(self.aws_region_name),
+                aws_profile_name=resolve_secret(self.aws_profile_name),
             )
             config = Config(
                 user_agent_extra="x-client-framework:haystack", **(self.boto3_config if self.boto3_config else {})
@@ -119,6 +128,12 @@ class AmazonBedrockTextEmbedder:
             )
             raise AmazonBedrockConfigurationError(msg) from exception
 
+    def close(self) -> None:
+        """Close the Amazon Bedrock client."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
     @component.output_types(embedding=list[float])
     def run(self, text: str) -> dict[str, list[float]]:
         """
@@ -130,6 +145,7 @@ class AmazonBedrockTextEmbedder:
         :raises TypeError: If the input text is not a string.
         :raises AmazonBedrockInferenceError: If the model inference fails.
         """
+        self.warm_up()
         if not isinstance(text, str):
             msg = (
                 "AmazonBedrockTextEmbedder expects a string as an input."
@@ -149,6 +165,12 @@ class AmazonBedrockTextEmbedder:
             body = {
                 "inputText": text,
             }
+            if self.model.startswith("amazon.titan-embed-text-v2"):
+                # `dimensions` and `normalize` are only supported by Amazon Titan Text Embeddings V2
+                if (dimensions := self.kwargs.get("dimensions")) is not None:
+                    body["dimensions"] = dimensions
+                if (normalize := self.kwargs.get("normalize")) is not None:
+                    body["normalize"] = normalize
 
         try:
             response = self._client.invoke_model(

@@ -7,7 +7,7 @@ name = "llama-cpp-haystack"
 dynamic = ["version"]
 description = 'An integration between the llama.cpp LLM framework and Haystack'
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 keywords = []
 authors = [
@@ -18,16 +18,16 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Development Status :: 4 - Beta",
     "Programming Language :: Python",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
-    "haystack-ai>=2.22.0", "llama-cpp-python>=0.2.87"
+    "haystack-ai>=2.30.0", "llama-cpp-python>=0.2.87"
 ]
 
 [project.urls]
@@ -62,6 +62,7 @@ dependencies = [
     "pytest-rerunfailures",
     "mypy",
     "pip",
+    "huggingface_hub",
     "transformers[sentencepiece]<5",
 ]
 
@@ -135,6 +136,7 @@ ignore = [
     "PLR0912",
     "PLR0913",
     "PLR0915",
+    "PLR0917",
   # Allow `Any` - used legitimately for dynamic types and SDK boundaries
   "ANN401",
 ]

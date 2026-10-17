@@ -1,5 +1,83 @@
 # Changelog
 
+## [integrations/cohere-v10.1.0] - 2026-09-28
+
+### 🚀 Features
+
+- *(cohere)* Add utility for API base URL validation (#4015)
+
+
+## [integrations/cohere-v10.0.1] - 2026-09-10
+
+### 🐛 Bug Fixes
+
+- Batch CohereDocumentEmbedder.run_async like the sync path (#3926)
+
+
+## [integrations/cohere-v10.0.0] - 2026-09-04
+
+### 🚜 Refactor
+
+- [**breaking**] Cohere - create clients in warm up methods (#3911)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+### 🧹 Chores
+
+- Clarify how generation_kwargs passed in run are handled (#3805)
+- [**breaking**] Remove deprecated `CohereGenerator` (use `CohereChatGenerator` instead) (#3885)
+
+
+## [integrations/cohere-v9.5.0] - 2026-08-11
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- CohereRanker reordered the top_k fallback to happen after validation (#3747)
+
+
+## [integrations/cohere-v9.4.1] - 2026-07-22
+
+
+## [integrations/cohere-v9.4.0] - 2026-07-22
+
+### 🐛 Bug Fixes
+
+- *(cohere)* Include citations in streaming ChatMessage meta (#3580)
+
+
+## [integrations/cohere-v9.3.0] - 2026-07-09
+
+### 🧪 Testing
+
+- Guard ToolInvoker imports so chat-generator tests run under Haystack 3.0 (#3535)
+- Fix cohere, amazon_bedrock, mirage, and ollama tests under Haystack 3.0 (#3566)
+
+### 🧹 Chores
+
+- Support sync streaming callbacks in async contexts for Haystack 2.x/3.x compatibility (#3534)
+
+
+## [integrations/cohere-v9.2.0] - 2026-06-05
+
+### 🚀 Features
+
+- Cohere - accept str as ChatGenerator input; deprecate generator (#3395)
+
+### 🧹 Chores
+
+- Cohere - set lower bound pin for Pydantic (#3284)
+
+
+## [integrations/cohere-v9.1.0] - 2026-04-13
+
+### 🚀 Features
+
+- *(cohere)* Add async support to CohereRanker (#3143)
+
+
 ## [integrations/cohere-v9.0.0] - 2026-04-07
 
 ### 🐛 Bug Fixes
@@ -71,7 +149,7 @@
 - [**breaking**] Cohere - drop Python 3.9 and use X|Y typing (#2696)
 
 
-## [integrations/cohere-v6.3.0] - 2025-11-26
+## [integrations/cohere-v6.2.0] - 2025-11-26
 
 ### ⚙️ CI
 
@@ -280,8 +358,6 @@
 
 ### 🚀 Features
 
-- Update Anthropic/Cohere for tools use (#790)
-- Update Cohere default LLMs, add examples and update unit tests (#838)
 - Cohere LLM - adjust token counting meta to match OpenAI format (#1086)
 
 ### 🐛 Bug Fixes
@@ -292,10 +368,6 @@
 
 - Do not retry tests in `hatch run test` command (#954)
 
-### ⚙️ CI
-
-- Retry tests to reduce flakyness (#836)
-
 ### 🧹 Chores
 
 - Update ruff invocation to include check parameter (#853)
@@ -305,6 +377,24 @@
 - Ci: install `pytest-rerunfailures` where needed; add retry config to `test-cov` script (#845)
 - Update CohereChatGenerator docstrings (#958)
 - Update CohereGenerator docstrings (#960)
+
+## [integrations/cohere-v1.1.3] - 2024-06-21
+
+### 🚀 Features
+
+- Update Cohere default LLMs, add examples and update unit tests (#838)
+
+### ⚙️ CI
+
+- Retry tests to reduce flakyness (#836)
+
+
+## [integrations/cohere-v1.1.2] - 2024-06-18
+
+### 🚀 Features
+
+- Update Anthropic/Cohere for tools use (#790)
+
 
 ## [integrations/cohere-v1.1.1] - 2024-06-12
 
@@ -378,11 +468,6 @@
 
 ## [integrations/cohere-v0.4.0] - 2024-02-12
 
-### 🐛 Bug Fixes
-
-- Fix Cohere tests (#337)
-- Cohere inconsistent embeddings and documents lengths (#284)
-
 ### 🚜 Refactor
 
 - [**breaking**] Use `Secret` for API keys in Cohere components (#386)
@@ -390,6 +475,13 @@
 ### 🧪 Testing
 
 - Fix failing `TestCohereChatGenerator.test_from_dict_fail_wo_env_var` test (#393)
+
+## [integrations/cohere-v0.3.1] - 2024-02-08
+
+### 🐛 Bug Fixes
+
+- Fix Cohere tests (#337)
+- Cohere inconsistent embeddings and documents lengths (#284)
 
 ### 🌀 Miscellaneous
 

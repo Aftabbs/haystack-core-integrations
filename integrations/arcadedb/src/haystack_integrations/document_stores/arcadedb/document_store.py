@@ -4,12 +4,13 @@
 
 """ArcadeDB DocumentStore for Haystack 2.x — document storage + vector search via HTTP/JSON API."""
 
-import logging
+from collections import defaultdict
+from contextlib import suppress
 from http import HTTPStatus
 from typing import Any, ClassVar
 
 import requests
-from haystack import Document, default_from_dict, default_to_dict
+from haystack import Document, default_from_dict, default_to_dict, logging
 from haystack.document_stores.errors import DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
 from haystack.errors import FilterError
@@ -95,7 +96,7 @@ class ArcadeDBDocumentStore:
         self._recreate_type = recreate_type
         self._create_database = create_database
 
-        self._session = requests.Session()
+        self._session: requests.Session | None = None
         self._initialized = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -134,9 +135,24 @@ class ArcadeDBDocumentStore:
                 init_params[key] = Secret.from_dict(init_params[key])
         return default_from_dict(cls, data)
 
+    def close(self) -> None:
+        """
+        Release the associated synchronous resources.
+        """
+        if self._session is not None:
+            with suppress(Exception):
+                self._session.close()
+            self._session = None
+
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
+
+    def _ensure_session(self) -> requests.Session:
+        """Lazily create the HTTP session"""
+        if self._session is None:
+            self._session = requests.Session()
+        return self._session
 
     def _auth(self) -> tuple[str, str] | None:
         user = self._username.resolve_value() if self._username else None
@@ -152,7 +168,7 @@ class ArcadeDBDocumentStore:
         if positional_params:
             payload["params"] = positional_params
 
-        resp = self._session.post(url, json=payload, auth=self._auth())
+        resp = self._ensure_session().post(url, json=payload, auth=self._auth())
         if resp.status_code >= HTTPStatus.BAD_REQUEST:
             msg = f"ArcadeDB command failed ({resp.status_code}): {resp.text}"
             raise RuntimeError(msg)
@@ -163,7 +179,7 @@ class ArcadeDBDocumentStore:
     def _server_command(self, command: str) -> dict[str, Any]:
         """Execute a server-level command (e.g. CREATE DATABASE)."""
         url = f"{self._url}/api/v1/server"
-        resp = self._session.post(url, json={"command": command}, auth=self._auth())
+        resp = self._ensure_session().post(url, json={"command": command}, auth=self._auth())
         if resp.status_code >= HTTPStatus.BAD_REQUEST:
             msg = f"ArcadeDB server command failed ({resp.status_code}): {resp.text}"
             raise RuntimeError(msg)
@@ -177,9 +193,9 @@ class ArcadeDBDocumentStore:
         if self._create_database:
             try:
                 self._server_command(f"CREATE DATABASE {self._database}")
-                logger.info("Created database '%s'", self._database)
+                logger.info("Created database '{database}'", database=self._database)
             except RuntimeError:
-                logger.debug("Database '%s' already exists or cannot be created", self._database)
+                logger.debug("Database '{database}' already exists or cannot be created", database=self._database)
 
         # 2. Optionally drop existing type
         if self._recreate_type:
@@ -213,11 +229,11 @@ class ArcadeDBDocumentStore:
 
         self._initialized = True
         logger.info(
-            "ArcadeDBDocumentStore initialized: database=%s, type=%s, dim=%d, metric=%s",
-            self._database,
-            self._type_name,
-            self._embedding_dimension,
-            metric,
+            "ArcadeDBDocumentStore initialized: database={database}, type={type}, dim={dim}, metric={metric}",
+            database=self._database,
+            type=self._type_name,
+            dim=self._embedding_dimension,
+            metric=metric,
         )
 
     # ------------------------------------------------------------------
@@ -238,20 +254,57 @@ class ArcadeDBDocumentStore:
         return 0
 
     @staticmethod
-    def _extract_distinct_values(rows: list[dict[str, Any]]) -> set[str]:
+    def _extract_distinct_values(rows: list[dict[str, Any]]) -> list[Any]:
         """
-        Extracts and flattens unique non-None strings from 'val' column result rows.
+        Extracts and flattens unique non-None values from 'val' column result rows.
+
+        Values of different types can be equal in Python (`1 == True == 1.0`), so dedupe by (type, value)
+        rather than by value alone.
+
         :param rows: Raw result rows from ``_command``.
-        :returns: A set of unique string values.
+        :returns: A list of unique values, preserving their original type.
         """
-        result: set[str] = set()
+        seen: set[tuple[type, Any]] = set()
+        result: list[Any] = []
+
+        def _add(value: Any) -> None:
+            dedup_key = (type(value), value)
+            if dedup_key not in seen:
+                seen.add(dedup_key)
+                result.append(value)
+
         for row in rows:
             val = row.get("val")
             if isinstance(val, list):
-                result.update(str(item) for item in val if item is not None)
+                for item in val:
+                    if item is not None:
+                        _add(item)
             elif val is not None:
-                result.add(str(val))
+                _add(val)
         return result
+
+    @staticmethod
+    def _sort_values_by_type(values: list[Any]) -> list[Any]:
+        """
+        Sorts values without ever comparing ones that aren't mutually comparable.
+
+        `1 < "a"` raises `TypeError`, so each type group is sorted on its own. `int`, `float` and `bool`
+        share one group to keep numeric order across them; sorting everything on `str(value)` would avoid
+        the `TypeError` too, but puts `10` before `2`. Values equal across types (`1 == 1.0 == True`)
+        tie-break on type name, since `SELECT DISTINCT` gives no row order and pagination needs one.
+
+        :param values: The values to sort.
+        :returns: The values, grouped into mutually comparable types and sorted within each group.
+        """
+
+        def sort_key(value: Any) -> tuple[Any, str]:
+            return value, type(value).__name__
+
+        grouped: dict[str, list[Any]] = defaultdict(list)
+        for value in values:
+            group = "number" if isinstance(value, (bool, int, float)) else type(value).__name__
+            grouped[group].append(value)
+        return [value for group in sorted(grouped) for value in sorted(grouped[group], key=sort_key)]
 
     def _get_metadata_projection_documents(self) -> list[dict[str, Any]]:
         """
@@ -296,7 +349,10 @@ class ArcadeDBDocumentStore:
             return "keyword"
 
         if len(inferred_types) > 1:
-            logger.warning("Field has mixed metadata types %s. Defaulting to 'keyword'.", inferred_types)
+            logger.warning(
+                "Field has mixed metadata types {inferred_types}. Defaulting to 'keyword'.",
+                inferred_types=inferred_types,
+            )
             return "keyword"
 
         return next(iter(inferred_types))
@@ -413,7 +469,8 @@ class ArcadeDBDocumentStore:
         Deletes all documents in the document store.
         """
         self._ensure_initialized()
-        self._command(f"TRUNCATE TYPE `{self._type_name}`")
+        # UNSAFE is required to truncate a non-empty vertex type; safe here since the store never creates edges
+        self._command(f"TRUNCATE TYPE `{self._type_name}` UNSAFE")
 
     def delete_by_filter(self, filters: dict[str, Any]) -> int:
         """
@@ -456,11 +513,14 @@ class ArcadeDBDocumentStore:
             msg = "update_by_filter requires a non-empty filter."
             raise FilterError(msg)
 
-        sql_set = ",".join(f"meta[{_sql_str(key)}] = {_map_literal_base(value)}" for key, value in meta.items())
-        sql = f"UPDATE `{self._type_name}` SET {sql_set} WHERE {where}"
-        count_result = self._command(sql)
-
-        return count_result[0]["count"]
+        # ArcadeDB does not support in-place MAP key updates via SET or MERGE.
+        # Read-modify-write: fetch matching docs, merge meta in Python, write back.
+        rows = self._command(f"SELECT id, meta FROM `{self._type_name}` WHERE {where}")
+        for row in rows:
+            merged = {**(row.get("meta") or {}), **meta}
+            meta_str = _map_literal(merged)
+            self._command(f"UPDATE `{self._type_name}` SET meta = {meta_str} WHERE id = {_sql_str(row['id'])}")
+        return len(rows)
 
     def count_documents_by_filter(self, filters: dict[str, Any]) -> int:
         """
@@ -503,7 +563,10 @@ class ArcadeDBDocumentStore:
         counts = {}
         for field in metadata_fields:  # Arcade doesn't support COUNT(DISTINCT..)
             field_name = field.removeprefix("meta.")
-            sql = f"SELECT DISTINCT meta[{_sql_str(field_name)}] AS val FROM `{self._type_name}`"
+            field_ref = f"meta[{_sql_str(field_name)}]"
+            # Projecting the value's type makes DISTINCT type-aware, so an int and a numerically equal
+            # float stay two values instead of collapsing into one - see get_metadata_field_unique_values.
+            sql = f"SELECT DISTINCT {field_ref} AS val, {field_ref}.type() AS val_type FROM `{self._type_name}`"
             if where:
                 sql += f" WHERE {where}"
             rows = self._command(sql)
@@ -556,31 +619,54 @@ class ArcadeDBDocumentStore:
         return {"min": rows[0].get("min_value"), "max": rows[0].get("max_value")}
 
     def get_metadata_field_unique_values(
-        self, metadata_field: str, search_term: str | None = None, from_: int = 0, size: int = 10
-    ) -> tuple[list[str], int]:
+        self,
+        metadata_field: str,
+        search_term: str | None = None,
+        from_: int = 0,
+        size: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], int]:
         """
         Retrieves unique values for a field matching a search term or all possible values
         if no search term is given.
+
+        **Note**: values of different types are kept distinct even when they compare equal in Python, so
+        the int `1`, the float `1.0`, the bool `True` and the str `"1"` are returned as four separate
+        values.
+
         :param metadata_field: The metadata field to inspect.
         :param search_term: Optional case-insensitive substring search term.
         :param from_: The starting index for pagination.
         :param size: The number of values to return.
-        :returns: A tuple containing the paginated values and the total count.
+        :param filters: Optional filters to restrict the documents considered.
+        :returns: A tuple containing the paginated values (in their original type) and the total count.
         """
         self._ensure_initialized()
 
         metadata_field = metadata_field.removeprefix("meta.")
         field_ref = f"meta[{_sql_str(metadata_field)}]"
-        where = ""
+        conditions = []
+
+        try:
+            filters_where = _convert_filters(filters)
+        except ValueError as e:
+            raise FilterError(str(e)) from e
+        if filters_where:
+            conditions.append(filters_where)
 
         if search_term:
             search_val = _sql_str(f"%{search_term}%")
-            where = f" WHERE {field_ref} ILIKE {search_val}"
+            conditions.append(f"{field_ref} ILIKE {search_val}")
 
-        sql = f"SELECT DISTINCT {field_ref} AS val FROM `{self._type_name}`{where}"
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        # On its own, SELECT DISTINCT treats a whole-number float (1.0) as identical to a numerically
+        # equal int (1) and collapses them. Projecting the value's type alongside it makes DISTINCT
+        # type-aware, so both survive; `_extract_distinct_values` only reads `val`.
+        sql = f"SELECT DISTINCT {field_ref} AS val, {field_ref}.type() AS val_type FROM `{self._type_name}`{where}"
         rows = self._command(sql)
 
-        all_values = sorted(self._extract_distinct_values(rows))
+        all_values = self._sort_values_by_type(self._extract_distinct_values(rows))
         total_count = len(all_values)
         return all_values[from_ : from_ + size], total_count
 

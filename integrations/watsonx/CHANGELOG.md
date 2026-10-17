@@ -1,5 +1,65 @@
 # Changelog
 
+## [integrations/watsonx-v2.0.0] - 2026-09-11
+
+### 🐛 Bug Fixes
+
+- Standardize license files (#3771)
+
+### 🚜 Refactor
+
+- [**breaking**] Watsonx - move client creation to warm_up (#3944)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+### 🧹 Chores
+
+- Clarify how generation_kwargs passed in run are handled (#3805)
+- [**breaking**] Remove deprecated `WatsonxGenerator` (use `WatsonxChatGenerator` instead) (#3889)
+
+
+## [integrations/watsonx-v1.7.0] - 2026-08-07
+
+### 🚀 Features
+
+- Add Python 3.14 support for WatsonX integration (#3744)
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+
+
+## [integrations/watsonx-v1.6.0] - 2026-07-09
+
+### 🧪 Testing
+
+- Fix failing test watsonx integration (#3414)
+- Trust test modules under Haystack 3.0's deserialization allowlist (#3537)
+- Make Tool/Agent serialization assertions version-agnostic for Haystack 2.x/3.x (#3533)
+
+### 🧹 Chores
+
+- Support sync streaming callbacks in async contexts for Haystack 2.x/3.x compatibility (#3534)
+
+
+## [integrations/watsonx-v1.5.0] - 2026-06-04
+
+### 🚀 Features
+
+- Watsonx - accept str as ChatGenerator input; deprecate generator; rm generator example (#3396)
+
+### 🧪 Testing
+
+- Track test coverage for all integrations (#3065)
+
+### 🧹 Chores
+
+- Add ANN type annotations to stackit, togetherai, unstructured, valkey, watsonx, weave, weaviate (#2994)
+- Enforce ruff docstring rules (D102/D103/D205/D209/D213/D417/D419) in integrations 41-47 (#3012)
+
+
 ## [integrations/watsonx-v1.4.0] - 2026-03-13
 
 ### 🚀 Features

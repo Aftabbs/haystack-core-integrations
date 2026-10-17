@@ -4,13 +4,16 @@
 
 import os
 import time
-from unittest.mock import patch
+from dataclasses import replace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 from haystack import Document
 from haystack.components.preprocessors import DocumentSplitter
 from haystack.components.retrievers import SentenceWindowRetriever
+from haystack.dataclasses import ByteStream, SparseEmbedding
+from haystack.document_stores.types import DuplicatePolicy
 from haystack.testing.document_store import (
     CountDocumentsByFilterTest,
     CountDocumentsTest,
@@ -125,7 +128,31 @@ def test_to_from_dict(mock_pinecone, monkeypatch):
     assert document_store.dimension == 60
     assert document_store.metric == "euclidean"
     assert document_store.spec == {"serverless": {"region": "us-east-1", "cloud": "aws"}}
-    assert document_store.show_progress is True
+
+
+def test_close():
+    document_store = PineconeDocumentStore(api_key=Secret.from_token("fake-api-key"))
+    mock_index = MagicMock()
+    document_store._index = mock_index
+
+    document_store.close()
+
+    mock_index.close.assert_called_once()
+    assert document_store._index is None
+
+    document_store.close()
+    mock_index.close.assert_called_once()
+
+
+def test_close_is_exception_safe():
+    document_store = PineconeDocumentStore(api_key=Secret.from_token("fake-api-key"))
+    mock_index = MagicMock()
+    mock_index.close.side_effect = RuntimeError("boom")
+    document_store._index = mock_index
+
+    document_store.close()
+
+    assert document_store._index is None
 
 
 def test_init_fails_wo_api_key(monkeypatch):
@@ -230,6 +257,145 @@ def test_convert_meta_to_int():
     assert PineconeDocumentStore._convert_meta_to_int(meta_data) == {}
 
 
+@pytest.mark.parametrize(
+    ("documents", "expected", "warning_fragment"),
+    [
+        ([], {}, None),
+        (
+            [Document(content="hello", meta={"flag": True})],
+            {"content": {"type": "text"}, "flag": {"type": "boolean"}},
+            None,
+        ),
+        (
+            [Document(content=None, meta={"tags": ["a", "b"]})],
+            {"tags": {"type": "keyword"}},
+            None,
+        ),
+        (
+            [Document(content=None, meta={"counts": [1, 2]})],
+            {"counts": {"type": "long"}},
+            None,
+        ),
+        (
+            [Document(content=None, meta={"flags": [True, False]})],
+            {"flags": {"type": "boolean"}},
+            None,
+        ),
+        (
+            [Document(content=None, meta={"empty": []})],
+            {"empty": {"type": "keyword"}},
+            None,
+        ),
+        (
+            [Document(content=None, meta={"pi": 3.14})],
+            {"pi": {"type": "long"}},
+            None,
+        ),
+        (
+            [
+                Document(content=None, meta={"value": 1}),
+                Document(content=None, meta={"value": "two"}),
+            ],
+            {"value": {"type": "keyword"}},
+            "mixed types",
+        ),
+    ],
+)
+def test_get_metadata_fields_info_impl_type_inference(documents, expected, warning_fragment, caplog):
+    with caplog.at_level("WARNING"):
+        result = PineconeDocumentStore._get_metadata_fields_info_impl(documents)
+    assert result == expected
+    if warning_fragment:
+        assert warning_fragment in caplog.text
+
+
+def test_get_metadata_field_min_max_impl_strips_meta_prefix_and_handles_missing():
+    docs = [
+        Document(content="a", meta={"priority": 1}),
+        Document(content="b", meta={"priority": 5}),
+    ]
+    assert PineconeDocumentStore._get_metadata_field_min_max_impl(docs, "meta.priority") == {"min": 1, "max": 5}
+    assert PineconeDocumentStore._get_metadata_field_min_max_impl(docs, "missing") == {"min": None, "max": None}
+
+
+def test_get_metadata_field_unique_values_impl_pagination_search_and_lists():
+    docs = [
+        Document(content="a", meta={"tags": ["python", "java"]}),
+        Document(content="b", meta={"tags": ["rust", "go"]}),
+        Document(content="c", meta={"tags": ["python"]}),
+    ]
+
+    values, total = PineconeDocumentStore._get_metadata_field_unique_values_impl(
+        docs, "tags", search_term=None, from_=0, size=10
+    )
+    assert total == 4
+    assert values == ["go", "java", "python", "rust"]
+
+    values, total = PineconeDocumentStore._get_metadata_field_unique_values_impl(
+        docs, "tags", search_term=None, from_=1, size=2
+    )
+    assert total == 4
+    assert values == ["java", "python"]
+
+    values, total = PineconeDocumentStore._get_metadata_field_unique_values_impl(
+        docs, "tags", search_term="PY", from_=0, size=10
+    )
+    assert total == 1
+    assert values == ["python"]
+
+
+def test_get_metadata_field_unique_values_impl_preserves_non_string_types():
+    docs = [
+        Document(content="a", meta={"priority": 1}),
+        Document(content="b", meta={"priority": 2}),
+        Document(content="c", meta={"priority": 1}),
+    ]
+
+    values, total = PineconeDocumentStore._get_metadata_field_unique_values_impl(
+        docs, "priority", search_term=None, from_=0, size=10
+    )
+    assert total == 2
+    assert set(values) == {1, 2}
+
+
+def test_get_metadata_field_unique_values_impl_strips_meta_prefix():
+    docs = [
+        Document(content="a", meta={"category": "news"}),
+        Document(content="b", meta={"category": "sports"}),
+    ]
+    values, total = PineconeDocumentStore._get_metadata_field_unique_values_impl(
+        docs, "meta.category", search_term=None, from_=0, size=10
+    )
+    assert total == 2
+    assert values == ["news", "sports"]
+
+
+def test_prepare_documents_for_writing_edge_cases(caplog):
+    ds = PineconeDocumentStore(api_key=Secret.from_token("fake-api-key"))
+
+    with pytest.raises(ValueError, match="must contain a list of objects of type Document"):
+        ds._prepare_documents_for_writing(["not-a-document"], policy=DuplicatePolicy.NONE)
+
+    docs = [
+        Document(content="no-embedding"),
+        Document(content="with-blob", embedding=[0.1] * 768, blob=ByteStream(data=b"data")),
+        Document(
+            content="with-sparse",
+            embedding=[0.1] * 768,
+            sparse_embedding=SparseEmbedding(indices=[0], values=[1.0]),
+        ),
+    ]
+    with caplog.at_level("WARNING"):
+        result = ds._prepare_documents_for_writing(docs, policy=DuplicatePolicy.SKIP)
+
+    assert len(result) == 3
+    assert result[0][1] == ds._dummy_vector
+    assert "only supports `DuplicatePolicy.OVERWRITE`" in caplog.text
+    assert "has no embedding" in caplog.text
+    assert "blob" in caplog.text
+    assert "sparse_embedding" in caplog.text
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(not os.environ.get("PINECONE_API_KEY"), reason="PINECONE_API_KEY not set")
 def test_serverless_index_creation_from_scratch(delete_sleep_time):
@@ -291,6 +457,38 @@ class TestDocumentStore(
         docs = [Document(id="1")]
         assert document_store.write_documents(docs) == 1
 
+    def test_get_metadata_field_unique_values_distinct_types(self, document_store: PineconeDocumentStore):
+        """
+        Override: the base mixin test stores int, float, str and bool under the *same* metadata field
+        name and expects all four back as distinct values. Pinecone stores numeric metadata values as
+        `float` (see `_convert_meta_to_int`), so an int written for an arbitrary field may come back as
+        a numerically equal float instead - collapsing with a genuine float under the same field name
+        regardless of which other values share that field.
+
+        This adapts the same intent - int, float, str and bool must come back as distinct, unmangled
+        types via get_metadata_field_unique_values() - using one field per type instead of one shared
+        field, which is what Pinecone can actually support.
+        """
+        docs = [
+            Document(content="Doc 1", meta={"priority_int": 1}),
+            Document(content="Doc 2", meta={"priority_str": "1"}),
+            Document(content="Doc 3", meta={"priority_float": 1.5}),
+            Document(content="Doc 4", meta={"priority_bool": True}),
+        ]
+        document_store.write_documents(docs)
+
+        int_values, int_count = document_store.get_metadata_field_unique_values(metadata_field="priority_int")
+        str_values, str_count = document_store.get_metadata_field_unique_values(metadata_field="priority_str")
+        float_values, float_count = document_store.get_metadata_field_unique_values(metadata_field="priority_float")
+        bool_values, bool_count = document_store.get_metadata_field_unique_values(metadata_field="priority_bool")
+
+        assert (int_count, str_count, float_count, bool_count) == (1, 1, 1, 1)
+        assert str_values == ["1"] and type(str_values[0]) is str
+        assert float_values == [1.5] and type(float_values[0]) is float
+        assert bool_values == [True] and type(bool_values[0]) is bool
+        # Pinecone may return a whole-number int as a numerically equal float (see docstring note above).
+        assert int_values[0] == 1 and type(int_values[0]) in (int, float)
+
     @pytest.mark.xfail(
         run=True, reason="Pinecone supports overwriting by default, but it takes a while for it to take effect"
     )
@@ -326,7 +524,7 @@ class TestDocumentStore(
         assert "Most similar document" in [result.content for result in results]
         assert "2nd best document" in [result.content for result in results]
 
-    def test_close(self, document_store: PineconeDocumentStore):
+    def test_close_and_reopen(self, document_store: PineconeDocumentStore):
         document_store._initialize_index()
         assert document_store._index is not None
 
@@ -335,7 +533,6 @@ class TestDocumentStore(
 
         document_store._initialize_index()
         assert document_store._index is not None
-        # test that the index is still usable after closing and reopening
         assert document_store.count_documents() == 0
 
     def test_sentence_window_retriever(self, document_store: PineconeDocumentStore):
@@ -349,9 +546,9 @@ class TestDocumentStore(
 
         for idx, doc in enumerate(docs["documents"]):
             if idx == 2:
-                doc.embedding = [0.1] * 768
+                docs["documents"][idx] = replace(doc, embedding=[0.1] * 768)
                 continue
-            doc.embedding = np.random.rand(768).tolist()
+            docs["documents"][idx] = replace(doc, embedding=np.random.rand(768).tolist())
         document_store.write_documents(docs["documents"])
 
         # query
@@ -395,11 +592,6 @@ class TestDocumentStore(
         assert min_max["min"] == "Alpha"
         assert min_max["max"] == "Zebra"
 
-    def test_get_metadata_field_min_max_empty_collection(self, document_store: PineconeDocumentStore):
-        assert document_store.count_documents() == 0
-        with pytest.raises(ValueError, match="No values found"):
-            document_store.get_metadata_field_min_max("priority")
-
     def test_get_metadata_field_min_max_no_values(self, document_store: PineconeDocumentStore):
         docs = [
             Document(content="Doc 1", meta={"tags": ["tag1", "tag2"]}),
@@ -407,49 +599,11 @@ class TestDocumentStore(
         ]
         document_store.write_documents(docs)
 
-        # Try to get min/max for unsupported field type (list)
-        with pytest.raises(ValueError, match="No values found"):
-            document_store.get_metadata_field_min_max("tags")
+        # Unsupported field type (list) — no comparable values collected
+        assert document_store.get_metadata_field_min_max("tags") == {"min": None, "max": None}
 
-        # Try to get min/max for non-existent field
-        with pytest.raises(ValueError, match="No values found"):
-            document_store.get_metadata_field_min_max("nonexistent")
-
-    def test_get_metadata_field_unique_values(self, document_store: PineconeDocumentStore):
-        docs = [
-            Document(content="Doc 1", meta={"category": "Alpha"}),
-            Document(content="Doc 2", meta={"category": "Beta"}),
-            Document(content="Doc 3", meta={"category": "Gamma"}),
-            Document(content="Doc 4", meta={"category": "Alpha"}),
-            Document(content="Doc 5", meta={"category": "Delta"}),
-            Document(content="Doc 6", meta={"category": "Beta"}),
-        ]
-        document_store.write_documents(docs)
-
-        # Get all unique values
-        values, total = document_store.get_metadata_field_unique_values("category", from_=0, size=10)
-        assert total == 4  # Alpha, Beta, Delta, Gamma
-        assert len(values) == 4
-        assert set(values) == {"Alpha", "Beta", "Delta", "Gamma"}
-
-        # Test pagination
-        values, total = document_store.get_metadata_field_unique_values("category", from_=0, size=2)
-        assert total == 4
-        assert len(values) == 2  # First 2 values (alphabetically sorted)
-
-        values, total = document_store.get_metadata_field_unique_values("category", from_=2, size=2)
-        assert total == 4
-        assert len(values) == 2  # Next 2 values
-
-        # Test search term
-        values, total = document_store.get_metadata_field_unique_values("category", search_term="ta", size=10)
-        assert total == 2  # Beta and Delta contain "ta"
-        assert set(values) == {"Beta", "Delta"}
-
-        # Test case-insensitive search
-        values, total = document_store.get_metadata_field_unique_values("category", search_term="ALPHA", size=10)
-        assert total == 1
-        assert values == ["Alpha"]
+        # Non-existent field
+        assert document_store.get_metadata_field_min_max("nonexistent") == {"min": None, "max": None}
 
     def test_get_metadata_field_unique_values_with_lists(self, document_store: PineconeDocumentStore):
         docs = [

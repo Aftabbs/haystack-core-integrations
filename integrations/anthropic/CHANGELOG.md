@@ -1,5 +1,171 @@
 # Changelog
 
+## [integrations/anthropic-v7.0.0] - 2026-10-12
+
+### 🐛 Bug Fixes
+
+- [**breaking**] Forward full usage in Anthropic streaming responses (#4089)
+
+### 🧹 Chores
+
+- Drop redundant deserialize_secrets_inplace calls in integrations requiring haystack-ai>=2.23 (#4058)
+
+
+## [integrations/anthropic-v6.3.0] - 2026-10-01
+
+### 🚜 Refactor
+
+- Generalize flattened generation_kwargs for tool_choice/thinking/output_config (#4028)
+
+
+## [integrations/anthropic-v6.2.0] - 2026-09-24
+
+### 🚀 Features
+
+- Add thinking_display flattened generation_kwarg to Anthropic and Bedrock chat generators (#3993)
+
+
+## [integrations/anthropic-v6.1.0] - 2026-09-22
+
+### 🐛 Bug Fixes
+
+- Anthropic - respect an empty runtime tools list (#3977)
+- Drop Anthropic tool calls truncated at max_tokens and raise the default limit (#3982)
+
+### 🧹 Chores
+
+- Refresh Anthropic model lists and expose service_tierupdates (#3983)
+
+
+## [integrations/anthropic-v6.0.1] - 2026-09-14
+
+### 🐛 Bug Fixes
+
+- Anthropic - allow empty assistant messages (#3952)
+
+
+## [integrations/anthropic-v6.0.0] - 2026-09-03
+
+### 🚀 Features
+
+- [**breaking**] Anthropic - lifecycle handling (#3906)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+### 🧹 Chores
+
+- [**breaking**] Remove deprecated `AnthropicGenerator` (use `AnthropicChatGenerator` instead) (#3884)
+
+
+## [integrations/anthropic-v5.17.0] - 2026-08-31
+
+### 🚀 Features
+
+- *(anthropic)* Add AnthropicTokenCounter (#3864)
+
+
+## [integrations/anthropic-v5.16.0] - 2026-08-24
+
+### 🚀 Features
+
+- Feat (anthropic): add file content support to tool result (#3827)
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- *(anthropic)* Include cached tokens in the OpenAI-compatible prompt_tokens (#3717)
+- Standardize license files (#3771)
+
+### 🧪 Testing
+
+- Refactor Anthropic test suite (#3616)
+
+### 🧹 Chores
+
+- Clarify how generation_kwargs passed in run are handled (#3805)
+
+
+## [integrations/anthropic-v5.15.0] - 2026-07-17
+
+### 🚀 Features
+
+- *(anthropic)* Add anthropic_server_tools to AnthropicChatGenerator (#3386)
+
+
+## [integrations/anthropic-v5.14.0] - 2026-07-09
+
+### 🐛 Bug Fixes
+
+- Replace in-place dataclass mutations in anthropic, llama_cpp, olama, pinecone tests (#3551)
+
+### 🧪 Testing
+
+- Make Tool/Agent serialization assertions version-agnostic for Haystack 2.x/3.x (#3533)
+
+### 🧹 Chores
+
+- Support sync streaming callbacks in async contexts for Haystack 2.x/3.x compatibility (#3534)
+
+
+## [integrations/anthropic-v5.13.0] - 2026-07-02
+
+### 🧹 Chores
+
+- Add none option to adaptive_thinking_effort (#3527)
+
+
+## [integrations/anthropic-v5.12.0] - 2026-07-02
+
+### 🚀 Features
+
+- Support disabled thinking for Claude Sonnet 5 with flattened generation kwargs (#3526)
+
+
+## [integrations/anthropic-v5.11.0] - 2026-06-16
+
+### 🐛 Bug Fixes
+
+- Change default model in `AnthropicGenerator` to Sonnet 4.5 (#3447)
+
+
+## [integrations/anthropic-v5.10.0] - 2026-06-04
+
+### 🚀 Features
+
+- Anthropic - accept str as ChatGenerator input; deprecate generator (#3399)
+
+### 🧪 Testing
+
+- Fix unit test in anthropic tests (#3382)
+
+
+## [integrations/anthropic-v5.9.0] - 2026-05-12
+
+### 🚀 Features
+
+- Support adaptive_thinking_effort flat param for Claude (#3297)
+
+
+## [integrations/anthropic-v5.8.0] - 2026-04-28
+
+### 🚀 Features
+
+- Add anthropic foundry support (#3238)
+
+### 🧪 Testing
+
+- Test compatible integrations with python 3.14; update pyproject (#3001)
+- Track test coverage for all integrations (#3065)
+- Add explicit integration test for structured output (#3226)
+
+### 🧹 Chores
+
+- Add missing -> None return type annotations to anthropic __init__ methods (#2972)
+- Enforce ruff docstring rules (D102/D103/D205/D209/D213/D417/D419) in first 10 integrations (#3008)
+
+
 ## [integrations/anthropic-v5.7.0] - 2026-03-13
 
 ### 🌀 Miscellaneous
@@ -82,10 +248,6 @@
 ## [integrations/anthropic-v4.6.0] - 2025-11-26
 
 
-### ⚙️ CI
-
-- Change pytest command (#2475)
-
 ### 🧹 Chores
 
 - Update anthropic default model (#2551)
@@ -93,6 +255,13 @@
 ### 🌀 Miscellaneous
 
 - Adopt PEP 585 type hinting (part 1) (#2509)
+
+## [integrations/anthropic-v4.5.1] - 2025-11-11
+
+### ⚙️ CI
+
+- Change pytest command (#2475)
+
 
 ## [integrations/anthropic-v4.5.0] - 2025-10-22
 
@@ -214,9 +383,19 @@
 
 ### 🧪 Testing
 
-- Update tool serialization in tests to include `inputs_from_state` and `outputs_to_state` (#1581)
 - Anthropic - add `server_tool_use` to `usage` (#1717)
 - Add service_tier to test_convert_anthropic_chunk_to_streaming_chunk (#1778)
+
+### 🌀 Miscellaneous
+
+- Add pins for Anthropic (#1811)
+
+## [integrations/anthropic-v2.4.1] - 2025-04-09
+
+
+### 🧪 Testing
+
+- Update tool serialization in tests to include `inputs_from_state` and `outputs_to_state` (#1581)
 
 ### ⚙️ CI
 
@@ -230,7 +409,6 @@
 
 - Improve `streaming_callback` type and use async version in `run_async` (#1579)
 - Test: Update tests to check for `outputs_to_string` in Tool when running haystack-ai>=2.12 (#1585)
-- Add pins for Anthropic (#1811)
 
 ## [integrations/anthropic-v2.4.0] - 2025-03-06
 
@@ -276,16 +454,32 @@
 
 ### 🌀 Miscellaneous
 
+- Chore: remove `jsonschema` dependency from `default` environment (#1368)
+
+## [integrations/anthropic-v2.0.0] - 2025-01-20
+
+### 🌀 Miscellaneous
+
 - Test: remove tests involving serialization of lambdas (#1281)
 - Test: remove more tests involving serialization of lambdas (#1285)
 - Feat: Anthropic - support for Tools + refactoring (#1300)
-- Chore: remove `jsonschema` dependency from `default` environment (#1368)
 
 ## [integrations/anthropic-v1.2.1] - 2024-12-18
 
 ### 🐛 Bug Fixes
 
 - Make Anthropic compatible with new `ChatMessage`; fix prompt caching tests (#1252)
+
+### 🧹 Chores
+
+- Fix linting/isort (#1215)
+
+### 🌀 Miscellaneous
+
+- Docs: add AnthropicVertexChatGenerator to pydoc (#1221)
+- Chore: use `text` instead of `content` for `ChatMessage` in Cohere and Anthropic (#1237)
+
+## [integrations/anthropic-v1.2.0] - 2024-11-21
 
 ### ⚙️ CI
 
@@ -294,13 +488,10 @@
 ### 🧹 Chores
 
 - Update ruff linting scripts and settings (#1105)
-- Fix linting/isort (#1215)
 
 ### 🌀 Miscellaneous
 
 - Add AnthropicVertexChatGenerator component (#1192)
-- Docs: add AnthropicVertexChatGenerator to pydoc (#1221)
-- Chore: use `text` instead of `content` for `ChatMessage` in Cohere and Anthropic (#1237)
 
 ## [integrations/anthropic-v1.1.0] - 2024-09-20
 
@@ -342,12 +533,17 @@
 
 ### 🚀 Features
 
-- Update Anthropic/Cohere for tools use (#790)
 - Update Anthropic default models, pydocs (#839)
 
 ### ⚙️ CI
 
 - Retry tests to reduce flakyness (#836)
+
+## [integrations/anthropic-v0.3.0] - 2024-06-18
+
+### 🚀 Features
+
+- Update Anthropic/Cohere for tools use (#790)
 
 ### 🌀 Miscellaneous
 

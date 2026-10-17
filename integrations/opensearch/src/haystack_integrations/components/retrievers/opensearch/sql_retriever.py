@@ -8,6 +8,8 @@ from haystack import component, default_from_dict, default_to_dict, logging
 
 from haystack_integrations.document_stores.opensearch import OpenSearchDocumentStore
 
+from .utils import _resolve_document_store
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,6 +80,18 @@ class OpenSearchSQLRetriever:
         )
         return default_from_dict(cls, data)
 
+    def close(self) -> None:
+        """
+        Release the synchronous resources of the underlying Document Store.
+        """
+        self._document_store.close()
+
+    async def close_async(self) -> None:
+        """
+        Release the asynchronous resources of the underlying Document Store.
+        """
+        await self._document_store.close_async()
+
     @component.output_types(result=dict[str, Any])
     def run(
         self,
@@ -108,13 +122,7 @@ class OpenSearchSQLRetriever:
             # For aggregate queries: result["result"]["aggregations"] contains aggregations
             ```
         """
-        if document_store is not None:
-            if not isinstance(document_store, OpenSearchDocumentStore):
-                msg = "document_store must be an instance of OpenSearchDocumentStore"
-                raise ValueError(msg)
-            doc_store = document_store
-        else:
-            doc_store = self._document_store
+        doc_store = _resolve_document_store(document_store, self._document_store)
 
         fetch_size = fetch_size if fetch_size is not None else self._fetch_size
 
@@ -163,13 +171,7 @@ class OpenSearchSQLRetriever:
             # For aggregate queries: result["result"]["aggregations"] contains aggregations
             ```
         """
-        if document_store is not None:
-            if not isinstance(document_store, OpenSearchDocumentStore):
-                msg = "document_store must be an instance of OpenSearchDocumentStore"
-                raise ValueError(msg)
-            doc_store = document_store
-        else:
-            doc_store = self._document_store
+        doc_store = _resolve_document_store(document_store, self._document_store)
 
         fetch_size = fetch_size if fetch_size is not None else self._fetch_size
 

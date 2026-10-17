@@ -11,9 +11,9 @@ from typing import Any, overload
 import numpy as np
 import torch
 from haystack.utils import Secret, deserialize_secrets_inplace
-from haystack.utils.hf import HFModelType, check_valid_model, deserialize_hf_model_kwargs, serialize_hf_model_kwargs
-from huggingface_hub import hf_hub_download
-from sentence_transformers.models import Pooling as SentenceTransformerPoolingLayer
+from haystack.utils.hf import deserialize_hf_model_kwargs, serialize_hf_model_kwargs
+from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.utils import RepositoryNotFoundError
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutput
@@ -27,6 +27,37 @@ from optimum.onnxruntime import (
 from .optimization import OptimumEmbedderOptimizationConfig
 from .pooling import OptimumEmbedderPooling
 from .quantization import OptimumEmbedderQuantizationConfig
+
+# for sentence-transformers Pooling, we use the new module path if available. It also ships correct types
+# we also keep compatibility with older versions of sentence-transformers
+try:
+    from sentence_transformers.sentence_transformer.modules import Pooling as SentenceTransformerPoolingLayer
+except ImportError:
+    from sentence_transformers.models import (  # type: ignore[import-not-found, no-redef]
+        Pooling as SentenceTransformerPoolingLayer,
+    )
+
+
+# check_valid_model was removed from haystack.utils.hf in Haystack 3.0, so an embedding-only
+# version of it is vendored here.
+def check_valid_model(model_id: str, token: Secret | None) -> None:
+    """
+    Check if the provided model ID corresponds to a valid embedding model on HuggingFace Hub.
+
+    :param model_id: A string representing the HuggingFace model ID.
+    :param token: The optional authentication token.
+    :raises ValueError: If the model is not found or is not an embedding model.
+    """
+    api = HfApi()
+    try:
+        model_info = api.model_info(model_id, token=token.resolve_value() if token else None)
+    except RepositoryNotFoundError as e:
+        msg = f"Model {model_id} not found on HuggingFace Hub. Please provide a valid HuggingFace model_id."
+        raise ValueError(msg) from e
+
+    if model_info.pipeline_tag not in ["sentence-similarity", "feature-extraction"]:
+        msg = f"Model {model_id} is not an embedding model. Please provide an embedding model."
+        raise ValueError(msg)
 
 
 @dataclass
@@ -58,12 +89,12 @@ class _EmbedderParams:
             out[field] = copy.deepcopy(getattr(self, field))
 
         # Fixups.
-        assert isinstance(self.pooling_mode, OptimumEmbedderPooling)
-        out["pooling_mode"] = str(self.pooling_mode)
+        out["pooling_mode"] = str(self.pooling_mode) if self.pooling_mode is not None else None
         out["token"] = self.token.to_dict() if self.token else None
         out["optimizer_settings"] = self.optimizer_settings.to_dict() if self.optimizer_settings else None
         out["quantizer_settings"] = self.quantizer_settings.to_dict() if self.quantizer_settings else None
 
+        out["model_kwargs"] = out["model_kwargs"] or {}
         out["model_kwargs"].pop("use_auth_token", None)
         out["model_kwargs"].pop("token", None)
         serialize_hf_model_kwargs(out["model_kwargs"])
@@ -71,7 +102,8 @@ class _EmbedderParams:
 
     @classmethod
     def deserialize_inplace(cls, data: dict[str, Any]) -> dict[str, Any]:
-        data["pooling_mode"] = OptimumEmbedderPooling.from_str(data["pooling_mode"])
+        if data["pooling_mode"] is not None:
+            data["pooling_mode"] = OptimumEmbedderPooling.from_str(data["pooling_mode"])
         if data["optimizer_settings"] is not None:
             data["optimizer_settings"] = OptimumEmbedderOptimizationConfig.from_dict(data["optimizer_settings"])
         if data["quantizer_settings"] is not None:
@@ -84,7 +116,7 @@ class _EmbedderParams:
 
 class _EmbedderBackend:
     def __init__(self, params: _EmbedderParams) -> None:
-        check_valid_model(params.model, HFModelType.EMBEDDING, params.token)
+        check_valid_model(params.model, params.token)
         resolved_token = params.token.resolve_value() if params.token else None
 
         if isinstance(params.pooling_mode, str):
@@ -118,6 +150,9 @@ class _EmbedderBackend:
         self.pooling_layer: SentenceTransformerPoolingLayer | None = None
 
     def warm_up(self) -> None:
+        if self.model is not None:
+            return
+
         assert self.params.model_kwargs
         model_kwargs = copy.deepcopy(self.params.model_kwargs)
         model = ORTModelForFeatureExtraction.from_pretrained(**model_kwargs, export=True)

@@ -1,12 +1,14 @@
+import inspect
 import json
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import replace
 from typing import Any, Literal
 
 from haystack import component, default_from_dict, default_to_dict
+from haystack.components.generators.utils import _normalize_messages
 from haystack.dataclasses import (
-    AsyncStreamingCallbackT,
     ChatMessage,
+    ChatRole,
     StreamingCallbackT,
     SyncStreamingCallbackT,
     ToolCall,
@@ -71,9 +73,12 @@ def _convert_chatmessage_to_ollama_format(message: ChatMessage) -> dict[str, Any
     tool_call_results = message.tool_call_results
     images = message.images
 
-    if not text_contents and not tool_calls and not tool_call_results and not images:
+    has_content = bool(text_contents or tool_calls or tool_call_results or images)
+    # An assistant message with no content parts is sent with empty content, which the API accepts
+    if not has_content and not message.is_from(ChatRole.ASSISTANT):
         msg = (
-            "A `ChatMessage` must contain at least one `TextContent`, `ToolCall`, `ToolCallResult`, or `ImageContent`."
+            f"A `ChatMessage` from `{message.role.value}` must contain at least one `TextContent`, `ToolCall`, "
+            "`ToolCallResult`, or `ImageContent`. Only assistant messages can be empty."
         )
         raise ValueError(msg)
     elif len(text_contents) + len(tool_call_results) > 1:
@@ -89,6 +94,8 @@ def _convert_chatmessage_to_ollama_format(message: ChatMessage) -> dict[str, Any
 
     if text_contents:
         ollama_msg["content"] = text_contents[0]
+    elif not has_content:
+        ollama_msg["content"] = ""
     if images:
         ollama_msg["images"] = [image.base64_image for image in images]
     if tool_calls:
@@ -100,6 +107,20 @@ def _convert_chatmessage_to_ollama_format(message: ChatMessage) -> dict[str, Any
     if message.reasoning:
         ollama_msg["thinking"] = message.reasoning.reasoning_text
     return ollama_msg
+
+
+def _convert_chatmessages_to_ollama_format(messages: list[ChatMessage]) -> list[dict[str, Any]]:
+    """
+    Convert a list of ChatMessages to the format expected by the Ollama Chat API.
+
+    A trailing assistant message with no text and no tool calls is left out. Ollama continues a trailing assistant
+    message as a prefill, so an empty one makes the model reply with empty content or a stray `<think></think>` block.
+    """
+    ollama_messages = [_convert_chatmessage_to_ollama_format(m) for m in messages]
+    last = ollama_messages[-1] if ollama_messages else None
+    if last and last["role"] == ChatRole.ASSISTANT.value and not last.get("content") and not last.get("tool_calls"):
+        ollama_messages.pop()
+    return ollama_messages
 
 
 def _convert_ollama_meta_to_openai_format(input_response_dict: dict) -> dict[str, Any]:
@@ -168,6 +189,7 @@ def _convert_ollama_response_to_chatmessage(ollama_response: ChatResponse) -> Ch
         for ollama_tc in ollama_tool_calls:
             tool_calls.append(
                 ToolCall(
+                    id=ollama_tc.get("id"),
                     tool_name=ollama_tc["function"]["name"],
                     arguments=ollama_tc["function"]["arguments"],
                 )
@@ -208,6 +230,7 @@ def _build_chunk(
             tool_calls_list.append(
                 ToolCallDelta(
                     index=tool_call_index,
+                    id=tool_call.get("id"),
                     tool_name=tool_call["function"]["name"],
                     arguments=json.dumps(tool_call["function"]["arguments"])
                     if tool_call["function"]["arguments"]
@@ -315,8 +338,30 @@ class OllamaChatGenerator:
         self.think = think
         self.response_format = response_format
 
-        self._client = Client(host=self.url, timeout=self.timeout)
-        self._async_client = AsyncClient(host=self.url, timeout=self.timeout)
+        self._client: Client | None = None
+        self._async_client: AsyncClient | None = None
+
+    def warm_up(self) -> None:
+        """Create the synchronous Ollama client."""
+        if self._client is None:
+            self._client = Client(host=self.url, timeout=self.timeout)
+
+    async def warm_up_async(self) -> None:
+        """Create the asynchronous Ollama client."""
+        if self._async_client is None:
+            self._async_client = AsyncClient(host=self.url, timeout=self.timeout)
+
+    def close(self) -> None:
+        """Close the synchronous Ollama client."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    async def close_async(self) -> None:
+        """Close the asynchronous Ollama client."""
+        if self._async_client is not None:
+            await self._async_client.close()
+            self._async_client = None
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -338,6 +383,7 @@ class OllamaChatGenerator:
             streaming_callback=callback_name,
             tools=serialize_tools_or_toolset(self.tools),
             response_format=self.response_format,
+            think=self.think,
         )
 
     @classmethod
@@ -370,10 +416,11 @@ class OllamaChatGenerator:
         component_info = ComponentInfo.from_component(self)
         chunks: list[StreamingChunk] = []
 
-        # Accumulators
-        arg_by_id: dict[str, str] = {}
-        name_by_id: dict[str, str] = {}
-        id_order: list[str] = []
+        # Accumulators keyed by tool_call.index (always unique per call, even for repeated tool names)
+        arg_by_index: dict[str, str] = {}
+        name_by_index: dict[str, str] = {}
+        id_by_index: dict[str, str | None] = {}
+        index_order: list[str] = []
         tool_call_index: int = 0
 
         # track reasoning and content blocks to correctly set start=True on the first chunk of each block
@@ -400,29 +447,14 @@ class OllamaChatGenerator:
 
             if chunk.tool_calls:
                 for tool_call in chunk.tool_calls:
-                    # the Ollama server doesn't guarantee an id field in every tool_calls entry.
-                    # OpenAI-compatible endpoint (/v1/chat/completions) - recent releases do add an auto-generated id
-                    # when the model produces multiple tool calls, so that clients can map results back.
-                    # Native Ollama endpoint (/api/chat) and older builds
-                    # - the JSON often contains only function.name + arguments;
-                    # many users have reported that id is missing even with several calls,
-                    # making client-side resolution harder:
-                    # https://github.com/ollama/ollama/issues/6708
-                    # https://github.com/ollama/ollama/issues/7510
-                    # - If id is provided → we can distinguish multiple calls to the same tool.
-
-                    # - If id is missing → fallback to function.name works only when there's one call.
-                    # - That's why the deduplication logic is cautious and assumes one logical
-                    #   call per name when id is absent.
-                    tool_call_id = tool_call.id or tool_call.tool_name or ""
+                    key = str(tool_call.index)
                     args = tool_call.arguments or ""
 
-                    # Remember first-seen order and tool name
-                    if tool_call_id not in id_order:
-                        id_order.append(tool_call_id)
-                        name_by_id[tool_call_id] = tool_call.tool_name or ""
-                    # Update the argument accumulator for this tool_call_id.
-                    arg_by_id[tool_call_id] = args
+                    if key not in index_order:
+                        index_order.append(key)
+                        name_by_index[key] = tool_call.tool_name or ""
+                        id_by_index[key] = tool_call.id
+                    arg_by_index[key] = args
 
             if callback:
                 callback(chunk)
@@ -435,9 +467,11 @@ class OllamaChatGenerator:
             reasoning += c.reasoning.reasoning_text if c.reasoning else ""
 
         tool_calls = []
-        for tool_call_id in id_order:
-            arguments: str = arg_by_id.get(tool_call_id, "")
-            tool_calls.append(ToolCall(tool_name=name_by_id[tool_call_id], arguments=json.loads(arguments)))
+        for key in index_order:
+            arguments: str = arg_by_index.get(key, "")
+            tool_calls.append(
+                ToolCall(id=id_by_index[key], tool_name=name_by_index[key], arguments=json.loads(arguments))
+            )
 
         # We can't use _convert_streaming_chunks_to_chat_message because
         # we need to map tool_call name and args by order.
@@ -453,7 +487,7 @@ class OllamaChatGenerator:
     async def _handle_streaming_response_async(
         self,
         response_iter: AsyncIterator[ChatResponse],
-        callback: AsyncStreamingCallbackT | None,
+        callback: StreamingCallbackT | None,
     ) -> dict[str, list[ChatMessage]]:
         """
         Merge an Ollama async streaming response into a single ChatMessage, preserving tool calls.
@@ -463,10 +497,11 @@ class OllamaChatGenerator:
         component_info = ComponentInfo.from_component(self)
         chunks: list[StreamingChunk] = []
 
-        # Accumulators
-        arg_by_id: dict[str, str] = {}
-        name_by_id: dict[str, str] = {}
-        id_order: list[str] = []
+        # Accumulators keyed by tool_call.index (always unique per call, even for repeated tool names)
+        arg_by_index: dict[str, str] = {}
+        name_by_index: dict[str, str] = {}
+        id_by_index: dict[str, str | None] = {}
+        index_order: list[str] = []
         tool_call_index: int = 0
 
         # track reasoning and content blocks to correctly set start=True on the first chunk of each block
@@ -494,18 +529,20 @@ class OllamaChatGenerator:
 
             if chunk.tool_calls:
                 for tool_call in chunk.tool_calls:
-                    tool_call_id = tool_call.id or tool_call.tool_name or ""
+                    key = str(tool_call.index)
                     args = tool_call.arguments or ""
 
-                    # Remember first-seen order and tool name
-                    if tool_call_id not in id_order:
-                        id_order.append(tool_call_id)
-                        name_by_id[tool_call_id] = tool_call.tool_name or ""
-                    # Update the argument accumulator for this tool_call_id
-                    arg_by_id[tool_call_id] = args
+                    if key not in index_order:
+                        index_order.append(key)
+                        name_by_index[key] = tool_call.tool_name or ""
+                        id_by_index[key] = tool_call.id
+                    arg_by_index[key] = args
 
             if callback is not None:
-                await callback(chunk)
+                # Sync callbacks are allowed in async contexts, so only await async ones.
+                callback_result = callback(chunk)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
 
             index += 1
 
@@ -517,9 +554,11 @@ class OllamaChatGenerator:
             reasoning += c.reasoning.reasoning_text if c.reasoning else ""
 
         tool_calls = []
-        for tool_call_id in id_order:
-            arguments: str = arg_by_id.get(tool_call_id, "")
-            tool_calls.append(ToolCall(tool_name=name_by_id[tool_call_id], arguments=json.loads(arguments)))
+        for key in index_order:
+            arguments: str = arg_by_index.get(key, "")
+            tool_calls.append(
+                ToolCall(id=id_by_index[key], tool_name=name_by_index[key], arguments=json.loads(arguments))
+            )
 
         # We can't use _convert_streaming_chunks_to_chat_message because
         # we need to map tool_call name and args by order.
@@ -546,6 +585,7 @@ class OllamaChatGenerator:
         is_stream: bool,
         generation_kwargs: dict[str, Any],
     ) -> ChatResponse | Iterator[ChatResponse]:
+        assert self._client is not None  # noqa: S101
         return self._client.chat(
             model=self.model,
             messages=messages,
@@ -571,6 +611,7 @@ class OllamaChatGenerator:
         is_stream: bool,
         generation_kwargs: dict[str, Any],
     ) -> ChatResponse | AsyncIterator[ChatResponse]:
+        assert self._async_client is not None  # noqa: S101
         return await self._async_client.chat(
             model=self.model,
             messages=messages,
@@ -585,7 +626,7 @@ class OllamaChatGenerator:
     @component.output_types(replies=list[ChatMessage])
     def run(
         self,
-        messages: list[ChatMessage],
+        messages: list[ChatMessage] | str,
         generation_kwargs: dict[str, Any] | None = None,
         tools: ToolsType | None = None,
         *,
@@ -595,7 +636,8 @@ class OllamaChatGenerator:
         Runs an Ollama Model on a given chat history.
 
         :param messages:
-            A list of ChatMessage instances representing the input messages.
+            A list of ChatMessage instances representing the input messages. If a string is provided, it is converted
+            to a list containing a ChatMessage with user role.
         :param generation_kwargs:
             Per-call overrides for Ollama inference options.
             These are merged on top of the instance-level `generation_kwargs`.
@@ -611,13 +653,17 @@ class OllamaChatGenerator:
         :returns: A dictionary with the following keys:
             - `replies`: A list of ChatMessages containing the model's response
         """
+        self.warm_up()
+        assert self._client is not None  # noqa: S101
+
+        messages = _normalize_messages(messages)
 
         # Validate and select the streaming callback
         callback = select_streaming_callback(
             init_callback=self.streaming_callback, runtime_callback=streaming_callback, requires_async=False
         )
         generation_kwargs = {**self.generation_kwargs, **(generation_kwargs or {})}
-        tools_to_use = tools or self.tools
+        tools_to_use = tools if tools is not None else self.tools
         flattened_tools = flatten_tools_or_toolsets(tools_to_use)
         _check_duplicate_tool_names(flattened_tools)
 
@@ -629,7 +675,7 @@ class OllamaChatGenerator:
 
         is_stream = callback is not None
 
-        ollama_messages = [_convert_chatmessage_to_ollama_format(m) for m in messages]
+        ollama_messages = _convert_chatmessages_to_ollama_format(messages=messages)
 
         response = self._chat(
             messages=ollama_messages, tools=ollama_tools, is_stream=is_stream, generation_kwargs=generation_kwargs
@@ -644,7 +690,7 @@ class OllamaChatGenerator:
     @component.output_types(replies=list[ChatMessage])
     async def run_async(
         self,
-        messages: list[ChatMessage],
+        messages: list[ChatMessage] | str,
         generation_kwargs: dict[str, Any] | None = None,
         tools: ToolsType | None = None,
         *,
@@ -654,7 +700,8 @@ class OllamaChatGenerator:
         Async version of run. Runs an Ollama Model on a given chat history.
 
         :param messages:
-            A list of ChatMessage instances representing the input messages.
+            A list of ChatMessage instances representing the input messages. If a string is provided, it is converted
+            to a list containing a ChatMessage with user role.
         :param generation_kwargs:
             Per-call overrides for Ollama inference options.
             These are merged on top of the instance-level `generation_kwargs`.
@@ -667,11 +714,16 @@ class OllamaChatGenerator:
         :returns: A dictionary with the following keys:
             - `replies`: A list of ChatMessages containing the model's response
         """
+        await self.warm_up_async()
+        assert self._async_client is not None  # noqa: S101
+
+        messages = _normalize_messages(messages)
+
         # Validate and select the streaming callback
         callback = select_streaming_callback(self.streaming_callback, streaming_callback, requires_async=True)
 
         generation_kwargs = {**self.generation_kwargs, **(generation_kwargs or {})}
-        tools_to_use = tools or self.tools
+        tools_to_use = tools if tools is not None else self.tools
         flattened_tools = flatten_tools_or_toolsets(tools_to_use)
         _check_duplicate_tool_names(flattened_tools)
 
@@ -683,7 +735,7 @@ class OllamaChatGenerator:
 
         is_stream = callback is not None
 
-        ollama_messages = [_convert_chatmessage_to_ollama_format(m) for m in messages]
+        ollama_messages = _convert_chatmessages_to_ollama_format(messages=messages)
 
         response = await self._chat_async(
             messages=ollama_messages, tools=ollama_tools, is_stream=is_stream, generation_kwargs=generation_kwargs

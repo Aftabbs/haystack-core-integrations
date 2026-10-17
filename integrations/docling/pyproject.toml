@@ -7,7 +7,7 @@ name = "docling-haystack"
 dynamic = ["version"]
 description = "Haystack integration for docling"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 keywords = [
     "Docling",
@@ -24,7 +24,6 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
   "Development Status :: 4 - Beta",
   "Programming Language :: Python",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
@@ -33,7 +32,7 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
-  "haystack-ai>=2.8.0,<3.0.0",
+  "haystack-ai>=2.12.0",
   "docling>=2.32.0,<3.0.0",
   "lxml>=6.0.2",
 ]
@@ -141,6 +140,7 @@ ignore = [
     "PLR0912",
     "PLR0913",
     "PLR0915",
+    "PLR0917",
     # Allow `Any` type - used legitimately for dynamic types and SDK boundaries
     "ANN401",
 ]

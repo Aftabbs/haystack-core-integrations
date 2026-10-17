@@ -1,5 +1,8 @@
+import json
+from copy import deepcopy
 from typing import Any, Literal, TypeAlias, cast, get_args
 
+from haystack import logging
 from haystack.dataclasses.chat_message import (
     ChatMessage,
     ChatRole,
@@ -30,6 +33,8 @@ from anthropic.types import (
     ToolUseBlockParam,
 )
 
+logger = logging.getLogger(__name__)
+
 # See https://docs.anthropic.com/en/api/messages for supported formats
 ImageFormat = Literal["image/jpeg", "image/png", "image/gif", "image/webp"]
 IMAGE_SUPPORTED_FORMATS: list[ImageFormat] = list(get_args(ImageFormat))
@@ -43,6 +48,70 @@ FINISH_REASON_MAPPING: dict[str, FinishReason] = {
     "pause_turn": "stop",
     "tool_use": "tool_calls",
 }
+
+
+_NON_CACHEABLE_BLOCK_TYPES = ("thinking", "redacted_thinking")
+
+
+def _has_server_tool_blocks(content_blocks: list[dict[str, Any]]) -> bool:
+    """Whether Anthropic ran a server-side tool while producing these content blocks."""
+    return any(
+        str(block.get("type", "")) == "server_tool_use" or str(block.get("type", "")).endswith("_tool_result")
+        for block in content_blocks
+    )
+
+
+def _extract_citations(content_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collect the citations Anthropic attached to text blocks."""
+    return [
+        dict(citation)
+        for block in content_blocks
+        if block.get("type") == "text"
+        for citation in (block.get("citations") or [])
+    ]
+
+
+def _accumulate_raw_content_blocks(chunks: list[StreamingChunk]) -> list[dict[str, Any]]:
+    """Rebuild Anthropic's content blocks from the raw stream events stored in each chunk's `meta`."""
+    blocks: dict[int, dict[str, Any]] = {}
+    partial_json: dict[int, str] = {}
+
+    for chunk in chunks:
+        meta = chunk.meta or {}
+        index = meta.get("index")
+        if index is None:
+            continue
+
+        if meta.get("type") == "content_block_start":
+            blocks[index] = deepcopy(meta.get("content_block") or {})
+            partial_json[index] = ""
+
+        elif meta.get("type") == "content_block_delta" and index in blocks:
+            block = blocks[index]
+            delta = meta.get("delta") or {}
+            delta_type = delta.get("type")
+            if delta_type == "text_delta":
+                block["text"] = block.get("text", "") + delta.get("text", "")
+            elif delta_type == "thinking_delta":
+                block["thinking"] = block.get("thinking", "") + delta.get("thinking", "")
+            elif delta_type == "signature_delta":
+                block["signature"] = delta.get("signature", "")
+            elif delta_type == "citations_delta":
+                block["citations"] = (block.get("citations") or []) + [delta.get("citation")]
+            elif delta_type == "input_json_delta":
+                partial_json[index] += delta.get("partial_json", "")
+
+    for index, buffer in partial_json.items():
+        if not buffer:
+            continue
+        try:
+            blocks[index]["input"] = json.loads(buffer)
+        except json.JSONDecodeError:
+            # a truncated stream must not fail the whole response
+            pass
+
+    return [blocks[index] for index in sorted(blocks)]
+
 
 AnthropicContentBlocks: TypeAlias = list[
     ImageBlockParam
@@ -114,7 +183,7 @@ def _update_anthropic_message_with_tool_call_results(
             msg = "`ToolCall` must have a non-null `id` attribute to be used with Anthropic."
             raise ValueError(msg)
 
-        tool_result_block_content: list[TextBlockParam | ImageBlockParam] = []
+        tool_result_block_content: list[TextBlockParam | ImageBlockParam | DocumentBlockParam] = []
         if isinstance(tool_call_result.result, str):
             tool_result_block_content.append(TextBlockParam(type="text", text=tool_call_result.result))
         elif isinstance(tool_call_result.result, list):
@@ -122,7 +191,9 @@ def _update_anthropic_message_with_tool_call_results(
                 if isinstance(item, TextContent):
                     tool_result_block_content.append(TextBlockParam(type="text", text=item.text))
                 elif isinstance(item, ImageContent):
-                    tool_result_block_content.append(_convert_image_content_to_anthropic_format(item))
+                    tool_result_block_content.append(_convert_image_content_to_anthropic_format(image_content=item))
+                elif isinstance(item, FileContent):
+                    tool_result_block_content.append(_convert_file_content_to_anthropic_format(file_content=item))
                 else:
                     msg = "Unsupported content type in tool call result"
                     raise ValueError(msg)
@@ -190,6 +261,21 @@ def _convert_messages_to_anthropic_format(
 
         content: AnthropicContentBlocks = []
 
+        # server-tool blocks carry encrypted_content/encrypted_index that Anthropic requires back unchanged
+        raw_content = message.meta.get("raw_content_for_server_tools") if message.is_from(ChatRole.ASSISTANT) else None
+        if raw_content:
+            content = deepcopy(raw_content)
+            if cache_control:
+                # only the last cacheable block: a request allows at most 4 breakpoints
+                for blk in reversed(content):
+                    if blk.get("type") not in _NON_CACHEABLE_BLOCK_TYPES:
+                        # ignore: blk is an untyped block dict, not a TypedDict declaring cache_control
+                        blk["cache_control"] = cache_control  # type: ignore[typeddict-unknown-key]
+                        break
+            anthropic_non_system_messages.append(MessageParam(role="assistant", content=content))
+            i += 1
+            continue
+
         # Handle multimodal content (text and images) preserving order
         for part in message._content:
             if isinstance(part, TextContent) and part.text:
@@ -256,10 +342,10 @@ def _convert_messages_to_anthropic_format(
                         # but mypy doesnt know that
                         blk["cache_control"] = cache_control  # type: ignore [typeddict-unknown-key]
 
-        if not content:
+        if not content and not message.is_from(ChatRole.ASSISTANT):
             msg = (
-                "A `ChatMessage` must contain at least one `TextContent`, `ImageContent`, "
-                "`ToolCall`, or `ToolCallResult`."
+                f"A `ChatMessage` from `{message._role.value}` must contain at least one `TextContent`, "
+                "`ImageContent`, `ToolCall`, or `ToolCallResult`. Only assistant messages can be empty."
             )
             raise ValueError(msg)
 
@@ -279,15 +365,42 @@ def _convert_messages_to_anthropic_format(
 def _get_openai_compatible_usage(response_dict: dict) -> dict:
     """
     Converts Anthropic usage metadata to OpenAI compatible format.
+
+    OpenAI's `prompt_tokens` INCLUDES tokens served from the prompt cache, with the cached
+    portion reported separately in `prompt_tokens_details.cached_tokens`. Anthropic's
+    `input_tokens` is the opposite: it is net of the cache, and the cached tokens live in
+    `cache_read_input_tokens` and `cache_creation_input_tokens`. All three are billed, so
+    they are summed here to give `prompt_tokens` the meaning OpenAI gives it.
+
+    The Anthropic-native keys are left in place so nothing that already reads them breaks.
     """
     usage = response_dict.get("usage", {})
     if usage:
         if "input_tokens" in usage:
-            usage["prompt_tokens"] = usage.pop("input_tokens")
+            input_tokens = usage.pop("input_tokens") or 0
+            # Fold the cached tokens in so `prompt_tokens` means what OpenAI means by it.
+            cached = sum(usage.get(key) or 0 for key in ("cache_read_input_tokens", "cache_creation_input_tokens"))
+            usage["prompt_tokens"] = input_tokens + cached
         if "output_tokens" in usage:
             usage["completion_tokens"] = usage.pop("output_tokens")
 
     return usage
+
+
+def _merge_streaming_usage(start_usage: dict[str, Any], delta_usage: dict[str, Any] | None) -> dict[str, Any]:
+    """
+    Combines the usage of a streamed response into the format a non-streamed response reports.
+
+    The `message_start` event carries the full `Usage`, including the `cache_creation` split by TTL and the
+    `service_tier`. The `message_delta` event carries the final cumulative counts, but only a subset of the fields.
+
+    :param start_usage: The usage of the `message_start` event.
+    :param delta_usage: The usage of the last `message_delta` event, or `None` if the stream had none.
+    :returns: The `message_start` usage with every non-null `message_delta` count written over it, converted with
+        `_get_openai_compatible_usage`.
+    """
+    usage = {**start_usage, **{key: value for key, value in (delta_usage or {}).items() if value is not None}}
+    return _get_openai_compatible_usage({"usage": usage})
 
 
 def _convert_chat_completion_to_chat_message(
@@ -298,9 +411,29 @@ def _convert_chat_completion_to_chat_message(
     """
     tool_calls = []
     reasoning_contents = []
-    reasoning_text = ""
 
-    for block in anthropic_response.content:
+    # A `max_tokens` stop reason cuts the response off mid-block. If that block was a tool call, its arguments are
+    # incomplete: Anthropic still returns a `tool_use` block, but only the keys it managed to finish. Running the
+    # tool with those arguments would act on the wrong input, so the call is dropped here. Instead, the reply carries
+    # the `length` finish reason which mirrors the streaming path, where the truncated JSON fails to parse and the tool
+    # call is dropped.
+    blocks = anthropic_response.content
+    truncated_tool_call = (
+        anthropic_response.stop_reason == "max_tokens" and bool(blocks) and blocks[-1].type == "tool_use"
+    )
+    if truncated_tool_call:
+        truncated_block = blocks[-1]
+        logger.warning(
+            "The model hit the `max_tokens` limit while writing the arguments of tool call `{tool_name}`, so they "
+            "are incomplete and the tool call will be skipped. Raise `max_tokens` in `generation_kwargs` to give "
+            "the model room to finish. Tool call ID: {tool_call_id}, partial arguments: {arguments}",
+            tool_name=truncated_block.name,
+            tool_call_id=truncated_block.id,
+            arguments=truncated_block.input,
+        )
+        blocks = blocks[:-1]
+
+    for block in blocks:
         reasoning_content: dict[str, Any] = {}
         if block.type == "tool_use":
             tool_calls.append(ToolCall(tool_name=block.name, arguments=block.input, id=block.id))
@@ -326,26 +459,32 @@ def _convert_chat_completion_to_chat_message(
     text = ""
 
     if not (ignore_tools_thinking_messages and tool_calls):
-        text = " ".join(block.text for block in anthropic_response.content if block.type == "text")
-
-    message = ChatMessage.from_assistant(text=text, tool_calls=tool_calls, reasoning=reasoning)
+        text = " ".join(block.text for block in blocks if block.type == "text")
 
     # Dump the chat completion to a dict
     response_dict = anthropic_response.model_dump()
-    usage = _get_openai_compatible_usage(response_dict)
-    message._meta.update(
-        {
-            "model": response_dict.get("model", None),
-            "index": 0,
-            "finish_reason": FINISH_REASON_MAPPING.get(response_dict.get("stop_reason" or "")),
-            "usage": usage,
-        }
-    )
-    return message
+    meta: dict[str, Any] = {
+        "model": response_dict.get("model", None),
+        "index": 0,
+        "finish_reason": FINISH_REASON_MAPPING.get(response_dict.get("stop_reason")),
+        "usage": _get_openai_compatible_usage(response_dict),
+    }
+
+    # keep raw content so server-tool blocks can be replayed on later turns
+    raw_content_blocks = response_dict.get("content") or []
+    if _has_server_tool_blocks(raw_content_blocks):
+        meta["raw_content_for_server_tools"] = raw_content_blocks
+    if citations := _extract_citations(raw_content_blocks):
+        meta["citations"] = citations
+
+    return ChatMessage.from_assistant(text=text, tool_calls=tool_calls, reasoning=reasoning, meta=meta)
 
 
 def _convert_anthropic_chunk_to_streaming_chunk(
-    chunk: RawMessageStreamEvent, component_info: ComponentInfo, tool_call_index: int
+    chunk: RawMessageStreamEvent,
+    component_info: ComponentInfo,
+    tool_call_index: int,
+    in_server_tool_block: bool = False,
 ) -> StreamingChunk:
     """
     Converts an Anthropic StreamEvent to a StreamingChunk.
@@ -353,6 +492,7 @@ def _convert_anthropic_chunk_to_streaming_chunk(
     :param chunk: The Anthropic StreamEvent to convert.
     :param component_info: The component info.
     :param tool_call_index: The index of the tool call among the tool calls in the message.
+    :param in_server_tool_block: Whether the chunk belongs to a server-side tool block.
     :returns: The StreamingChunk.
     """
     content = ""
@@ -388,7 +528,8 @@ def _convert_anthropic_chunk_to_streaming_chunk(
     elif chunk.type == "content_block_delta":
         if chunk.delta.type == "text_delta":
             content = chunk.delta.text
-        elif chunk.delta.type == "input_json_delta":
+        # server tools are executed by Anthropic, so their arguments must not be surfaced as tool calls to invoke
+        elif chunk.delta.type == "input_json_delta" and not in_server_tool_block:
             tool_calls.append(ToolCallDelta(index=tool_call_index, arguments=chunk.delta.partial_json))
         elif chunk.delta.type == "thinking_delta":
             reasoning = ReasoningContent(reasoning_text=chunk.delta.thinking)

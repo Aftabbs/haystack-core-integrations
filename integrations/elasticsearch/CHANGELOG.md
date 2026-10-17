@@ -1,5 +1,98 @@
 # Changelog
 
+## [integrations/elasticsearch-v6.4.2] - 2026-10-08
+
+### 🐛 Bug Fixes
+
+- *(elasticsearch,opensearch)* Keep every bound when merging same-field ranges (#3984)
+- Elasticsearch painless script injection (#4068)
+
+### 🧪 Testing
+
+- Elastisearch/OpenSearch - explicitly set the embedding model in Hybrid Retriever tests (#4053)
+
+
+## [integrations/elasticsearch-v6.4.1] - 2026-09-24
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+
+## [integrations/elasticsearch-v6.4.0] - 2026-09-01
+
+### 🚀 Features
+
+- `ElasticsearchDocumentStore` with offset pagination (#3691)
+
+### 🐛 Bug Fixes
+
+- `ElasticSearch` match `search_term` against metadata field value, not content (#3646)
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- Standardize license files (#3771)
+
+### 🧪 Testing
+
+- `ElasticSearchDocumentStore` removing duplicated tests already covered by haystack Mixin tests + overriding (#3772)
+
+
+## [integrations/elasticsearch-v6.3.0] - 2026-07-22
+
+### 🚀 Features
+
+- *(elasticsearch)* Add close() and close_async() to ElasticsearchDocumentStore (#3523)
+
+### 🚜 Refactor
+
+- Elasticsearch - split sync/async paths (#3633)
+
+
+## [integrations/elasticsearch-v6.2.0] - 2026-07-14
+
+### 🐛 Bug Fixes
+
+- Adapt optimum, ragas, elasticsearch, opensearch to APIs removed in Haystack 3.0 (#3538)
+- *(elasticsearch)* Don't merge same-field ranges under OR (#3588)
+
+### 📚 Documentation
+
+- Replace old haystack core imports with haystack_integrations paths (#3545)
+
+
+## [integrations/elasticsearch-v6.1.1] - 2026-07-02
+
+### 🐛 Bug Fixes
+
+- *(elasticsearch)* Remove duplicate delete/create in delete_all_documents(recreate_index=True) (#3522)
+
+
+## [integrations/elasticsearch-v6.1.0] - 2026-05-04
+
+### 🚀 Features
+
+- *(elasticsearch)* Add ElasticsearchInferenceHybridRetriever (#3228)
+- *(elasticsearch)* Optional ingest_pipeline for bulk writes (#3252)
+
+
+## [integrations/elasticsearch-v6.0.0] - 2026-04-22
+
+### 🚀 Features
+
+- Add support for elasticsearch sparse inference embedding retriever (#3166)
+
+### 🚜 Refactor
+
+- [**breaking**] Elasticsearch - use async mixin tests and fix write/delete behaviour (#3196)
+
+
+## [integrations/elasticsearch-v5.5.0] - 2026-04-13
+
+### 🚀 Features
+
+- Add sparse vector storage to ElasticsearchDocumentStore (#2989)
+- Adds `ElasticsearchSparseEmbeddingRetriever`  or sparse embedding retrieval  (#3104)
+
+
 ## [integrations/elasticsearch-v5.4.0] - 2026-04-10
 
 ### 🐛 Bug Fixes
@@ -195,18 +288,29 @@
 
 ## [integrations/elasticsearch-v1.0.0] - 2024-09-12
 
-### 🚀 Features
+### 🧪 Testing
 
-- Defer the database connection to when it's needed (#766)
-- Add filter_policy to elasticsearch integration (#825)
+- Do not retry tests in `hatch run test` command (#954)
+
+### 🧹 Chores
+
+- ElasticSearch - remove legacy filters elasticsearch (#1078)
+
+### 🌀 Miscellaneous
+
+- Chore: elasticsearch - ruff update, don't ruff tests (#999)
+
+## [integrations/elasticsearch-v0.7.1] - 2024-07-17
 
 ### 🐛 Bug Fixes
 
 - `ElasticSearch` - Fallback to default filter policy when deserializing retrievers without the init parameter (#898)
 
-### 🧪 Testing
+## [integrations/elasticsearch-v0.7.0] - 2024-07-15
 
-- Do not retry tests in `hatch run test` command (#954)
+### 🚀 Features
+
+- Add filter_policy to elasticsearch integration (#825)
 
 ### ⚙️ CI
 
@@ -215,13 +319,17 @@
 ### 🧹 Chores
 
 - Update ruff invocation to include check parameter (#853)
-- ElasticSearch - remove legacy filters elasticsearch (#1078)
 
 ### 🌀 Miscellaneous
 
 - Ci: install `pytest-rerunfailures` where needed; add retry config to `test-cov` script (#845)
 - Chore: Minor retriever pydoc fix (#884)
-- Chore: elasticsearch - ruff update, don't ruff tests (#999)
+
+## [integrations/elasticsearch-v0.6.0] - 2024-05-30
+
+### 🚀 Features
+
+- Defer the database connection to when it's needed (#766)
 
 ## [integrations/elasticsearch-v0.5.0] - 2024-05-24
 

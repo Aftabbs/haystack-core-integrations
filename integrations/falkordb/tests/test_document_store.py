@@ -1,0 +1,652 @@
+# SPDX-FileCopyrightText: 2024-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import logging
+import os
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+from haystack.dataclasses import Document
+from haystack.document_stores.errors import DocumentStoreError, DuplicateDocumentError
+from haystack.document_stores.types import DuplicatePolicy
+from haystack.errors import FilterError
+from haystack.testing.document_store import (
+    CountDocumentsByFilterTest,
+    CountUniqueMetadataByFilterTest,
+    DeleteAllTest,
+    DeleteByFilterTest,
+    DocumentStoreBaseTests,
+    GetMetadataFieldMinMaxTest,
+    GetMetadataFieldsInfoTest,
+    GetMetadataFieldUniqueValuesTest,
+    UpdateByFilterTest,
+)
+from redis.exceptions import ResponseError
+
+from haystack_integrations.components.retrievers.falkordb import (
+    FalkorDBCypherRetriever,
+    FalkorDBEmbeddingRetriever,
+)
+from haystack_integrations.document_stores.falkordb import FalkorDBDocumentStore
+from haystack_integrations.document_stores.falkordb import document_store as document_store_module
+from haystack_integrations.document_stores.falkordb.document_store import (
+    _convert_filters,
+)
+
+from .test_document_store_common import FalkorDBDocumentStoreTestMixin
+
+logger = logging.getLogger(__name__)
+
+
+class TestFalkorDBDocumentStoreSerialization:
+    def test_to_dict_from_dict(self):
+        store = FalkorDBDocumentStore(
+            host="myhost",
+            port=1234,
+            graph_name="test_graph",
+            embedding_dim=512,
+            similarity="euclidean",
+            verify_connectivity=False,
+        )
+
+        data = store.to_dict()
+
+        assert data["init_parameters"]["host"] == "myhost"
+        assert data["init_parameters"]["port"] == 1234
+        assert data["init_parameters"]["embedding_dim"] == 512
+        assert data["init_parameters"]["similarity"] == "euclidean"
+
+        restored = FalkorDBDocumentStore.from_dict(data)
+        assert restored.host == "myhost"
+        assert restored.port == 1234
+        assert restored.graph_name == "test_graph"
+        assert restored.embedding_dim == 512
+        assert restored.similarity == "euclidean"
+
+
+def _result(rows):
+    return MagicMock(result_set=rows)
+
+
+@pytest.fixture
+def mock_falkordb(monkeypatch):
+    constructor = MagicMock()
+    client = MagicMock()
+    graph = MagicMock()
+    constructor.return_value = client
+    client.select_graph.return_value = graph
+    graph.query.return_value = _result([])
+    monkeypatch.setattr(document_store_module, "FalkorDB", constructor)
+    return constructor, client, graph
+
+
+class TestFalkorDBDocumentStoreUnit:
+    def test_init_rejects_invalid_similarity(self):
+        with pytest.raises(ValueError, match="not supported"):
+            FalkorDBDocumentStore(similarity="invalid")
+
+    @pytest.mark.parametrize(
+        "filter_node, expected_clause, expected_params",
+        [
+            ({"field": "year", "operator": "==", "value": 2024}, "coalesce(d.year = $p0, false)", {"p0": 2024}),
+            ({"field": "year", "operator": "==", "value": None}, "d.year IS NULL", {}),
+            ({"field": "y", "operator": "!=", "value": None}, "d.y IS NOT NULL", {}),
+            ({"field": "y", "operator": ">", "value": 1}, "coalesce(d.y > $p0, false)", {"p0": 1}),
+            ({"field": "y", "operator": ">", "value": None}, "false", {}),
+            (
+                {"field": "tag", "operator": "in", "value": ["a"]},
+                "coalesce(d.tag IN $p0, false)",
+                {"p0": ["a"]},
+            ),
+            (
+                {"field": "tag", "operator": "not in", "value": ["a"]},
+                "coalesce(NOT (d.tag IN $p0), true)",
+                {"p0": ["a"]},
+            ),
+            (
+                {"field": "meta.year", "operator": "==", "value": 2024},
+                "coalesce(d.year = $p0, false)",
+                {"p0": 2024},
+            ),
+            # underscore-prefixed identifiers are valid Cypher and must be accepted
+            ({"field": "_id", "operator": "==", "value": "x"}, "coalesce(d._id = $p0, false)", {"p0": "x"}),
+            (
+                {"field": "meta._private", "operator": "==", "value": "y"},
+                "coalesce(d._private = $p0, false)",
+                {"p0": "y"},
+            ),
+            (
+                {
+                    "operator": "OR",
+                    "conditions": [
+                        {"field": "y", "operator": "==", "value": 1},
+                        {"operator": "NOT", "conditions": [{"field": "b", "operator": "<=", "value": 0}]},
+                    ],
+                },
+                "(coalesce(d.y = $p0, false) OR NOT (coalesce(d.b <= $p1, false)))",
+                {"p0": 1, "p1": 0},
+            ),
+        ],
+    )
+    def test_convert_filters(self, filter_node, expected_clause, expected_params):
+        clause, params = _convert_filters(filter_node)
+        assert clause == expected_clause
+        assert params == expected_params
+
+    @pytest.mark.parametrize(
+        "filter_node, match",
+        [
+            ({"operator": "AND"}, "requires a 'conditions' key"),
+            ({"operator": "NOT"}, "requires a 'conditions' key"),
+            ({"operator": "==", "value": 1}, "requires a 'field' key"),
+            ({"operator": "==", "field": "f"}, "requires a 'value' key"),
+            ({"field": "x", "operator": ">", "value": [1, 2]}, "does not support list values"),
+            ({"field": "x", "operator": ">", "value": "not-a-date"}, "non-ISO string"),
+            ({"field": "x", "operator": "in", "value": "scalar"}, "requires a list value"),
+            ({"field": "x", "operator": "not in", "value": "scalar"}, "requires a list value"),
+            ({"field": "x", "operator": "regex", "value": "."}, "Unsupported filter operator"),
+            # Cypher injection via field identifier (CVE: unsanitized interpolation)
+            (
+                {"field": "tenant = $p0, false) OR true RETURN d //", "operator": "==", "value": "alice"},
+                "Invalid filter field name",
+            ),
+            ({"field": "x; DROP DATABASE", "operator": "==", "value": 1}, "Invalid filter field name"),
+            ({"field": "x.y", "operator": "==", "value": 1}, "Invalid filter field name"),
+            ({"field": "meta.x.y", "operator": "==", "value": 1}, "Invalid filter field name"),
+            # empty identifier after meta. stripping
+            ({"field": "meta.", "operator": "==", "value": 1}, "Invalid filter field name"),
+            # digit-leading identifier
+            ({"field": "2fast", "operator": "==", "value": 1}, "Invalid filter field name"),
+            # hyphen in field name (common meta key, but not a valid Cypher identifier)
+            ({"field": "created-by", "operator": "==", "value": "alice"}, "Invalid filter field name"),
+            ({"field": "meta.created-by", "operator": "==", "value": "alice"}, "Invalid filter field name"),
+        ],
+    )
+    def test_convert_filters_errors(self, filter_node, match):
+        with pytest.raises(FilterError, match=match):
+            _convert_filters(filter_node)
+
+    def test_warm_up_initializes_client_and_schema(self, mock_falkordb):
+        constructor, client, graph = mock_falkordb
+        store = FalkorDBDocumentStore()
+
+        store.warm_up()
+
+        constructor.assert_called_once()
+        assert store.client is client
+        assert store.graph is graph
+        assert store.initialized is True
+        assert graph.query.call_count == 2
+
+    def test_warm_up_is_idempotent(self, mock_falkordb):
+        constructor, _, graph = mock_falkordb
+        store = FalkorDBDocumentStore()
+
+        store.warm_up()
+        store.warm_up()
+
+        constructor.assert_called_once()
+        assert graph.query.call_count == 2
+
+    def test_close_then_warm_up_reopens(self, mock_falkordb):
+        constructor, client, graph = mock_falkordb
+        store = FalkorDBDocumentStore()
+        store.warm_up()
+
+        store.close()
+        store.warm_up()
+
+        assert constructor.call_count == 2
+        client.close.assert_called_once()
+        assert store.client is client
+        assert store.graph is graph
+        assert store.initialized is True
+        assert graph.query.call_count == 4
+
+    def test_warm_up_suppresses_missing_graph_error(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.delete.side_effect = ResponseError("Invalid graph operation on empty key")
+        store = FalkorDBDocumentStore(recreate_graph=True)
+
+        store.warm_up()
+
+        assert store._recreate_graph_applied is True
+        assert store.initialized is True
+
+    @pytest.mark.parametrize(
+        "error",
+        [ResponseError("unexpected response"), ConnectionError("connection lost")],
+        ids=["response-error", "connection-error"],
+    )
+    def test_warm_up_retries_graph_deletion_after_error(self, mock_falkordb, error):
+        _, _, graph = mock_falkordb
+        graph.delete.side_effect = [error, None]
+        store = FalkorDBDocumentStore(recreate_graph=True)
+
+        with pytest.raises(type(error), match=str(error)):
+            store.warm_up()
+
+        assert store._recreate_graph_applied is False
+
+        store.warm_up()
+
+        assert graph.delete.call_count == 2
+        assert store._recreate_graph_applied is True
+        assert store.initialized is True
+
+    @pytest.mark.parametrize("rows, expected", [([[42]], 42), ([], 0)])
+    def test_count_documents(self, mock_falkordb, rows, expected):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result(rows)]
+        assert FalkorDBDocumentStore().count_documents() == expected
+
+    def test_filter_documents_no_filters(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        node = SimpleNamespace(properties={"id": "n1", "content": "hello"})
+        graph.query.side_effect = [_result([]), _result([]), _result([[node]])]
+        docs = FalkorDBDocumentStore().filter_documents()
+        assert [d.content for d in docs] == ["hello"]
+        assert "WHERE" not in graph.query.call_args_list[-1].args[0]
+
+    def test_filter_documents_with_filters(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([])]
+        FalkorDBDocumentStore().filter_documents({"field": "year", "operator": "==", "value": 2024})
+        last = graph.query.call_args_list[-1]
+        assert "WHERE" in last.args[0]
+        assert last.args[1] == {"p0": 2024}
+
+    @pytest.mark.usefixtures("mock_falkordb")
+    def test_filter_documents_malformed_raises(self):
+        with pytest.raises(FilterError, match="Invalid filter syntax"):
+            FalkorDBDocumentStore().filter_documents({"field": "year", "value": 2024})
+
+    def test_delete_documents_empty_is_noop(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        FalkorDBDocumentStore().delete_documents([])
+        assert graph.query.call_count == 2
+
+    def test_delete_documents_runs_query(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        FalkorDBDocumentStore().delete_documents(["a", "b"])
+        last = graph.query.call_args_list[-1]
+        assert "DETACH DELETE" in last.args[0]
+        assert last.args[1] == {"ids": ["a", "b"]}
+
+    @pytest.mark.parametrize(
+        "similarity, raw, scale_score, filters, expected_score, where_expected",
+        [
+            ("cosine", 0.4, True, None, 0.8, False),
+            ("cosine", 0.4, False, None, 0.4, False),
+            ("euclidean", 1.0, True, {"field": "y", "operator": "==", "value": 1}, 0.5, True),
+        ],
+    )
+    def test_embedding_retrieval(
+        self, mock_falkordb, similarity, raw, scale_score, filters, expected_score, where_expected
+    ):
+        _, _, graph = mock_falkordb
+        node = SimpleNamespace(properties={"id": "n1", "content": "hello"})
+        graph.query.side_effect = [_result([]), _result([]), _result([[node, raw]])]
+        docs = FalkorDBDocumentStore(similarity=similarity)._embedding_retrieval(
+            query_embedding=[0.1], top_k=5, filters=filters, scale_score=scale_score
+        )
+        assert docs[0].score == pytest.approx(expected_score)
+        assert ("WHERE" in graph.query.call_args_list[-1].args[0]) is where_expected
+
+    def test_cypher_retrieval_returns_documents(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        node = SimpleNamespace(properties={"id": "n1", "content": "hello"})
+        graph.query.side_effect = [_result([]), _result([]), _result([[node]])]
+        docs = FalkorDBDocumentStore()._cypher_retrieval("MATCH (d) RETURN d", parameters={"k": 1})
+        assert docs[0].content == "hello"
+
+    @pytest.mark.usefixtures("mock_falkordb")
+    def test_write_documents_rejects_non_documents(self):
+        with pytest.raises(ValueError, match="expects a list of Documents"):
+            FalkorDBDocumentStore().write_documents(["not a doc"])
+
+    @pytest.mark.usefixtures("mock_falkordb")
+    def test_write_documents_empty_list_returns_zero(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert FalkorDBDocumentStore().write_documents([]) == 0
+        assert "empty list" in caplog.text
+
+    def test_write_documents_policy_none_coerced_to_fail(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([["a"]])]
+        with pytest.raises(DuplicateDocumentError):
+            FalkorDBDocumentStore().write_documents([Document(id="a", content="x")])
+
+    def test_write_documents_drops_duplicates_within_batch(self, mock_falkordb, caplog):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([]), _result([[2]])]
+        with caplog.at_level(logging.INFO):
+            written = FalkorDBDocumentStore().write_documents(
+                [
+                    Document(id="a", content="x"),
+                    Document(id="a", content="x"),
+                    Document(id="b", content="y"),
+                ],
+                policy=DuplicatePolicy.SKIP,
+            )
+        assert written == 2
+        assert "already present in the batch" in caplog.text
+        sent_ids = [d["id"] for d in graph.query.call_args_list[-1].args[1]["docs"]]
+        assert sent_ids == ["a", "b"]
+
+    def test_write_documents_skip_filters_existing(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([["a"]]), _result([[1]])]
+        written = FalkorDBDocumentStore().write_documents(
+            [Document(id="a", content="x"), Document(id="b", content="y")],
+            policy=DuplicatePolicy.SKIP,
+        )
+        assert written == 1
+        sent_ids = [d["id"] for d in graph.query.call_args_list[-1].args[1]["docs"]]
+        assert sent_ids == ["b"]
+
+    def test_write_documents_overwrite_uses_on_match_set(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([[1]])]
+        FalkorDBDocumentStore().write_documents([Document(id="a", content="x")], policy=DuplicatePolicy.OVERWRITE)
+        assert "ON MATCH SET d = doc" in graph.query.call_args_list[-1].args[0]
+
+    def test_write_documents_embeddings_second_pass(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([[1]]), _result([])]
+        FalkorDBDocumentStore().write_documents(
+            [Document(id="a", content="x", embedding=[0.1, 0.2, 0.3])],
+            policy=DuplicatePolicy.OVERWRITE,
+        )
+        last = graph.query.call_args_list[-1]
+        assert "vecf32" in last.args[0]
+        assert last.args[1]["docs"] == [{"id": "a", "emb": [0.1, 0.2, 0.3]}]
+
+    def test_write_documents_wraps_errors(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), Exception("boom")]
+        with pytest.raises(DocumentStoreError, match="Failed to write documents"):
+            FalkorDBDocumentStore().write_documents([Document(id="a", content="x")], policy=DuplicatePolicy.OVERWRITE)
+
+    def test_delete_all_documents(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([])]
+        FalkorDBDocumentStore().delete_all_documents()
+        assert "DETACH DELETE" in graph.query.call_args_list[-1].args[0]
+
+    def test_delete_by_filter_returns_count(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([[3]]), _result([])]
+        count = FalkorDBDocumentStore().delete_by_filter({"field": "year", "operator": "==", "value": 2024})
+        assert count == 3
+        assert "DETACH DELETE" in graph.query.call_args_list[-1].args[0]
+
+    def test_delete_by_filter_empty_result(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([]), _result([])]
+        assert FalkorDBDocumentStore().delete_by_filter({"field": "year", "operator": "==", "value": 2024}) == 0
+
+    def test_update_by_filter_returns_count(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([[2]])]
+        count = FalkorDBDocumentStore().update_by_filter(
+            {"field": "year", "operator": "==", "value": 2024}, {"status": "published"}
+        )
+        assert count == 2
+        assert "SET d +=" in graph.query.call_args_list[-1].args[0]
+
+    def test_update_by_filter_strips_meta_prefix(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([[1]])]
+        FalkorDBDocumentStore().update_by_filter(
+            {"field": "year", "operator": "==", "value": 2024}, {"meta.status": "published"}
+        )
+        assert graph.query.call_args_list[-1].args[1]["meta_update"] == {"status": "published"}
+
+    @pytest.mark.parametrize("rows, expected", [([[5]], 5), ([], 0)])
+    def test_count_documents_by_filter(self, mock_falkordb, rows, expected):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result(rows)]
+        count = FalkorDBDocumentStore().count_documents_by_filter({"field": "year", "operator": "==", "value": 2024})
+        assert count == expected
+
+    def test_count_unique_metadata_by_filter(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([[3]]), _result([[2]])]
+        result = FalkorDBDocumentStore().count_unique_metadata_by_filter({}, ["category", "status"])
+        assert result == {"category": 3, "status": 2}
+
+    def test_get_metadata_fields_info(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [
+            _result([]),
+            _result([]),
+            _result([[["category", "year"]]]),
+            _result([["A"]]),
+            _result([[2024]]),
+        ]
+        info = FalkorDBDocumentStore().get_metadata_fields_info()
+        assert info["category"] == {"type": "str"}
+        assert info["year"] == {"type": "int"}
+
+    @pytest.mark.parametrize(
+        "rows, expected",
+        [([[2020, 2024]], {"min": 2020, "max": 2024}), ([], {"min": None, "max": None})],
+    )
+    def test_get_metadata_field_min_max(self, mock_falkordb, rows, expected):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result(rows)]
+        assert FalkorDBDocumentStore().get_metadata_field_min_max("year") == expected
+
+    def test_get_metadata_field_unique_values(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([[["A", "B", "C"], 3]])]
+        values, total = FalkorDBDocumentStore().get_metadata_field_unique_values("category", size=10)
+        assert values == ["A", "B", "C"]
+        assert total == 3
+
+    def test_get_metadata_field_unique_values_pagination(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        all_values = ["A", "B", "C", "D", "E"]
+        total = len(all_values)
+        pages = [all_values[i : i + 2] for i in range(0, total, 2)]
+        graph.query.side_effect = [_result([]), _result([]), *(_result([[page, total]]) for page in pages)]
+        store = FalkorDBDocumentStore()
+
+        for page_index, expected_page in enumerate(pages):
+            from_ = page_index * 2
+            values, returned_total = store.get_metadata_field_unique_values("category", from_=from_, size=2)
+            assert values == expected_page
+            assert returned_total == total
+            _, params = graph.query.call_args[0]
+            assert params["from_"] == from_
+            assert params["size"] == 2
+
+        # last page is a partial page, smaller than the requested size
+        assert len(pages[-1]) == 1
+
+    def test_get_metadata_field_unique_values_search_term_case_insensitive(self, mock_falkordb):
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([[["Apple"], 1]])]
+        values, _ = FalkorDBDocumentStore().get_metadata_field_unique_values("category", search_term="APP")
+        assert values == ["Apple"]
+        cypher, params = graph.query.call_args[0]
+        assert "toLower(toString(d.category)) CONTAINS toLower($search_term)" in cypher
+        assert params == {"from_": 0, "size": 10, "search_term": "APP"}
+
+    def test_get_metadata_field_unique_values_preserves_non_string_types(self, mock_falkordb):
+        """Non-string metadata values (e.g. ints) are returned in their original type, not stringified."""
+        _, _, graph = mock_falkordb
+        graph.query.side_effect = [_result([]), _result([]), _result([[[1, 2, 3], 3]])]
+        values, total = FalkorDBDocumentStore().get_metadata_field_unique_values("priority", size=10)
+        assert values == [1, 2, 3]
+        assert total == 3
+
+    def test_close(self):
+        store = FalkorDBDocumentStore()
+        client = MagicMock()
+        store.client = client
+        store.initialized = True
+
+        store.close()
+
+        client.close.assert_called_once()
+        assert store.client is None
+
+        store.close()
+        client.close.assert_called_once()
+
+    def test_close_is_exception_safe(self):
+        store = FalkorDBDocumentStore()
+        client = MagicMock()
+        client.close.side_effect = RuntimeError("boom")
+        store.client = client
+        store.initialized = True
+
+        store.close()
+
+        assert store.client is None
+
+
+@pytest.mark.integration
+class TestDocumentStore(
+    FalkorDBDocumentStoreTestMixin,
+    DocumentStoreBaseTests,
+    DeleteAllTest,
+    DeleteByFilterTest,
+    UpdateByFilterTest,
+    CountDocumentsByFilterTest,
+    CountUniqueMetadataByFilterTest,
+    GetMetadataFieldsInfoTest,
+    GetMetadataFieldMinMaxTest,
+    GetMetadataFieldUniqueValuesTest,
+):
+    """
+    Test FalkorDBDocumentStore against the standard Haystack DocumentStore tests.
+    """
+
+    @pytest.fixture
+    def document_store(self, request):
+        host = os.environ.get("FALKORDB_HOST", "localhost")
+        port = int(os.environ.get("FALKORDB_PORT", "6379"))
+
+        # Use a unique graph name for each test to avoid interference
+        graph_name = f"test_graph_{request.node.name[:30]}"
+        store = FalkorDBDocumentStore(
+            host=host,
+            port=port,
+            graph_name=graph_name,
+            embedding_dim=768,
+            recreate_graph=True,
+            verify_connectivity=True,
+        )
+        yield store
+        # Teardown: delete the graph
+        try:
+            store.client.select_graph(graph_name).delete()
+        except Exception:
+            logger.debug("Could not delete graph %s during teardown", graph_name)
+
+    def test_write_documents(self, document_store):
+        """
+        Test write_documents() default behaviour.
+        """
+        doc = Document(content="test doc")
+        assert document_store.write_documents([doc]) == 1
+        self.assert_documents_are_equal(document_store.filter_documents(), [doc])
+
+    def test_get_metadata_field_unique_values_distinct_types(self, document_store):
+        """
+        Override: the base mixin test stores int, float, str and bool under the *same* metadata field
+        name and expects all four back as distinct values. Cypher's `DISTINCT` treats a whole-number
+        float (e.g. 1.0) as identical to a numerically equal int (1), so it collapses them into a
+        single value regardless of which other values share that field - even though a plain
+        per-node property read correctly preserves each value's own type.
+
+        This adapts the same intent - int, float, str and bool must come back as distinct, unmangled
+        types via get_metadata_field_unique_values() - using one field per type instead of one shared
+        field, which is what FalkorDB can actually support.
+
+        The float value is a non-whole number (1.5, not 1.0): a whole-number float would still collapse
+        with an int under Cypher's DISTINCT even in its own field, so a fractional value is used to
+        sidestep that ambiguity entirely.
+        """
+        docs = [
+            Document(content="Doc 1", meta={"priority_int": 1}),
+            Document(content="Doc 2", meta={"priority_str": "1"}),
+            Document(content="Doc 3", meta={"priority_float": 1.5}),
+            Document(content="Doc 4", meta={"priority_bool": True}),
+        ]
+        document_store.write_documents(docs)
+
+        int_values, int_count = document_store.get_metadata_field_unique_values(metadata_field="priority_int")
+        str_values, str_count = document_store.get_metadata_field_unique_values(metadata_field="priority_str")
+        float_values, float_count = document_store.get_metadata_field_unique_values(metadata_field="priority_float")
+        bool_values, bool_count = document_store.get_metadata_field_unique_values(metadata_field="priority_bool")
+
+        assert (int_count, str_count, float_count, bool_count) == (1, 1, 1, 1)
+        assert int_values == [1] and type(int_values[0]) is int
+        assert str_values == ["1"] and type(str_values[0]) is str
+        assert float_values == [1.5] and type(float_values[0]) is float
+        assert bool_values == [True] and type(bool_values[0]) is bool
+
+    def test_close_and_reopen(self, document_store):
+        document = Document(content="hello")
+        document_store.write_documents([document])
+
+        document_store.close()
+        assert document_store.client is None
+        document_store.warm_up()
+        assert document_store.client is not None
+        self.assert_documents_are_equal(document_store.filter_documents(), [document])
+
+    @pytest.fixture
+    def embedding_store(self):
+        host = os.environ.get("FALKORDB_HOST", "localhost")
+        port = int(os.environ.get("FALKORDB_PORT", "6379"))
+        store = FalkorDBDocumentStore(
+            host=host,
+            port=port,
+            graph_name="test_embedding_retrieval",
+            embedding_dim=3,
+            recreate_graph=True,
+            verify_connectivity=True,
+        )
+        yield store
+        try:
+            store.client.select_graph("test_embedding_retrieval").delete()
+        except Exception:
+            logger.debug("Could not delete graph test_embedding_retrieval during teardown")
+
+    def test_embedding_retrieval(self, embedding_store):
+        docs = [
+            Document(content="Graph databases represent data as nodes and edges.", embedding=[0.1, 0.2, 0.3]),
+            Document(content="Large language models generate text.", embedding=[0.9, 0.8, 0.1]),
+        ]
+        embedding_store.write_documents(docs)
+
+        retriever = FalkorDBEmbeddingRetriever(document_store=embedding_store, top_k=1)
+        res = retriever.run(query_embedding=[0.1, 0.25, 0.3])
+
+        assert len(res["documents"]) == 1
+        assert "Graph databases" in res["documents"][0].content
+        assert res["documents"][0].score is not None
+
+    def test_cypher_retriever_graph_traversal(self, document_store):
+        document_store.graph.query(
+            "CREATE (a:Document {id: 'docA', content: 'Node A'})"
+            "-[:REFERENCES]->"
+            "(b:Document {id: 'docB', content: 'Node B'})"
+        )
+
+        retriever = FalkorDBCypherRetriever(
+            document_store=document_store,
+            custom_cypher_query=("MATCH (:Document {id: $source_id})-[:REFERENCES]->(target:Document) RETURN target"),
+        )
+        res = retriever.run(parameters={"source_id": "docA"})
+
+        assert len(res["documents"]) == 1
+        assert res["documents"][0].id == "docB"
+        assert res["documents"][0].content == "Node B"

@@ -3,12 +3,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
+import datetime as dt
+import itertools
 import os
+from unittest.mock import MagicMock, Mock
 
 import pytest
 from haystack import Document
 from haystack.document_stores.errors import DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
+from haystack.errors import FilterError
 from haystack.testing.document_store import (
     CountDocumentsByFilterTest,
     CountUniqueMetadataByFilterTest,
@@ -20,6 +24,11 @@ from haystack.testing.document_store import (
 )
 
 from haystack_integrations.document_stores.arcadedb import ArcadeDBDocumentStore
+from haystack_integrations.document_stores.arcadedb.document_store import (
+    _map_literal,
+    _map_literal_base,
+    _sql_str,
+)
 
 ARCADEDB_URL = os.getenv("ARCADEDB_URL", "http://localhost:2480")
 
@@ -37,18 +46,364 @@ def _sample_docs(n: int = 3, dim: int = 4) -> list[Document]:
     return docs
 
 
-class TestSerialization:
-    def test_to_dict_from_dict(self):
+class TestSqlHelpers:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (None, "NULL"),
+            ("hello", "'hello'"),
+            ("it's", "'it\\'s'"),
+            ("a\\b", "'a\\\\b'"),
+            ("", "''"),
+        ],
+    )
+    def test_sql_str(self, value, expected):
+        assert _sql_str(value) == expected
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("hello", "'hello'"),
+            (True, "true"),
+            (False, "false"),
+            (42, 42),
+            (1.5, 1.5),
+            (None, "NULL"),
+            ([1, 2, 3], [1, 2, 3]),
+        ],
+    )
+    def test_map_literal_base_known_types(self, value, expected):
+        assert _map_literal_base(value) == expected
+
+    def test_map_literal_base_fallback_to_str(self):
+        date = dt.date(2024, 1, 2)
+        assert _map_literal_base(date) == "'2024-01-02'"
+
+    def test_map_literal_empty_dict(self):
+        assert _map_literal({}) == "{}"
+
+    def test_map_literal_pairs(self):
+        assert _map_literal({"a": 1, "b": "x"}) == '{"a": 1, "b": \'x\'}'
+
+
+class TestStaticHelpers:
+    @pytest.mark.parametrize(
+        "rows,expected",
+        [
+            ([], []),
+            ([{"val": "a"}, {"val": "b"}], ["a", "b"]),
+            ([{"val": None}], []),
+            ([{"val": [1, 2, None, 3]}], [1, 2, 3]),
+            ([{"val": "x"}, {"val": None}, {"val": ["a", "b"]}], ["x", "a", "b"]),
+            # duplicates collapse, keeping the first occurrence, across both scalar and list rows
+            ([{"val": "a"}, {"val": "a"}, {"val": ["a", "b"]}], ["a", "b"]),
+        ],
+    )
+    def test_extract_distinct_values(self, rows, expected):
+        assert ArcadeDBDocumentStore._extract_distinct_values(rows) == expected
+
+    def test_extract_distinct_values_keeps_types_distinct(self):
+        """Values that compare equal in Python (1 == True, 1 == 1.0) must not collapse into one."""
+        rows = [{"val": 1}, {"val": True}, {"val": 1.0}, {"val": "1"}]
+        values = ArcadeDBDocumentStore._extract_distinct_values(rows)
+
+        assert len(values) == 4
+        values_by_type = {type(value): value for value in values}
+        assert values_by_type.keys() == {int, bool, float, str}
+
+    @pytest.mark.parametrize(
+        "values,expected",
+        [
+            # numbers keep numeric order instead of degrading to string order ("10" before "2")
+            ([10, 1, 20, 2, 3], [1, 2, 3, 10, 20]),
+            ([1.5, 0.5, 10.25], [0.5, 1.5, 10.25]),
+            (["b", "a", "C"], ["C", "a", "b"]),
+            ([], []),
+            # ints and floats are mutually comparable, so a field holding both still sorts numerically
+            # instead of putting every float ahead of every int
+            ([2.5, 1, 3], [1, 2.5, 3]),
+            ([1, 2, 3, 1.5], [1, 1.5, 2, 3]),
+            ([9.99, 10, 1], [1, 9.99, 10]),
+        ],
+    )
+    def test_sort_values_by_type(self, values, expected):
+        assert ArcadeDBDocumentStore._sort_values_by_type(values) == expected
+
+    def test_sort_values_by_type_groups_incomparable_types(self):
+        """Mixed types can't all be compared with `<`, so they're grouped instead of raising."""
+        result = ArcadeDBDocumentStore._sort_values_by_type([1, "a", 2.5, True])
+
+        # `1 == True` and `1 == 1.0`, so equality alone can't prove the grouping - check the types.
+        # int, float and bool share one numeric group; the str sorts on its own.
+        assert [type(value).__name__ for value in result] == ["bool", "int", "float", "str"]
+        assert result == [True, 1, 2.5, "a"]
+
+    def test_sort_values_by_type_is_independent_of_input_order(self):
+        """
+        Values that compare equal but differ in type must always come back in the same order.
+
+        `SELECT DISTINCT` gives no row-order guarantee, so if the tie between `1`, `1.0` and `True`
+        were left to the sort's stability, the order would follow whatever the server happened to
+        return - and one page of values could repeat a value that the next page then skips.
+        """
+        for permutation in itertools.permutations([1, 1.0, True, "1"]):
+            result = ArcadeDBDocumentStore._sort_values_by_type(list(permutation))
+
+            # `1 == 1.0 == True`, so only the types can show the ordering is really stable.
+            assert [type(value).__name__ for value in result] == ["bool", "float", "int", "str"]
+
+    @pytest.mark.parametrize(
+        "values,expected",
+        [
+            ([], "keyword"),
+            ([1, 2, 3], "long"),
+            ([1.0, 2.0], "double"),
+            ([True, False], "boolean"),
+            (["a", "b"], "keyword"),
+            ([1, "a"], "keyword"),
+            ([[1, 2]], "long"),
+            ([[True]], "boolean"),
+            ([[1.5]], "double"),
+            ([["x"]], "keyword"),
+        ],
+    )
+    def test_infer_metadata_field_type(self, values, expected):
+        assert ArcadeDBDocumentStore._infer_metadata_field_type(values) == expected
+
+
+class TestDocumentStoreUnit:
+    @pytest.fixture
+    def store(self):
         store = ArcadeDBDocumentStore(
-            url="http://localhost:2480",
-            database="test_db",
+            url="http://localhost:2480/",
+            database="test",
             embedding_dimension=4,
+            create_database=False,
         )
+        store._initialized = True
+        return store
+
+    def test_to_dict_from_dict(self, store):
         data = store.to_dict()
         restored = ArcadeDBDocumentStore.from_dict(data)
         assert restored._database == store._database
         assert restored._embedding_dimension == store._embedding_dimension
         assert restored._url == store._url
+
+    def test_url_trailing_slash_stripped(self):
+        store = ArcadeDBDocumentStore(url="http://host:2480/", database="db")
+        assert store._url == "http://host:2480"
+
+    def test_auth_returns_none_when_secrets_unresolved(self, store, monkeypatch):
+        monkeypatch.delenv("ARCADEDB_USERNAME", raising=False)
+        monkeypatch.delenv("ARCADEDB_PASSWORD", raising=False)
+
+        assert store._auth() is None
+
+    def test_auth_tuple_when_secrets_resolved(self, monkeypatch):
+        monkeypatch.setenv("ARCADEDB_USERNAME", "user1")
+        monkeypatch.setenv("ARCADEDB_PASSWORD", "pwd1")
+        store = ArcadeDBDocumentStore(create_database=False)
+        assert store._auth() == ("user1", "pwd1")
+
+    def test_from_dict_with_none_secrets(self):
+        data = {
+            "type": "haystack_integrations.document_stores.arcadedb.document_store.ArcadeDBDocumentStore",
+            "init_parameters": {
+                "url": "http://localhost:2480",
+                "database": "mydb",
+                "username": None,
+                "password": None,
+                "embedding_dimension": 4,
+            },
+        }
+        restored = ArcadeDBDocumentStore.from_dict(data)
+        assert restored._database == "mydb"
+        assert restored._username is None
+        assert restored._password is None
+
+    def test_command_raises_runtimeerror_on_http_error(self, store):
+        mock_resp = MagicMock(status_code=500, text="boom")
+        store._session = MagicMock()
+        store._session.post.return_value = mock_resp
+        with pytest.raises(RuntimeError, match="ArcadeDB command failed"):
+            store._command("SELECT 1")
+
+    def test_command_passes_positional_params(self, store):
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"result": []}
+        store._session = MagicMock()
+        store._session.post.return_value = mock_resp
+        store._command("SELECT * WHERE id = ?", positional_params=["abc"])
+        _, kwargs = store._session.post.call_args
+        assert kwargs["json"]["params"] == ["abc"]
+
+    def test_server_command_raises_runtimeerror(self, store):
+        mock_resp = MagicMock(status_code=400, text="bad")
+        store._session = MagicMock()
+        store._session.post.return_value = mock_resp
+        with pytest.raises(RuntimeError, match="ArcadeDB server command failed"):
+            store._server_command("CREATE DATABASE foo")
+
+    def test_count_documents_returns_zero_when_no_rows(self, store):
+        store._command = MagicMock(return_value=[])
+        assert store.count_documents() == 0
+
+    @pytest.mark.parametrize(
+        "bad_input",
+        [
+            "not a list",
+            [Document(id="1"), "not a doc"],
+            [{"dict": "not_doc"}],
+        ],
+    )
+    def test_write_documents_rejects_invalid_input(self, store, bad_input):
+        with pytest.raises(ValueError, match="must be a list of Document"):
+            store.write_documents(bad_input)
+
+    def test_write_documents_empty_list_returns_zero(self, store):
+        store._command = MagicMock()
+        assert store.write_documents([]) == 0
+        store._command.assert_not_called()
+
+    def test_write_documents_overwrite_inserts_when_update_miss(self, store):
+        store._command = MagicMock(side_effect=[[{"count": 0}], []])
+        written = store.write_documents(
+            [Document(id="x", content="c", embedding=[0.0] * 4)],
+            policy=DuplicatePolicy.OVERWRITE,
+        )
+        assert written == 1
+        assert store._command.call_count == 2
+
+    def test_write_documents_skip_returns_existing(self, store):
+        store._command = MagicMock(return_value=[{"id": "x"}])
+        written = store.write_documents(
+            [Document(id="x", content="c", embedding=[0.0] * 4)],
+            policy=DuplicatePolicy.SKIP,
+        )
+        assert written == 0
+
+    def test_delete_documents_empty_list_is_noop(self, store):
+        store._command = MagicMock()
+        store.delete_documents([])
+        store._command.assert_not_called()
+
+    def test_delete_by_filter_empty_filter_raises(self, store):
+        with pytest.raises(FilterError, match="non-empty filter"):
+            store.delete_by_filter({})
+
+    def test_update_by_filter_empty_filter_raises(self, store):
+        with pytest.raises(FilterError, match="non-empty filter"):
+            store.update_by_filter({}, {"k": "v"})
+
+    @pytest.mark.parametrize(
+        "method,args",
+        [
+            ("filter_documents", ({"operator": "??", "field": "x", "value": 1},)),
+            ("delete_by_filter", ({"operator": "??", "field": "x", "value": 1},)),
+            ("update_by_filter", ({"operator": "??", "field": "x", "value": 1}, {"k": "v"})),
+            ("count_documents_by_filter", ({"operator": "??", "field": "x", "value": 1},)),
+            ("count_unique_metadata_by_filter", ({"operator": "??", "field": "x", "value": 1}, ["k"])),
+        ],
+    )
+    def test_invalid_filter_raises_filter_error(self, store, method, args):
+        store._command = MagicMock()
+        with pytest.raises(FilterError):
+            getattr(store, method)(*args)
+
+    def test_count_documents_by_filter_no_rows(self, store):
+        store._command = MagicMock(return_value=[])
+        assert store.count_documents_by_filter({"field": "x", "operator": "==", "value": 1}) == 0
+
+    def test_count_unique_metadata_by_filter_empty_fields(self, store):
+        store._command = MagicMock()
+        assert store.count_unique_metadata_by_filter({}, []) == {}
+        store._command.assert_not_called()
+
+    def test_count_unique_metadata_by_filter_with_fields(self, store):
+        store._command = MagicMock(return_value=[{"val": "a"}, {"val": "b"}, {"val": "a"}])
+        counts = store.count_unique_metadata_by_filter({"field": "meta.x", "operator": "==", "value": 1}, ["meta.cat"])
+        assert counts == {"cat": 2}
+
+    def test_get_metadata_fields_info_empty(self, store):
+        store._command = MagicMock(return_value=[])
+        assert store.get_metadata_fields_info() == {}
+
+    def test_get_metadata_fields_info_infers_types(self, store):
+        store._command = MagicMock(
+            return_value=[
+                {"content": "hi", "meta": {"n": 1, "f": 1.5, "b": True, "s": "x"}},
+                {"content": "yo", "meta": {"n": 2, "f": 2.5, "b": False, "s": "y"}},
+            ]
+        )
+        info = store.get_metadata_fields_info()
+        assert info["content"] == {"type": "text"}
+        assert info["n"] == {"type": "long"}
+        assert info["f"] == {"type": "double"}
+        assert info["b"] == {"type": "boolean"}
+        assert info["s"] == {"type": "keyword"}
+
+    def test_get_metadata_field_min_max_empty_rows(self, store):
+        store._command = MagicMock(return_value=[])
+        assert store.get_metadata_field_min_max("meta.x") == {"min": None, "max": None}
+
+    def test_embedding_retrieval_returns_empty_when_no_rows(self, store):
+        store._command = MagicMock(return_value=[])
+        assert store._embedding_retrieval([0.0] * 4) == []
+
+    def test_embedding_retrieval_returns_empty_when_no_neighbors(self, store):
+        store._command = MagicMock(return_value=[{"neighbors": None}])
+        assert store._embedding_retrieval([0.0] * 4) == []
+
+    def test_embedding_retrieval_post_filters_by_ids(self, store):
+        store._command = MagicMock(
+            side_effect=[
+                [
+                    {
+                        "neighbors": [
+                            {"record": {"id": "a", "content": "A", "meta": {}}, "distance": 0.1},
+                            {"record": {"id": "b", "content": "B", "meta": {}}, "distance": 0.2},
+                        ]
+                    }
+                ],
+                [{"id": "a"}],
+            ]
+        )
+        docs = store._embedding_retrieval(
+            [0.0] * 4,
+            filters={"field": "meta.k", "operator": "==", "value": "v"},
+        )
+        assert [d.id for d in docs] == ["a"]
+        assert docs[0].score == pytest.approx(0.9)
+
+    def test_embedding_retrieval_invalid_filter_raises(self, store):
+        store._command = MagicMock(return_value=[{"neighbors": [{"record": {"id": "a"}, "distance": 0.0}]}])
+        with pytest.raises(FilterError):
+            store._embedding_retrieval(
+                [0.0] * 4,
+                filters={"operator": "??", "field": "x", "value": 1},
+            )
+
+    def test_embedding_retrieval_without_filter_returns_all(self, store):
+        store._command = MagicMock(
+            return_value=[{"neighbors": [{"record": {"id": "a", "content": "A"}, "distance": 0.1}]}]
+        )
+        docs = store._embedding_retrieval([0.0] * 4)
+        assert [d.id for d in docs] == ["a"]
+
+    def test_close(self, store):
+        store._session = Mock()
+        session = store._session
+        store.close()
+        session.close.assert_called_once_with()
+        assert store._session is None
+        store.close()
+
+    def test_close_is_exception_safe(self, store):
+        store._session = Mock()
+        store._session.close.side_effect = RuntimeError
+        store.close()
+        assert store._session is None
 
 
 @pytest.mark.skipif(
@@ -100,6 +455,15 @@ class TestArcadeDBDocumentStore(
             expected_clean = dataclasses.replace(expected_doc, embedding=None)
             assert actual == expected_clean
 
+    def test_close_and_reopen(self, document_store: ArcadeDBDocumentStore):
+        document_store.write_documents([Document(id="1")])
+        assert document_store.count_documents() == 1
+
+        document_store.close()
+        assert document_store._session is None
+
+        assert document_store.count_documents() == 1
+
     def test_write_documents(self, document_store: ArcadeDBDocumentStore):
         """Override mixin: test default write_documents and duplicate fail behaviour."""
         docs = [Document(id="1")]
@@ -140,6 +504,27 @@ class TestArcadeDBDocumentStore(
         assert len(results) <= 3
         assert results[0].score is not None
 
+    def test_not_operator_multiple_conditions(self, document_store: ArcadeDBDocumentStore):
+        document_store.write_documents(
+            [
+                Document(id="both", meta={"number": 100, "name": "foo"}),
+                Document(id="first_only", meta={"number": 100, "name": "bar"}),
+                Document(id="second_only", meta={"number": 99, "name": "foo"}),
+                Document(id="neither", meta={"number": 99, "name": "bar"}),
+            ]
+        )
+        filters = {
+            "operator": "NOT",
+            "conditions": [
+                {"field": "meta.number", "operator": "==", "value": 100},
+                {"field": "meta.name", "operator": "==", "value": "foo"},
+            ],
+        }
+
+        # NOT excludes only documents matching both conditions.
+        result = document_store.filter_documents(filters)
+        assert {doc.id for doc in result} == {"first_only", "second_only", "neither"}
+
     def test_count_documents_by_empty_filter(self, document_store: ArcadeDBDocumentStore):
         """Counts all documents when an empty filter is provided."""
         docs = [
@@ -174,32 +559,36 @@ class TestArcadeDBDocumentStore(
 
         assert result == {"min": None, "max": None}
 
-    def test_get_metadata_field_unique_values_pagination(self, document_store: ArcadeDBDocumentStore):
-        """Respects size limit while total reflects the full unpaginated count."""
+    def test_count_unique_metadata_by_filter_distinct_types(self, document_store: ArcadeDBDocumentStore):
+        """An int and a numerically equal float are two values, not one, on the counting path too."""
         docs = [
-            Document(id="1", content="Doc 1", meta={"category": "alpha"}),
-            Document(id="2", content="Doc 2", meta={"category": "beta"}),
-            Document(id="3", content="Doc 3", meta={"category": "gamma"}),
+            Document(content="Doc 1", meta={"priority": 1}),
+            Document(content="Doc 2", meta={"priority": 1.0}),
+            Document(content="Doc 3", meta={"priority": True}),
+            Document(content="Doc 4", meta={"priority": "1"}),
+            Document(content="Doc 5", meta={"priority": 1}),
         ]
         document_store.write_documents(docs)
 
-        values, total = document_store.get_metadata_field_unique_values("category", from_=0, size=2)
+        counts = document_store.count_unique_metadata_by_filter(filters={}, metadata_fields=["priority"])
 
-        assert len(values) == 2
-        assert total == 3
+        assert counts == {"priority": 4}
 
-    def test_get_metadata_field_unique_values_case_insensitive(self, document_store: ArcadeDBDocumentStore):
-        """Matches values case-insensitively when a search term is provided."""
-        docs = [
-            Document(id="1", content="Doc 1", meta={"category": "Books"}),
-            Document(id="2", content="Doc 2", meta={"category": "books"}),
-            Document(id="3", content="Doc 3", meta={"category": "ELECTRONICS"}),
-        ]
+    def test_get_metadata_field_unique_values_numeric_ordering(self, document_store: ArcadeDBDocumentStore):
+        """
+        Numeric values must come back in numeric order, not string order ("10" sorts before "2").
+        The base mixin's pagination test only uses string values, so it can't catch that - and getting
+        it wrong silently changes which values land on which page.
+        """
+        docs = [Document(content=f"Doc {value}", meta={"priority": value}) for value in [10, 1, 20, 2, 3]]
         document_store.write_documents(docs)
 
-        _, total = document_store.get_metadata_field_unique_values("category", search_term="book")
+        values, total_count = document_store.get_metadata_field_unique_values("priority", size=10)
+        assert values == [1, 2, 3, 10, 20]
+        assert total_count == 5
 
-        assert total == 2
+        first_page, _ = document_store.get_metadata_field_unique_values("priority", from_=0, size=2)
+        assert first_page == [1, 2]
 
     def test_get_metadata_field_unique_values_no_matches(self, document_store: ArcadeDBDocumentStore):
         """Returns empty results when no metadata values match the search term."""
@@ -210,3 +599,121 @@ class TestArcadeDBDocumentStore(
 
         assert values == []
         assert total == 0
+
+    def test_write_documents_none_embedding_is_zero_padded(self, document_store: ArcadeDBDocumentStore):
+        """Documents written without an embedding get a zero vector of the correct dimension."""
+        dim = document_store._embedding_dimension
+        doc = Document(id="no-emb", content="no embedding")
+        document_store.write_documents([doc])
+
+        results = document_store.filter_documents({"field": "id", "operator": "==", "value": "no-emb"})
+        assert len(results) == 1
+        assert results[0].embedding == [0.0] * dim
+
+    def test_write_documents_skip_policy_inserts_new_document(self, document_store: ArcadeDBDocumentStore):
+        """SKIP policy writes a document that does not already exist."""
+        doc = Document(id="new-skip", content="new doc")
+        written = document_store.write_documents([doc], policy=DuplicatePolicy.SKIP)
+
+        assert written == 1
+        results = document_store.filter_documents({"field": "id", "operator": "==", "value": "new-skip"})
+        assert len(results) == 1
+
+    def test_write_documents_none_policy_success(self, document_store: ArcadeDBDocumentStore):
+        """NONE policy successfully inserts a document when no duplicate exists."""
+        doc = Document(id="none-policy", content="inserted with NONE")
+        written = document_store.write_documents([doc], policy=DuplicatePolicy.NONE)
+
+        assert written == 1
+        results = document_store.filter_documents({"field": "id", "operator": "==", "value": "none-policy"})
+        assert len(results) == 1
+
+    def test_write_documents_overwrite_updates_existing(self, document_store: ArcadeDBDocumentStore):
+        """OVERWRITE updates an existing document without creating a duplicate."""
+        doc = Document(id="ow-hit", content="original")
+        document_store.write_documents([doc], policy=DuplicatePolicy.OVERWRITE)
+
+        updated = Document(id="ow-hit", content="updated")
+        written = document_store.write_documents([updated], policy=DuplicatePolicy.OVERWRITE)
+
+        assert written == 1
+        assert document_store.count_documents() == 1
+        results = document_store.filter_documents({"field": "id", "operator": "==", "value": "ow-hit"})
+        assert results[0].content == "updated"
+
+    def test_get_metadata_fields_info_mixed_types_defaults_to_keyword(self, document_store: ArcadeDBDocumentStore):
+        """When the same metadata field has different types across documents, type defaults to 'keyword'."""
+        docs = [
+            Document(id="mt-1", content="doc 1", meta={"x": 1}),
+            Document(id="mt-2", content="doc 2", meta={"x": "one"}),
+        ]
+        document_store.write_documents(docs)
+
+        info = document_store.get_metadata_fields_info()
+
+        assert info["x"] == {"type": "keyword"}
+
+    def test_get_metadata_fields_info_no_content_documents(self, document_store: ArcadeDBDocumentStore):
+        """Documents with no content do not produce a 'content' entry in metadata fields info."""
+        docs = [
+            Document(id="nc-1", meta={"tag": "a"}),
+            Document(id="nc-2", meta={"tag": "b"}),
+        ]
+        document_store.write_documents(docs)
+
+        info = document_store.get_metadata_fields_info()
+
+        assert "content" not in info
+        assert "tag" in info
+
+    def test_get_metadata_fields_info_list_valued_metadata(self, document_store: ArcadeDBDocumentStore):
+        """List-valued metadata fields are recognised and their item types are inferred."""
+        docs = [
+            Document(id="lv-1", content="doc 1", meta={"tags": ["python", "haystack"]}),
+            Document(id="lv-2", content="doc 2", meta={"tags": ["arcadedb"]}),
+        ]
+        document_store.write_documents(docs)
+
+        info = document_store.get_metadata_fields_info()
+
+        assert "tags" in info
+        assert info["tags"] == {"type": "keyword"}
+
+    def test_get_metadata_fields_info_list_valued_bool(self, document_store: ArcadeDBDocumentStore):
+        """Boolean items inside list-valued metadata fields are inferred as boolean type."""
+        docs = [Document(id="lvb-1", content="doc", meta={"flags": [True, False]})]
+        document_store.write_documents(docs)
+
+        info = document_store.get_metadata_fields_info()
+
+        assert info.get("flags") == {"type": "boolean"}
+
+    def test_get_metadata_fields_info_list_valued_float(self, document_store: ArcadeDBDocumentStore):
+        """Float items inside list-valued metadata fields are inferred as double type."""
+        docs = [Document(id="lvf-1", content="doc", meta={"scores": [1.5, 2.5]})]
+        document_store.write_documents(docs)
+
+        info = document_store.get_metadata_fields_info()
+
+        assert info.get("scores") == {"type": "double"}
+
+    def test_get_metadata_fields_info_list_valued_int(self, document_store: ArcadeDBDocumentStore):
+        """Integer items inside list-valued metadata fields are inferred as long type."""
+        docs = [Document(id="lvi-1", content="doc", meta={"counts": [1, 2, 3]})]
+        document_store.write_documents(docs)
+
+        info = document_store.get_metadata_fields_info()
+
+        assert info.get("counts") == {"type": "long"}
+
+    def test_count_unique_metadata_by_filter_list_valued_field(self, document_store: ArcadeDBDocumentStore):
+        """count_unique_metadata_by_filter handles metadata fields whose values are lists."""
+        docs = [
+            Document(id="cu-1", content="doc 1", meta={"tags": ["a", "b"]}),
+            Document(id="cu-2", content="doc 2", meta={"tags": ["b", "c"]}),
+        ]
+        document_store.write_documents(docs)
+
+        counts = document_store.count_unique_metadata_by_filter({}, ["meta.tags"])
+
+        assert counts["tags"] >= 1

@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import create_autospec
 
 import pytest
 
@@ -11,9 +11,20 @@ from haystack_integrations.document_stores.weaviate import WeaviateDocumentStore
 
 
 @pytest.mark.asyncio
+async def test_close_async():
+    mock_document_store = create_autospec(WeaviateDocumentStore, instance=True)
+    retriever = WeaviateEmbeddingRetriever(document_store=mock_document_store)
+
+    await retriever.close_async()
+
+    mock_document_store.close_async.assert_awaited_once_with()
+    assert retriever._document_store is mock_document_store
+
+
+@pytest.mark.asyncio
 async def test_run_async_calls_async_retrieval():
-    mock_document_store = Mock(spec=WeaviateDocumentStore)
-    mock_document_store._embedding_retrieval_async = AsyncMock(return_value=[])
+    mock_document_store = create_autospec(WeaviateDocumentStore, instance=True)
+    mock_document_store._embedding_retrieval_async.return_value = []
 
     retriever = WeaviateEmbeddingRetriever(document_store=mock_document_store)
 
@@ -35,8 +46,32 @@ async def test_run_async_calls_async_retrieval():
 
 @pytest.mark.asyncio
 async def test_run_async_distance_and_certainty_error():
-    mock_document_store = Mock(spec=WeaviateDocumentStore)
+    mock_document_store = create_autospec(WeaviateDocumentStore, instance=True)
     retriever = WeaviateEmbeddingRetriever(document_store=mock_document_store)
 
     with pytest.raises(ValueError, match=r"Can't use 'distance' \(0.5\) and 'certainty' \(0.8\) parameters together"):
         await retriever.run_async(query_embedding=[0.1, 0.2, 0.3], distance=0.5, certainty=0.8)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("param", ["distance", "certainty"])
+async def test_run_async_honors_explicit_zero(param):
+    mock_document_store = create_autospec(WeaviateDocumentStore, instance=True)
+    mock_document_store._embedding_retrieval_async.return_value = []
+    retriever = WeaviateEmbeddingRetriever(document_store=mock_document_store, **{param: 0.5})
+
+    await retriever.run_async(query_embedding=[0.1, 0.2, 0.3], **{param: 0.0})
+
+    assert mock_document_store._embedding_retrieval_async.call_args.kwargs[param] == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("param", ["distance", "certainty"])
+async def test_run_async_honors_zero_set_at_init(param):
+    mock_document_store = create_autospec(WeaviateDocumentStore, instance=True)
+    mock_document_store._embedding_retrieval_async.return_value = []
+    retriever = WeaviateEmbeddingRetriever(document_store=mock_document_store, **{param: 0.0})
+
+    await retriever.run_async(query_embedding=[0.1, 0.2, 0.3])
+
+    assert mock_document_store._embedding_retrieval_async.call_args.kwargs[param] == 0.0

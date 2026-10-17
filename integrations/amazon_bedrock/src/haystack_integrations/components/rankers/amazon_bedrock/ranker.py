@@ -31,12 +31,14 @@ class AmazonBedrockRanker:
     ```python
     from haystack import Document
     from haystack.utils import Secret
-    from haystack_integrations.components.rankers.amazon_bedrock import AmazonBedrockRanker
+    from haystack_integrations.components.rankers.amazon_bedrock import (
+        AmazonBedrockRanker,
+    )
 
     ranker = AmazonBedrockRanker(
         model="cohere.rerank-v3-5:0",
         top_k=2,
-        aws_region_name=Secret.from_token("eu-central-1")
+        aws_region_name=Secret.from_token("eu-central-1"),
     )
 
     docs = [Document(content="Paris"), Document(content="Berlin")]
@@ -66,7 +68,7 @@ class AmazonBedrockRanker:
             ["AWS_SECRET_ACCESS_KEY"], strict=False
         ),
         aws_session_token: Secret | None = Secret.from_env_var(["AWS_SESSION_TOKEN"], strict=False),  # noqa: B008
-        aws_region_name: Secret | None = Secret.from_env_var(["AWS_DEFAULT_REGION"], strict=False),  # noqa: B008
+        aws_region_name: Secret | str | None = Secret.from_env_var(["AWS_DEFAULT_REGION"], strict=False),  # noqa: B008
         aws_profile_name: Secret | None = Secret.from_env_var(["AWS_PROFILE"], strict=False),  # noqa: B008
         max_chunks_per_doc: int | None = None,
         meta_fields_to_embed: list[str] | None = None,
@@ -89,9 +91,14 @@ class AmazonBedrockRanker:
             with the document content for reranking.
         :param meta_data_separator: Separator used to concatenate the meta fields
             to the Document content.
+
+        :raises ValueError: If `model` is empty or if `top_k` is not > 0.
         """
         if not model:
             msg = "'model' cannot be None or empty string"
+            raise ValueError(msg)
+        if top_k <= 0:
+            msg = f"top_k must be > 0, but got {top_k}"
             raise ValueError(msg)
         self.model_name = model
         self.aws_access_key_id = aws_access_key_id
@@ -104,16 +111,23 @@ class AmazonBedrockRanker:
         self.meta_fields_to_embed = meta_fields_to_embed or []
         self.meta_data_separator = meta_data_separator
 
-        def resolve_secret(secret: Secret | None) -> str | None:
-            return secret.resolve_value() if secret else None
+        self._bedrock_client: Any = None
+
+    def warm_up(self) -> None:
+        """Create the Amazon Bedrock client."""
+        if self._bedrock_client is not None:
+            return
+
+        def resolve_secret(secret: Secret | str | None) -> str | None:
+            return secret.resolve_value() if isinstance(secret, Secret) else secret
 
         try:
             session = get_aws_session(
-                aws_access_key_id=resolve_secret(aws_access_key_id),
-                aws_secret_access_key=resolve_secret(aws_secret_access_key),
-                aws_session_token=resolve_secret(aws_session_token),
-                aws_region_name=resolve_secret(aws_region_name),
-                aws_profile_name=resolve_secret(aws_profile_name),
+                aws_access_key_id=resolve_secret(self.aws_access_key_id),
+                aws_secret_access_key=resolve_secret(self.aws_secret_access_key),
+                aws_session_token=resolve_secret(self.aws_session_token),
+                aws_region_name=resolve_secret(self.aws_region_name),
+                aws_profile_name=resolve_secret(self.aws_profile_name),
             )
             self._bedrock_client = session.client("bedrock-agent-runtime")
         except Exception as exception:
@@ -122,6 +136,12 @@ class AmazonBedrockRanker:
                 "See https://boto3.amazonaws.com/v1/documentation/api/latest/guide/quickstart.html#configuration"
             )
             raise AmazonBedrockConfigurationError(msg) from exception
+
+    def close(self) -> None:
+        """Close the Amazon Bedrock client."""
+        if self._bedrock_client is not None:
+            self._bedrock_client.close()
+            self._bedrock_client = None
 
     def to_dict(self) -> dict[str, Any]:
         """
@@ -167,7 +187,7 @@ class AmazonBedrockRanker:
         concatenated_input_list = []
         for doc in documents:
             meta_values_to_embed = [
-                str(doc.meta[key]) for key in self.meta_fields_to_embed if key in doc.meta and doc.meta.get(key)
+                str(doc.meta[key]) for key in self.meta_fields_to_embed if doc.meta.get(key) is not None
             ]
             concatenated_input = self.meta_data_separator.join([*meta_values_to_embed, doc.content or ""])
             concatenated_input_list.append(concatenated_input)
@@ -191,16 +211,17 @@ class AmazonBedrockRanker:
 
         :raises ValueError: If `top_k` is not > 0.
         """
-        top_k = top_k or self.top_k
-        if top_k <= 0:
+        self.warm_up()
+        if top_k is not None and top_k <= 0:
             msg = f"top_k must be > 0, but got {top_k}"
             raise ValueError(msg)
+        top_k = self.top_k if top_k is None else top_k
 
         if not documents:
             return {"documents": []}
 
-        def resolve_secret(secret: Secret | None) -> str | None:
-            return secret.resolve_value() if secret else None
+        def resolve_secret(secret: Secret | str | None) -> str | None:
+            return secret.resolve_value() if isinstance(secret, Secret) else secret
 
         region = resolve_secret(self.aws_region_name)
 

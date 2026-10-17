@@ -1,5 +1,83 @@
 # Changelog
 
+## [integrations/arcadedb-v1.7.0] - 2026-10-06
+
+### 🐛 Bug Fixes
+
+-  fix: handle changed NULL semantics in arcadedb 26.10.1 (#4054)
+
+### 🧹 Chores
+
+- Switch remaining document stores to haystack.logging (#4011)
+
+
+## [integrations/arcadedb-v1.6.1] - 2026-09-24
+
+### 🐛 Bug Fixes
+
+- Fixing ArcadeDB delete_all_documents (#3989)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+
+## [integrations/arcadedb-v1.6.0] - 2026-09-01
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- `ArcadeDBDocumentStore` get_metadata_field_unique_values setting list of values to return to `Any` (#3715)
+- ArcadeDB adding optional parameter `filters` to `get_metadata_field_unique_values() ` (#3733)
+- Standardize license files (#3771)
+- `ArcadeDBDocumentStore` removing duplicated tests already covered by haystack Mixin tests + fix dedup (#3774)
+
+### 🧹 Chores
+
+- Re-standardize READMEs (#3768)
+
+
+## [integrations/arcadedb-v1.5.0] - 2026-07-23
+
+### 🚀 Features
+
+- Arcadedb - add closing methods (#3653)
+
+### 📚 Documentation
+
+- Replace old haystack core imports with haystack_integrations paths (#3545)
+
+
+## [integrations/arcadedb-v1.4.1] - 2026-06-16
+
+### 🐛 Bug Fixes
+
+- Make ArcadeDB include null records in NOT IN operation (#3452)
+
+
+## [integrations/arcadedb-v1.4.0] - 2026-06-09
+
+### 🐛 Bug Fixes
+
+- `ArcadeDB` does not support in-place updates, changing to: fetch, update write back docs (#3420)
+
+### 🧹 Chores
+
+- Arcadedb - use arcadedata/arcadedb:26.5.1 (#3357)
+
+
+## [integrations/arcadedb-v1.3.0] - 2026-05-19
+
+### 🐛 Bug Fixes
+
+- Arcade db sql injection (#3329)
+
+### 🧪 Testing
+
+- Track test coverage for all integrations (#3065)
+- Arcadedb - add unit tests (#3192)
+
+
 ## [integrations/arcadedb-v1.2.0] - 2026-03-24
 
 ### 🚀 Features

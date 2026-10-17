@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,6 +29,8 @@ from haystack_integrations.document_stores.qdrant.document_store import (
     SPARSE_VECTORS_NAME,
     QdrantDocumentStore,
     QdrantStoreError,
+    _build_rrf_query,
+    get_batches_from_generator,
 )
 
 
@@ -180,6 +183,249 @@ class TestQdrantDocumentStoreUnit:
             with pytest.raises(ValueError, match="different vector size"):
                 document_store._set_up_collection("test_collection", 768, False, "cosine", False, False)
 
+    def test_get_distance_known(self):
+        document_store = QdrantDocumentStore(location=":memory:")
+        assert document_store.get_distance("cosine") == rest.Distance.COSINE
+        assert document_store.get_distance("dot_product") == rest.Distance.DOT
+        assert document_store.get_distance("l2") == rest.Distance.EUCLID
+
+    def test_get_distance_unknown_raises(self):
+        document_store = QdrantDocumentStore(location=":memory:")
+        with pytest.raises(QdrantStoreError, match="not supported"):
+            document_store.get_distance("unknown")
+
+    def test_validate_filters_accepts_dict_and_native(self):
+        QdrantDocumentStore._validate_filters(None)
+        QdrantDocumentStore._validate_filters({"operator": "==", "field": "meta.x", "value": 1})
+        QdrantDocumentStore._validate_filters(rest.Filter(must=[]))
+
+    def test_validate_filters_rejects_non_dict_non_filter(self):
+        with pytest.raises(ValueError, match="must be a dictionary"):
+            QdrantDocumentStore._validate_filters("not-a-filter")
+
+    def test_validate_filters_rejects_dict_without_operator(self):
+        with pytest.raises(ValueError, match="Invalid filter syntax"):
+            QdrantDocumentStore._validate_filters({"field": "meta.x"})
+
+    def test_check_stop_scrolling(self):
+        assert QdrantDocumentStore._check_stop_scrolling(None) is True
+        empty_offset = SimpleNamespace(num=0, uuid="")
+        assert QdrantDocumentStore._check_stop_scrolling(empty_offset) is True
+        non_empty_offset = SimpleNamespace(num=5, uuid="abc")
+        assert QdrantDocumentStore._check_stop_scrolling(non_empty_offset) is False
+
+    def test_infer_type_from_value(self):
+        assert QdrantDocumentStore._infer_type_from_value(True) == "boolean"
+        assert QdrantDocumentStore._infer_type_from_value(1) == "long"
+        assert QdrantDocumentStore._infer_type_from_value(1.5) == "float"
+        assert QdrantDocumentStore._infer_type_from_value("x") == "keyword"
+        assert QdrantDocumentStore._infer_type_from_value([1, 2]) == "keyword"
+
+    def test_process_records_fields_info(self):
+        records = [
+            SimpleNamespace(payload={"meta": {"category": "A", "score": 0.9, "missing": None}}),
+            SimpleNamespace(payload={"meta": {"category": "B"}}),  # category already seen
+            SimpleNamespace(payload=None),  # no payload
+            SimpleNamespace(payload={"other": "noise"}),  # no meta
+        ]
+        field_info: dict = {}
+        QdrantDocumentStore._process_records_fields_info(records, field_info)
+        assert field_info == {"category": {"type": "keyword"}, "score": {"type": "float"}}
+
+    def test_metadata_fields_info_from_schema(self):
+        schema = {
+            "meta.category": SimpleNamespace(data_type="keyword"),
+            "meta.priority": SimpleNamespace(data_type="integer"),
+            "meta.unknown": object(),  # no data_type attribute
+            "not_meta_prefixed": SimpleNamespace(data_type="keyword"),
+        }
+        fields = QdrantDocumentStore._metadata_fields_info_from_schema(schema)
+        assert fields == {
+            "category": {"type": "keyword"},
+            "priority": {"type": "integer"},
+            "unknown": {"type": "unknown"},
+        }
+
+    def test_process_records_min_max(self):
+        records = [
+            SimpleNamespace(payload={"meta": {"score": 0.5}}),
+            SimpleNamespace(payload={"meta": {"score": 0.9}}),
+            SimpleNamespace(payload={"meta": {"score": None}}),
+            SimpleNamespace(payload={"meta": {"other": 100}}),
+            SimpleNamespace(payload=None),
+        ]
+        min_v, max_v = QdrantDocumentStore._process_records_min_max(records, "score", None, None)
+        assert min_v == 0.5
+        assert max_v == 0.9
+
+    def test_process_records_count_unique(self):
+        records = [
+            SimpleNamespace(payload={"meta": {"category": "A", "tags": ["x"]}}),
+            SimpleNamespace(payload={"meta": {"category": "B", "tags": ["x"]}}),
+            SimpleNamespace(payload={"meta": {"category": "A", "tags": ["y"]}}),
+            SimpleNamespace(payload=None),
+        ]
+        unique: dict = {"category": set(), "tags": set()}
+        QdrantDocumentStore._process_records_count_unique(records, ["category", "tags"], unique)
+        assert len(unique["category"]) == 2
+        assert len(unique["tags"]) == 2
+
+    def test_process_records_count_unique_does_not_merge_different_types(self):
+        """Values that are `==` across types (`1 == True`, `1 == 1.0`) must still count as distinct."""
+        records = [
+            SimpleNamespace(payload={"meta": {"value": 1}}),
+            SimpleNamespace(payload={"meta": {"value": True}}),
+            SimpleNamespace(payload={"meta": {"value": 1.0}}),
+        ]
+        unique: dict = {"value": set()}
+        QdrantDocumentStore._process_records_count_unique(records, ["value"], unique)
+        assert len(unique["value"]) == 3
+
+    def test_process_records_unique_values_collects_all(self):
+        records = [SimpleNamespace(payload={"meta": {"v": i}}) for i in range(10)]
+        values: list = []
+        values_set: set = set()
+        QdrantDocumentStore._process_records_unique_values(records, "v", values, values_set)
+        assert values == list(range(10))
+
+    def test_process_records_unique_values_skips_missing_payload(self):
+        records = [SimpleNamespace(payload={"meta": {"v": 1}}), SimpleNamespace(payload=None)]
+        values: list = []
+        values_set: set = set()
+        QdrantDocumentStore._process_records_unique_values(records, "v", values, values_set)
+        assert values == [1]
+
+    def test_create_updated_point_from_record_adds_missing_meta(self):
+        record = SimpleNamespace(
+            id="abc",
+            payload={"content": "hello"},
+            vector=[0.1, 0.2],
+        )
+        point = QdrantDocumentStore._create_updated_point_from_record(record, {"status": "published"})
+        assert point.payload["meta"] == {"status": "published"}
+        assert point.payload["content"] == "hello"
+        assert point.vector == [0.1, 0.2]
+
+    def test_create_updated_point_from_record_merges_meta(self):
+        record = SimpleNamespace(
+            id="abc",
+            payload={"content": "hello", "meta": {"category": "A"}},
+            vector=None,
+        )
+        point = QdrantDocumentStore._create_updated_point_from_record(record, {"status": "published"})
+        assert point.payload["meta"] == {"category": "A", "status": "published"}
+        assert point.vector == {}
+
+    def test_drop_duplicate_documents(self):
+        document_store = QdrantDocumentStore(location=":memory:")
+        doc1 = Document(id="1", content="a")
+        doc2 = Document(id="2", content="b")
+        doc1_dup = Document(id="1", content="a")
+        result = document_store._drop_duplicate_documents([doc1, doc2, doc1_dup])
+        assert [d.id for d in result] == ["1", "2"]
+
+    def test_prepare_collection_config_without_sparse(self):
+        document_store = QdrantDocumentStore(location=":memory:", use_sparse_embeddings=False)
+        vectors_config, sparse_config = document_store._prepare_collection_config(
+            embedding_dim=768, distance=rest.Distance.COSINE
+        )
+        assert isinstance(vectors_config, rest.VectorParams)
+        assert sparse_config is None
+
+    def test_prepare_collection_config_with_sparse_and_idf(self):
+        document_store = QdrantDocumentStore(location=":memory:", use_sparse_embeddings=True)
+        vectors_config, sparse_config = document_store._prepare_collection_config(
+            embedding_dim=768, distance=rest.Distance.COSINE, sparse_idf=True
+        )
+        assert DENSE_VECTORS_NAME in vectors_config
+        assert sparse_config[SPARSE_VECTORS_NAME].modifier == rest.Modifier.IDF
+
+    def test_prepare_client_params_does_not_mutate_metadata(self):
+        metadata = {"key": "value"}
+        document_store = QdrantDocumentStore(location=":memory:", metadata=metadata)
+        params = document_store._prepare_client_params()
+        params["metadata"]["added"] = "x"
+        assert metadata == {"key": "value"}
+
+    def test_get_batches_from_generator(self):
+        batches = list(get_batches_from_generator([1, 2, 3, 4, 5], 2))
+        assert batches == [(1, 2), (3, 4), (5,)]
+        assert list(get_batches_from_generator([], 2)) == []
+
+    @pytest.mark.parametrize(
+        ("rrf_k", "rrf_weights", "expected_type"),
+        [
+            (None, None, rest.FusionQuery),
+            (20, None, rest.RrfQuery),
+            (None, [2.0, 1.0], rest.RrfQuery),
+            (20, [2.0, 1.0], rest.RrfQuery),
+        ],
+    )
+    def test_build_rrf_query(self, rrf_k, rrf_weights, expected_type):
+        query = _build_rrf_query(rrf_k=rrf_k, rrf_weights=rrf_weights)
+        assert isinstance(query, expected_type)
+        if expected_type is rest.RrfQuery:
+            if rrf_k is not None:
+                assert query.rrf.k == rrf_k
+            if rrf_weights is not None:
+                assert query.rrf.weights == rrf_weights
+
+    def test_query_by_sparse_raises_when_sparse_disabled(self):
+        document_store = QdrantDocumentStore(location=":memory:", use_sparse_embeddings=False)
+        sparse_embedding = SparseEmbedding(indices=[0, 1], values=[0.1, 0.2])
+        with pytest.raises(QdrantStoreError, match="use_sparse_embeddings=False"):
+            document_store._query_by_sparse(query_sparse_embedding=sparse_embedding)
+
+    @pytest.mark.parametrize(
+        ("method_name", "args"),
+        [
+            ("count_documents", ()),
+            ("delete_all_documents", (False,)),
+            ("delete_all_documents", (True,)),
+            ("count_documents_by_filter", ({},)),
+            ("get_metadata_fields_info", ()),
+            ("get_metadata_field_min_max", ("score",)),
+            ("count_unique_metadata_by_filter", ({}, ["category"])),
+            ("get_metadata_field_unique_values", ("category",)),
+        ],
+    )
+    def test_operations_raise_on_client_errors(self, method_name, args):
+        document_store = QdrantDocumentStore(location=":memory:")
+        document_store._initialize_client()
+        err = ValueError("boom")
+        with (
+            patch.object(document_store._client, "count", side_effect=err),
+            patch.object(document_store._client, "scroll", side_effect=err),
+            patch.object(document_store._client, "get_collection", side_effect=err),
+            patch.object(document_store._client, "delete", side_effect=err),
+        ):
+            with pytest.raises(QdrantStoreError) as exc_info:
+                getattr(document_store, method_name)(*args)
+            assert exc_info.value.__cause__ is err
+
+    def test_close(self):
+        document_store = QdrantDocumentStore(location=":memory:")
+        mock_client = MagicMock()
+        document_store._client = mock_client
+
+        document_store.close()
+
+        mock_client.close.assert_called_once()
+        assert document_store._client is None
+
+        document_store.close()
+        mock_client.close.assert_called_once()
+
+    def test_close_is_exception_safe(self):
+        document_store = QdrantDocumentStore(location=":memory:")
+        mock_client = MagicMock()
+        mock_client.close.side_effect = RuntimeError("boom")
+        document_store._client = mock_client
+
+        document_store.close()
+
+        assert document_store._client is None
+
 
 @pytest.mark.integration
 class TestQdrantDocumentStore(
@@ -218,6 +464,16 @@ class TestQdrantDocumentStore(
 
         # Check that the sets are equal, meaning the content and IDs match regardless of order
         assert {doc.id for doc in received} == {doc.id for doc in expected}
+
+    def test_close_and_reopen(self, document_store: QdrantDocumentStore):
+        assert document_store.count_documents() == 0
+        assert document_store._client is not None
+
+        document_store.close()
+
+        assert document_store._client is None
+        assert document_store.count_documents() == 0
+        assert document_store._client is not None
 
     def test_prepare_client_params_no_mutability(self):
         metadata = {"key": "value"}
@@ -371,33 +627,3 @@ class TestQdrantDocumentStore(
         assert len(updated_docs) == 1
         assert updated_docs[0].embedding is not None
         assert len(updated_docs[0].embedding) == 768
-
-    def test_get_metadata_field_unique_values_pagination(self, document_store: QdrantDocumentStore):
-        """Test getting unique metadata field values with pagination."""
-        docs = [Document(content=f"Doc {i}", meta={"value": i % 5}) for i in range(10)]
-        document_store.write_documents(docs)
-
-        # Get first 2 unique values
-        values_page_1 = document_store.get_metadata_field_unique_values("value", limit=2, offset=0)
-        assert len(values_page_1) == 2
-
-        # Get next 2 unique values
-        values_page_2 = document_store.get_metadata_field_unique_values("value", limit=2, offset=2)
-        assert len(values_page_2) == 2
-
-        # Values should not overlap
-        assert set(values_page_1) != set(values_page_2)
-
-    def test_get_metadata_field_unique_values_with_filter(self, document_store: QdrantDocumentStore):
-        """Test getting unique metadata field values with filtering."""
-        docs = [
-            Document(content="Doc 1", meta={"category": "A", "status": "active"}),
-            Document(content="Doc 2", meta={"category": "B", "status": "active"}),
-            Document(content="Doc 3", meta={"category": "A", "status": "inactive"}),
-        ]
-        document_store.write_documents(docs)
-
-        values = document_store.get_metadata_field_unique_values(
-            "category", filters={"field": "meta.status", "operator": "==", "value": "active"}
-        )
-        assert set(values) == {"A", "B"}

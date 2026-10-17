@@ -2,13 +2,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import suppress
 from typing import Any, Literal, overload
 
 from haystack import default_from_dict, default_to_dict, logging
 from haystack.dataclasses.document import Document
 from haystack.document_stores.errors import DocumentStoreError, DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
-from haystack.utils.auth import Secret, deserialize_secrets_inplace
+from haystack.errors import FilterError
+from haystack.utils.auth import Secret
 from psycopg import AsyncConnection, Connection, Cursor, Error, IntegrityError
 from psycopg.cursor_async import AsyncCursor
 from psycopg.rows import DictRow, dict_row
@@ -220,8 +222,29 @@ class PgvectorDocumentStore:
         :returns:
             Deserialized component.
         """
-        deserialize_secrets_inplace(data["init_parameters"], ["connection_string"])
         return default_from_dict(cls, data)
+
+    def close(self) -> None:
+        """
+        Release the associated synchronous resources.
+        """
+        if self._connection is not None:
+            with suppress(Exception):
+                self._connection.close()
+            self._connection = None
+            self._cursor = None
+            self._dict_cursor = None
+
+    async def close_async(self) -> None:
+        """
+        Release the associated asynchronous resources.
+        """
+        if self._async_connection is not None:
+            with suppress(Exception):
+                await self._async_connection.close()
+            self._async_connection = None
+            self._async_cursor = None
+            self._async_dict_cursor = None
 
     @staticmethod
     def _connection_is_valid(connection: Connection) -> bool:
@@ -900,7 +923,7 @@ class PgvectorDocumentStore:
             )
             raise DocumentStoreError(error_msg) from e
 
-        # get the number of the inserted documents, inspired by psycopg3 docs
+        # executemany(returning=True) yields one result set per document, so walk them all with nextset()
         # https://www.psycopg.org/psycopg3/docs/api/cursors.html#psycopg.Cursor.executemany
         written_docs = 0
         while True:
@@ -957,9 +980,14 @@ class PgvectorDocumentStore:
             )
             raise DocumentStoreError(error_msg) from e
 
+        # executemany(returning=True) yields one result set per document, so walk them all with nextset()
+        # https://www.psycopg.org/psycopg3/docs/api/cursors.html#psycopg.Cursor.executemany
         written_docs = 0
-        async for _ in self._async_cursor:
-            written_docs += 1
+        while True:
+            if await self._async_cursor.fetchone():
+                written_docs += 1
+            if not self._async_cursor.nextset():
+                break
 
         return written_docs
 
@@ -1050,18 +1078,21 @@ class PgvectorDocumentStore:
         :param filters: The filters to apply to select documents for deletion.
             For filter syntax, see [Haystack metadata filtering](https://docs.haystack.deepset.ai/docs/metadata-filtering)
         :returns: The number of documents deleted.
+        :raises FilterError: If `filters` is empty. Use `delete_all_documents()` to delete everything.
         """
         _validate_filters(filters)
+        if not filters:
+            # An empty filter would compile to an unqualified DELETE and empty the table
+            msg = "delete_by_filter requires a non-empty filter. Use delete_all_documents() to delete every document."
+            raise FilterError(msg)
 
         delete_sql = SQL("DELETE FROM {schema_name}.{table_name}").format(
             schema_name=Identifier(self.schema_name),
             table_name=Identifier(self.table_name),
         )
 
-        params = ()
-        if filters:
-            sql_where_clause, params = _convert_filters_to_where_clause_and_params(filters)
-            delete_sql += sql_where_clause
+        sql_where_clause, params = _convert_filters_to_where_clause_and_params(filters)
+        delete_sql += sql_where_clause
 
         self._ensure_db_setup()
         assert self._cursor is not None
@@ -1092,18 +1123,24 @@ class PgvectorDocumentStore:
         :param filters: The filters to apply to select documents for deletion.
             For filter syntax, see [Haystack metadata filtering](https://docs.haystack.deepset.ai/docs/metadata-filtering)
         :returns: The number of documents deleted.
+        :raises FilterError: If `filters` is empty. Use `delete_all_documents_async()` to delete everything.
         """
         _validate_filters(filters)
+        if not filters:
+            # An empty filter would compile to an unqualified DELETE and empty the table
+            msg = (
+                "delete_by_filter_async requires a non-empty filter. "
+                "Use delete_all_documents_async() to delete every document."
+            )
+            raise FilterError(msg)
 
         delete_sql = SQL("DELETE FROM {schema_name}.{table_name}").format(
             schema_name=Identifier(self.schema_name),
             table_name=Identifier(self.table_name),
         )
 
-        params = ()
-        if filters:
-            sql_where_clause, params = _convert_filters_to_where_clause_and_params(filters)
-            delete_sql += sql_where_clause
+        sql_where_clause, params = _convert_filters_to_where_clause_and_params(filters)
+        delete_sql += sql_where_clause
 
         await self._ensure_db_setup_async()
         assert self._async_cursor is not None
@@ -1351,10 +1388,13 @@ class PgvectorDocumentStore:
         # cosine_similarity and inner_product are modified from the result of the operator
         if vector_function == "cosine_similarity":
             score_definition = f"1 - (embedding <=> {query_embedding_for_postgres}) AS score"
+            order_by_definition = f"embedding <=> {query_embedding_for_postgres}"
         elif vector_function == "inner_product":
             score_definition = f"(embedding <#> {query_embedding_for_postgres}) * -1 AS score"
+            order_by_definition = f"embedding <#> {query_embedding_for_postgres}"
         elif vector_function == "l2_distance":
             score_definition = f"embedding <-> {query_embedding_for_postgres} AS score"
+            order_by_definition = f"embedding <-> {query_embedding_for_postgres}"
 
         sql_select = SQL("SELECT *, {score} FROM {schema_name}.{table_name}").format(
             schema_name=Identifier(self.schema_name),
@@ -1367,13 +1407,9 @@ class PgvectorDocumentStore:
         if filters:
             sql_where_clause, params = _convert_filters_to_where_clause_and_params(filters)
 
-        # we always want to return the most similar documents first
-        # so when using l2_distance, the sort order must be ASC
-        sort_order = "ASC" if vector_function == "l2_distance" else "DESC"
-
-        sql_sort = SQL(" ORDER BY score {sort_order} LIMIT {top_k}").format(
+        sql_sort = SQL(" ORDER BY {order_by} ASC LIMIT {top_k}").format(
             top_k=SQLLiteral(top_k),
-            sort_order=SQL(sort_order),
+            order_by=SQL(order_by_definition),
         )
 
         sql_query = sql_select + sql_where_clause + sql_sort
@@ -1669,7 +1705,7 @@ class PgvectorDocumentStore:
         :param records: List of database records containing 'meta' field.
         :returns: A dictionary mapping field names to their type information.
         """
-        fields_info: dict[str, dict[str, str]] = {"content": {"type": "text"}}
+        fields_info: dict[str, dict[str, str]] = {}
 
         # Analyze metadata from all documents
         for record in records:
@@ -1706,7 +1742,6 @@ class PgvectorDocumentStore:
         Example return:
         ```python
         {
-            'content': {'type': 'text'},
             'category': {'type': 'text'},
             'status': {'type': 'text'},
             'priority': {'type': 'integer'},
@@ -1846,15 +1881,14 @@ class PgvectorDocumentStore:
         :returns: A dictionary with 'min' and 'max' keys containing the minimum and maximum values.
             For numeric fields (integer, real), returns numeric min/max.
             For text fields, returns lexicographic min/max based on database collation.
-        :raises ValueError: If the field doesn't exist or has no values.
+            Returns `{"min": None, "max": None}` when the field has no values or the store is empty.
         """
         normalized_field = PgvectorDocumentStore._normalize_metadata_field_name(metadata_field)
 
         # Get field type information from metadata fields info
         fields_info = self.get_metadata_fields_info()
         if normalized_field not in fields_info:
-            msg = f"Metadata field '{metadata_field}' not found in document store"
-            raise ValueError(msg)
+            return {"min": None, "max": None}
 
         field_type = fields_info[normalized_field]["type"]
         sql_query = self._build_min_max_query(normalized_field, field_type)
@@ -1879,15 +1913,14 @@ class PgvectorDocumentStore:
         :returns: A dictionary with 'min' and 'max' keys containing the minimum and maximum values.
             For numeric fields (integer, real), returns numeric min/max.
             For text fields, returns lexicographic min/max based on database collation.
-        :raises ValueError: If the field doesn't exist or has no values.
+            Returns ``{"min": None, "max": None}`` when the field has no values or the store is empty.
         """
         normalized_field = PgvectorDocumentStore._normalize_metadata_field_name(metadata_field)
 
         # Get field type information from metadata fields info
         fields_info = await self.get_metadata_fields_info_async()
         if normalized_field not in fields_info:
-            msg = f"Metadata field '{metadata_field}' not found in document store"
-            raise ValueError(msg)
+            return {"min": None, "max": None}
 
         field_type = fields_info[normalized_field]["type"]
         sql_query = self._build_min_max_query(normalized_field, field_type)
@@ -1907,36 +1940,53 @@ class PgvectorDocumentStore:
         return {"min": min_value, "max": max_value}
 
     def _build_unique_values_queries(
-        self, normalized_field: str, search_term: str | None, from_: int, size: int
+        self,
+        normalized_field: str,
+        search_term: str | None,
+        from_: int,
+        size: int,
+        filters: dict[str, Any] | None = None,
     ) -> tuple[Composed, Composed, tuple]:
         """
         Builds SQL queries for getting unique metadata field values.
 
         :param normalized_field: The normalized metadata field name.
-        :param search_term: Optional search term to filter documents by content.
+        :param search_term: Optional search term to filter unique values by a case-insensitive substring match
+            against the metadata field's own value.
         :param from_: The offset for pagination (0-based).
         :param size: The number of unique values to return.
+        :param filters: Optional filters to restrict the documents considered.
         :returns: A tuple containing (count_query, select_query, params).
         """
         field_literal = SQLLiteral(normalized_field)
 
         # base query components
-        sql_select = SQL("SELECT DISTINCT meta->>{} AS value").format(field_literal)
+        # Use the `->` (jsonb) operator rather than `->>` (text) so DISTINCT/ORDER BY operate on the
+        # value's original JSON type (numbers sort numerically, not lexicographically) and psycopg
+        # decodes the result to its native Python type instead of a string.
+        #
+        # Not fixable here: JSONB equality treats a whole-number float (1.0) as identical to a
+        # numerically equal int (1), so DISTINCT still collapses them - see this method's docstring.
+        sql_select = SQL("SELECT DISTINCT meta->{} AS value").format(field_literal)
         sql_from = SQL(" FROM {schema_name}.{table_name}").format(
             schema_name=Identifier(self.schema_name), table_name=Identifier(self.table_name)
         )
         sql_where = SQL(" WHERE meta->>{} IS NOT NULL").format(field_literal)
 
         params: tuple = ()
+        if filters:
+            _validate_filters(filters)
+            filters_where_clause, filters_params = _convert_filters_to_where_clause_and_params(filters, operator="AND")
+            sql_where += filters_where_clause
+            params += filters_params
+
         if search_term:
-            # Use full-text search with word boundaries (similar to keyword retrieval)
-            sql_where += SQL(" AND to_tsvector({language}, content) @@ plainto_tsquery({language}, %s)").format(
-                language=SQLLiteral(self.language)
-            )
-            params = (search_term,)
+            # Case-insensitive substring match against the metadata field's own (text) value.
+            sql_where += SQL(" AND meta->>{} ILIKE %s").format(field_literal)
+            params += (f"%{search_term}%",)
 
         # count query
-        sql_count = SQL("SELECT COUNT(DISTINCT meta->>{} ) AS total").format(field_literal)
+        sql_count = SQL("SELECT COUNT(DISTINCT meta->{} ) AS total").format(field_literal)
         sql_count += sql_from + sql_where
 
         # paginated select query
@@ -1950,7 +2000,7 @@ class PgvectorDocumentStore:
     @staticmethod
     def _process_unique_values_result(
         count_result: dict[str, Any] | None, records: list[dict[str, Any]]
-    ) -> tuple[list[str], int]:
+    ) -> tuple[list[Any], int]:
         """
         Processes the results from unique values queries.
 
@@ -1959,26 +2009,40 @@ class PgvectorDocumentStore:
         :returns: A tuple containing (unique_values, total_count).
         """
         total_count = count_result.get("total", 0) if count_result else 0
-        unique_values = [str(record.get("value", "")) for record in records if record.get("value") is not None]
+        unique_values = [record.get("value") for record in records if record.get("value") is not None]
         return unique_values, total_count
 
     def get_metadata_field_unique_values(
-        self, metadata_field: str, search_term: str | None, from_: int, size: int
-    ) -> tuple[list[str], int]:
+        self,
+        metadata_field: str,
+        search_term: str | None = None,
+        from_: int = 0,
+        size: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], int]:
         """
         Returns unique values for a given metadata field, optionally filtered by a search term.
 
+        **Note**: values of different JSON type categories are kept distinct - a string, a number and
+        a boolean never collapse into each other, even when they share a textual form (e.g. the string
+        `"1"` and the number `1`). One exception: the ``meta`` column is JSONB, whose equality treats a
+        whole-number float (`1.0`) as identical to a numerically equal int (`1`), so those two collapse
+        into a single value. Floats with a fractional part (e.g. `1.5`) are unaffected.
+
         :param metadata_field: The name of the metadata field. Can include or omit the "meta." prefix.
-        :param search_term: Optional search term to filter documents by content before extracting unique values.
-            If None, all documents are considered.
+        :param search_term: Optional search term to filter unique values by a case-insensitive substring
+            match against the metadata field's own value. If None, all values are considered.
         :param from_: The offset for pagination (0-based).
         :param size: The number of unique values to return.
+        :param filters: Optional filters to restrict the documents considered.
         :returns: A tuple containing:
-            - A list of unique values (as strings)
+            - A list of unique values in their original type
             - The total count of unique values
         """
         normalized_field = PgvectorDocumentStore._normalize_metadata_field_name(metadata_field)
-        sql_count, sql_query, params = self._build_unique_values_queries(normalized_field, search_term, from_, size)
+        sql_count, sql_query, params = self._build_unique_values_queries(
+            normalized_field, search_term, from_, size, filters
+        )
 
         self._ensure_db_setup()
         assert self._dict_cursor is not None
@@ -2001,22 +2065,36 @@ class PgvectorDocumentStore:
         return PgvectorDocumentStore._process_unique_values_result(count_result, records)
 
     async def get_metadata_field_unique_values_async(
-        self, metadata_field: str, search_term: str | None, from_: int, size: int
-    ) -> tuple[list[str], int]:
+        self,
+        metadata_field: str,
+        search_term: str | None = None,
+        from_: int = 0,
+        size: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], int]:
         """
         Asynchronously returns unique values for a given metadata field, optionally filtered by a search term.
 
+        **Note**: values of different JSON type categories are kept distinct - a string, a number and
+        a boolean never collapse into each other, even when they share a textual form (e.g. the string
+        `"1"` and the number `1`). One exception: the ``meta`` column is JSONB, whose equality treats a
+        whole-number float (`1.0`) as identical to a numerically equal int (`1`), so those two collapse
+        into a single value. Floats with a fractional part (e.g. `1.5`) are unaffected.
+
         :param metadata_field: The name of the metadata field. Can include or omit the "meta." prefix.
-        :param search_term: Optional search term to filter documents by content before extracting unique values.
-            If None, all documents are considered.
+        :param search_term: Optional search term to filter unique values by a case-insensitive substring
+            match against the metadata field's own value. If None, all values are considered.
         :param from_: The offset for pagination (0-based).
         :param size: The number of unique values to return.
+        :param filters: Optional filters to restrict the documents considered.
         :returns: A tuple containing:
-            - A list of unique values (as strings)
+            - A list of unique values in their original type
             - The total count of unique values
         """
         normalized_field = PgvectorDocumentStore._normalize_metadata_field_name(metadata_field)
-        sql_count, sql_query, params = self._build_unique_values_queries(normalized_field, search_term, from_, size)
+        sql_count, sql_query, params = self._build_unique_values_queries(
+            normalized_field, search_term, from_, size, filters
+        )
 
         await self._ensure_db_setup_async()
         assert self._async_dict_cursor is not None

@@ -3,8 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import base64
-import datetime
+import datetime as dt
+import importlib.metadata
 import json
+from contextlib import suppress
 from dataclasses import asdict
 from typing import Any, NoReturn
 
@@ -36,6 +38,27 @@ from ._filters import convert_filters, validate_filters
 from .auth import AuthCredentials
 
 logger = logging.getLogger(__name__)
+
+# Weaviate tracks which framework integrations talk to it through this header, so that adoption of
+# weaviate-haystack shows up in Weaviate's own telemetry. See https://github.com/weaviate/weaviate/pull/10535.
+_INTEGRATION_HEADER = "X-Weaviate-Client-Integration"
+_INTEGRATION_NAME = "haystack-python"
+_PACKAGE_NAME = "weaviate-haystack"
+
+
+def _integration_header_value() -> str:
+    """
+    Builds the value of the Weaviate client integration header.
+
+    :returns:
+        A `<name>/<version>` string. The version falls back to `unknown` when the package metadata is
+        unavailable, for example when running from a source checkout that was never installed.
+    """
+    try:
+        version = importlib.metadata.version(_PACKAGE_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        version = "unknown"
+    return f"{_INTEGRATION_NAME}/{version}"
 
 
 # This is the default collection properties for Weaviate.
@@ -143,6 +166,9 @@ class WeaviateDocumentStore:
             ```
             {"X-OpenAI-Api-Key": "<THE-KEY>"}, {"X-HuggingFace-Api-Key": "<THE-KEY>"}
             ```
+            Every connection also carries `X-Weaviate-Client-Integration: haystack-python/<version>`, which
+            identifies this integration in Weaviate's telemetry. Supplying that header here, in any casing,
+            overrides it.
         :param embedded_options:
             If set, create an embedded Weaviate cluster inside the client. For a full list of options see
             `weaviate.embedded.EmbeddedOptions`.
@@ -182,6 +208,26 @@ class WeaviateDocumentStore:
             "properties", DOCUMENT_COLLECTION_PROPERTIES
         )
 
+    def _connection_headers(self) -> dict[str, Any]:
+        """
+        Builds the headers passed to the Weaviate client.
+
+        Merges the integration identification header into the user supplied `additional_headers`. A user
+        supplied value for the same header wins, so the header can be overridden or suppressed. The merged
+        headers are deliberately not stored on the instance: `to_dict()` must keep serializing only the
+        headers the user actually passed, so that a serialized pipeline does not bake in the version of
+        `weaviate-haystack` that happened to write it.
+
+        :returns:
+            The headers to pass to the Weaviate client.
+        """
+        headers: dict[str, Any] = dict(self._additional_headers) if self._additional_headers else {}
+        # The comparison is case insensitive because gRPC metadata keys are case sensitive: a user supplied
+        # "x-weaviate-client-integration" would otherwise end up alongside our own spelling of the header.
+        if not any(key.lower() == _INTEGRATION_HEADER.lower() for key in headers):
+            headers[_INTEGRATION_HEADER] = _integration_header_value()
+        return headers
+
     @property
     def client(self) -> weaviate.WeaviateClient:
         """Return the synchronous Weaviate client, creating and connecting it if necessary."""
@@ -198,7 +244,7 @@ class WeaviateDocumentStore:
             self._client = weaviate.connect_to_weaviate_cloud(
                 self._url,
                 auth_credentials=self._auth_client_secret.resolve_value(),
-                headers=self._additional_headers,
+                headers=self._connection_headers(),
                 additional_config=self._additional_config,
             )
         else:
@@ -215,7 +261,7 @@ class WeaviateDocumentStore:
                 ),
                 auth_client_secret=self._auth_client_secret.resolve_value() if self._auth_client_secret else None,
                 additional_config=self._additional_config,
-                additional_headers=self._additional_headers,
+                additional_headers=self._connection_headers(),
                 embedded_options=self._embedded_options,
                 skip_init_checks=False,
             )
@@ -243,7 +289,7 @@ class WeaviateDocumentStore:
             self._async_client = weaviate.use_async_with_weaviate_cloud(
                 self._url,
                 auth_credentials=self._auth_client_secret.resolve_value(),
-                headers=self._additional_headers,
+                headers=self._connection_headers(),
                 additional_config=self._additional_config,
             )
         else:
@@ -260,7 +306,7 @@ class WeaviateDocumentStore:
                 ),
                 auth_client_secret=self._auth_client_secret.resolve_value() if self._auth_client_secret else None,
                 additional_config=self._additional_config,
-                additional_headers=self._additional_headers,
+                additional_headers=self._connection_headers(),
                 embedded_options=self._embedded_options,
                 skip_init_checks=False,
             )
@@ -294,19 +340,21 @@ class WeaviateDocumentStore:
 
     def close(self) -> None:
         """
-        Close the synchronous Weaviate client connection.
+        Release the associated synchronous resources.
         """
-        if self._client:
-            self._client.close()
+        if self._client is not None:
+            with suppress(Exception):
+                self._client.close()
             self._client = None
             self._collection = None
 
     async def close_async(self) -> None:
         """
-        Close the asynchronous Weaviate client connection.
+        Release the associated asynchronous resources.
         """
-        if self._async_client:
-            await self._async_client.close()
+        if self._async_client is not None:
+            with suppress(Exception):
+                await self._async_client.close()
             self._async_client = None
             self._async_collection = None
 
@@ -325,6 +373,8 @@ class WeaviateDocumentStore:
         return default_to_dict(
             self,
             url=self._url,
+            grpc_port=self._grpc_port,
+            grpc_secure=self._grpc_secure,
             collection_settings=self._collection_settings,
             auth_client_secret=self._auth_client_secret.to_dict() if self._auth_client_secret else None,
             additional_headers=self._additional_headers,
@@ -491,7 +541,9 @@ class WeaviateDocumentStore:
             msg = f"Field type '{data_type_str}' doesn't support min/max aggregation"
             raise ValueError(msg)
 
-        result = self.collection.aggregate.over_all(return_metrics=metrics)
+        result = self.collection.aggregate.over_all(return_metrics=metrics, total_count=True)
+        if not result.total_count:
+            return {"min": None, "max": None}
         field_metrics = result.properties.get(field_name)
 
         return {
@@ -539,7 +591,9 @@ class WeaviateDocumentStore:
             msg = f"Field type '{data_type_str}' doesn't support min/max aggregation"
             raise ValueError(msg)
 
-        result = await collection.aggregate.over_all(return_metrics=metrics)
+        result = await collection.aggregate.over_all(return_metrics=metrics, total_count=True)
+        if not result.total_count:
+            return {"min": None, "max": None}
         field_metrics = result.properties.get(field_name)
 
         return {
@@ -559,8 +613,10 @@ class WeaviateDocumentStore:
         :returns: A dictionary mapping field names to counts of unique values.
         :raises ValueError: If any of the requested fields don't exist in the collection schema.
         """
-        validate_filters(filters)
-        weaviate_filter = convert_filters(filters)
+        weaviate_filter = None
+        if filters:
+            validate_filters(filters)
+            weaviate_filter = convert_filters(filters)
 
         normalized_fields = [_normalize_metadata_field_name(f) for f in metadata_fields]
 
@@ -595,9 +651,12 @@ class WeaviateDocumentStore:
         :returns: A dictionary mapping field names to counts of unique values.
         :raises ValueError: If any of the requested fields don't exist in the collection schema.
         """
-        validate_filters(filters)
+        weaviate_filter = None
+        if filters:
+            validate_filters(filters)
+            weaviate_filter = convert_filters(filters)
+
         collection = await self.async_collection
-        weaviate_filter = convert_filters(filters)
 
         normalized_fields = [_normalize_metadata_field_name(f) for f in metadata_fields]
 
@@ -618,76 +677,121 @@ class WeaviateDocumentStore:
 
         return result
 
-    def get_metadata_field_unique_values(
-        self,
-        metadata_field: str,
-        search_term: str | None = None,
-        from_: int = 0,
-        size: int = 10000,
-    ) -> tuple[list[str], int]:
+    @staticmethod
+    def _compute_field_unique_values(
+        agg_result: Any, search_term: str | None, from_: int, size: int
+    ) -> tuple[list[Any], int]:
         """
-        Returns unique values for a metadata field with pagination support.
+        Computes paginated unique values from a Weaviate group-by aggregation result.
 
-        :param metadata_field: The metadata field name to get unique values for.
-            Can be prefixed with 'meta.' (e.g., 'meta.category' or 'category').
-        :param search_term: Optional term to filter documents by content before
-            extracting unique values. If provided, only documents whose content
-            contains this term will be considered.
-            Note: Uses substring matching (case-sensitive, no stemming).
-        :param from_: The starting offset for pagination (0-indexed). Defaults to 0.
-        :param size: The maximum number of unique values to return. Defaults to 10000.
-        :returns: A tuple of (list of unique values, total count of unique values).
-        :raises ValueError: If the field is not found in the collection schema.
+        Weaviate's `like` filter only supports case-sensitive substring matching, so instead of
+        filtering server-side (which would be case-sensitive), all groups are fetched unconditionally
+        and `search_term` is applied here as a case-insensitive substring match in Python.
+
+        :param agg_result: The group-by aggregation result, with one group per unique field value.
+        :param search_term: Optional term to filter the values by, matched as a case-insensitive
+            substring against each value.
+        :param from_: The starting offset for pagination (0-indexed).
+        :param size: The maximum number of unique values to return.
+        :returns: A tuple of (paginated list of unique values in their original type, total count of
+            unique values). See `get_metadata_field_unique_values`'s docstring for a caveat on scalar
+            int fields - `agg_result`'s numeric group keys always decode as `float`.
         """
-        field_name = _normalize_metadata_field_name(metadata_field)
-
-        config = self.collection.config.get()
-        schema_fields = {prop.name for prop in config.properties}
-        if field_name not in schema_fields:
-            msg = f"Field '{field_name}' not found in collection schema"
-            raise ValueError(msg)
-
-        weaviate_filter = None
+        all_values = [g.grouped_by.value for g in agg_result.groups] if agg_result.groups else []
         if search_term:
-            weaviate_filter = convert_filters({"field": "content", "operator": "contains", "value": search_term})
-
-        # Weaviate's GroupByAggregate has a default limit of 100 groups.
-        # We use the document count as the limit to ensure all unique values are retrieved,
-        # since the number of unique values cannot exceed the number of documents.
-        doc_count = self.collection.aggregate.over_all(total_count=True).total_count or 0
-
-        agg_result = self.collection.aggregate.over_all(
-            filters=weaviate_filter, group_by=GroupByAggregate(prop=field_name, limit=doc_count)
-        )
-
-        all_values = [str(g.grouped_by.value) for g in agg_result.groups] if agg_result.groups else []
-        all_values.sort()  # Sort for consistent pagination
+            search_term_lower = search_term.lower()
+            all_values = [value for value in all_values if search_term_lower in str(value).lower()]
+        all_values.sort(key=str)  # Sort for consistent pagination
         total_count = len(all_values)
 
         paginated_values = all_values[from_ : from_ + size]
 
         return paginated_values, total_count
 
+    def get_metadata_field_unique_values(
+        self,
+        metadata_field: str,
+        search_term: str | None = None,
+        from_: int = 0,
+        size: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], int]:
+        """
+        Returns unique values for a metadata field with pagination support.
+
+        :param metadata_field: The metadata field name to get unique values for.
+            Can be prefixed with 'meta.' (e.g., 'meta.category' or 'category').
+        :param search_term: Optional term to filter the metadata field's values by
+            before returning them. If provided, only values of `metadata_field` that
+            contain this term will be considered.
+            Note: Uses case-insensitive substring matching (no stemming).
+        :param from_: The starting offset for pagination (0-indexed). Defaults to 0.
+        :param size: The maximum number of unique values to return. Defaults to 10.
+        :param filters: Optional filters to restrict the documents considered.
+        :returns: A tuple of (list of unique values in their original type, total count of unique values).
+
+        **Note**: a scalar `int` metadata value comes back as `float`, not `int`. weaviate-client has no
+        wire-protocol field for a scalar int - non-list properties are packed into a
+        `google.protobuf.Struct`, whose `Value` type only has `number_value` (a double), so the int/float
+        distinction is lost before the value reaches Weaviate. `GroupByAggregate` decodes numeric group
+        keys the same way, so this holds even when the field's schema type is explicitly `DataType.INT`.
+        List-valued int fields (e.g. `meta={"tags": [1, 2]}`) are unaffected - those go through a
+        dedicated `IntArrayProperties` wire type instead.
+        """
+        field_name = _normalize_metadata_field_name(metadata_field)
+
+        config = self.collection.config.get()
+        schema_fields = {prop.name for prop in config.properties}
+        if field_name not in schema_fields:
+            # No document has ever written this field, so Weaviate's auto-schema never created a
+            # property for it - there are no values to aggregate.
+            return [], 0
+
+        weaviate_filter = None
+        if filters:
+            validate_filters(filters)
+            weaviate_filter = convert_filters(filters)
+
+        # Weaviate's GroupByAggregate has a default limit of 100 groups.
+        # We use the document count as the limit to ensure all unique values are retrieved,
+        # since the number of unique values cannot exceed the number of documents.
+        doc_count = self.collection.aggregate.over_all(filters=weaviate_filter, total_count=True).total_count or 0
+
+        agg_result = self.collection.aggregate.over_all(
+            filters=weaviate_filter, group_by=GroupByAggregate(prop=field_name, limit=doc_count)
+        )
+
+        return self._compute_field_unique_values(agg_result, search_term, from_, size)
+
     async def get_metadata_field_unique_values_async(
         self,
         metadata_field: str,
         search_term: str | None = None,
         from_: int = 0,
-        size: int = 10000,
-    ) -> tuple[list[str], int]:
+        size: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], int]:
         """
         Asynchronously returns unique values for a metadata field with pagination support.
 
         :param metadata_field: The metadata field name to get unique values for.
             Can be prefixed with 'meta.' (e.g., 'meta.category' or 'category').
-        :param search_term: Optional term to filter documents by content before
-            extracting unique values. If provided, only documents whose content
-            contains this term will be considered.
-            Note: Uses substring matching (case-sensitive, no stemming).
+        :param search_term: Optional term to filter the metadata field's values by
+            before returning them. If provided, only values of `metadata_field` that
+            contain this term will be considered.
+            Note: Uses case-insensitive substring matching (no stemming).
         :param from_: The starting offset for pagination (0-indexed). Defaults to 0.
-        :param size: The maximum number of unique values to return. Defaults to 10000.
-        :returns: A tuple of (list of unique values, total count of unique values).
-        :raises ValueError: If the field is not found in the collection schema.
+        :param size: The maximum number of unique values to return. Defaults to 10.
+        :param filters: Optional filters to restrict the documents considered.
+        :returns: A tuple of (list of unique values in their original type, total count of unique values).
+
+        **Note**: a scalar `int` metadata value comes back as `float`, not `int`. weaviate-client has no
+        wire-protocol field for a scalar int - non-list properties are packed into a
+        `google.protobuf.Struct`, whose `Value` type only has `number_value` (a double), so the int/float
+        distinction is lost before the value reaches Weaviate. `GroupByAggregate` decodes numeric group
+        keys the same way, so this holds even when the field's schema type is explicitly `DataType.INT`.
+        List-valued int fields (e.g. `meta={"tags": [1, 2]}`) are unaffected - those go through a
+        dedicated `IntArrayProperties` wire type instead.
         """
         field_name = _normalize_metadata_field_name(metadata_field)
 
@@ -695,30 +799,26 @@ class WeaviateDocumentStore:
         config = await collection.config.get()
         schema_fields = {prop.name for prop in config.properties}
         if field_name not in schema_fields:
-            msg = f"Field '{field_name}' not found in collection schema"
-            raise ValueError(msg)
+            # No document has ever written this field, so Weaviate's auto-schema never created a
+            # property for it - there are no values to aggregate.
+            return [], 0
 
         weaviate_filter = None
-        if search_term:
-            weaviate_filter = convert_filters({"field": "content", "operator": "contains", "value": search_term})
+        if filters:
+            validate_filters(filters)
+            weaviate_filter = convert_filters(filters)
 
         # Weaviate's GroupByAggregate has a default limit of 100 groups.
         # We use the document count as the limit to ensure all unique values are retrieved,
         # since the number of unique values cannot exceed the number of documents.
-        doc_count_result = await collection.aggregate.over_all(total_count=True)
+        doc_count_result = await collection.aggregate.over_all(filters=weaviate_filter, total_count=True)
         doc_count = doc_count_result.total_count or 0
 
         agg_result = await collection.aggregate.over_all(
             filters=weaviate_filter, group_by=GroupByAggregate(prop=field_name, limit=doc_count)
         )
 
-        all_values = [str(g.grouped_by.value) for g in agg_result.groups] if agg_result.groups else []
-        all_values.sort()  # Sort for consistent pagination
-        total_count = len(all_values)
-
-        paginated_values = all_values[from_ : from_ + size]
-
-        return paginated_values, total_count
+        return self._compute_field_unique_values(agg_result, search_term, from_, size)
 
     @staticmethod
     def _to_data_object(document: Document) -> dict[str, Any]:
@@ -776,7 +876,7 @@ class WeaviateDocumentStore:
         document_data.pop("blob_mime_type", None)
 
         for key, value in document_data.items():
-            if isinstance(value, datetime.datetime):
+            if isinstance(value, dt.datetime):
                 document_data[key] = value.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         if weaviate_meta := getattr(data, "metadata", None):
@@ -883,6 +983,9 @@ class WeaviateDocumentStore:
         matching). For case-insensitive matching, normalize the value before
         building the filter.
 
+        Note: ``NOT`` over the ``contains`` operator is translated to Weaviate's
+        native ``NOT``, which requires Weaviate 1.33 or later.
+
         :param filters: The filters to apply to the document list.
         :returns: A list of Documents that match the given filters.
         """
@@ -905,6 +1008,9 @@ class WeaviateDocumentStore:
         Note: The ``contains`` filter operator is case-sensitive (substring
         matching). For case-insensitive matching, normalize the value before
         building the filter.
+
+        Note: ``NOT`` over the ``contains`` operator is translated to Weaviate's
+        native ``NOT``, which requires Weaviate 1.33 or later.
 
         :param filters: The filters to apply to the document list.
         :returns: A list of Documents that match the given filters.
@@ -1035,6 +1141,7 @@ class WeaviateDocumentStore:
         """
         collection = await self.async_collection
 
+        written = 0
         duplicate_errors_ids = []
         for doc in documents:
             if not isinstance(doc, Document):
@@ -1054,6 +1161,7 @@ class WeaviateDocumentStore:
                     vector=doc.embedding,
                 )
 
+                written += 1
             except weaviate.exceptions.UnexpectedStatusCodeError:
                 if policy == DuplicatePolicy.FAIL:
                     duplicate_errors_ids.append(doc.id)
@@ -1061,7 +1169,7 @@ class WeaviateDocumentStore:
         if duplicate_errors_ids:
             msg = f"IDs '{', '.join(duplicate_errors_ids)}' already exist in the document store."
             raise DuplicateDocumentError(msg)
-        return len(documents)
+        return written
 
     def write_documents(self, documents: list[Document], policy: DuplicatePolicy = DuplicatePolicy.NONE) -> int:
         """

@@ -6,22 +6,24 @@ import base64
 import mimetypes
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NotRequired
 
+from google.genai import Client
+from google.genai.client import AsyncClient
 from google.genai.types import Content, EmbedContentConfig, Part
-from haystack import Document, component, logging
+from haystack import Document, component, default_to_dict, logging
 from haystack.components.converters.image.image_utils import (
     _batch_convert_pdf_pages_to_images,
     _encode_image_to_base64,
     _PDFPageInfo,
 )
 from haystack.dataclasses import ByteStream
-from haystack.utils.auth import Secret
+from haystack.utils import Secret
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as async_tqdm
-from typing_extensions import NotRequired, TypedDict
+from typing_extensions import TypedDict
 
-from haystack_integrations.components.common.google_genai.utils import _get_client
+from haystack_integrations.common.google_genai.utils import _get_client
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +62,8 @@ def _extract_sources_info(documents: list[Document], file_path_meta_field: str, 
         If the file is a PDF and a page number is provided, the dictionary also contains the page number.
         Files that are not images, or PDFs without a page number, have `send_raw` set to True,
         meaning they will be sent as raw bytes without image processing.
-    :raises ValueError: If the document is missing the file_path_meta_field key in its metadata or the file path is
-        invalid.
+    :raises ValueError: If the document is missing the file_path_meta_field key in its metadata, the file path
+        escapes the configured root path, or the file path is invalid.
     """
     sources_info: list[_SourceInfo] = []
     for doc in documents:
@@ -74,6 +76,20 @@ def _extract_sources_info(documents: list[Document], file_path_meta_field: str, 
             raise ValueError(err_msg)
 
         resolved_file_path = Path(root_path, file_path)
+
+        # When root_path is set, ensure the resolved path stays within it to block path-traversal
+        # payloads (e.g. "../../etc/passwd") coming from document metadata. When root_path is unset,
+        # file paths are treated as absolute by design and no containment check is applied.
+        if root_path:
+            resolved_file_path = resolved_file_path.resolve()
+            resolved_root = Path(root_path).resolve()
+            if not resolved_file_path.is_relative_to(resolved_root):
+                err_msg = (
+                    f"Document with ID '{doc.id}' has a file path '{file_path}' that escapes the "
+                    f"configured root '{root_path}'. Resolved path: '{resolved_file_path}'."
+                )
+                raise ValueError(err_msg)
+
         if not resolved_file_path.is_file():
             err_msg = (
                 f"Document with ID '{doc.id}' has an invalid file path '{resolved_file_path}'. "
@@ -177,10 +193,12 @@ class GoogleGenAIMultimodalDocumentEmbedder:
         file_path_meta_field: str = "file_path",
         root_path: str | None = None,
         image_size: tuple[int, int] | None = None,
-        model: str = "gemini-embedding-2-preview",
+        model: str = "gemini-embedding-2",
         batch_size: int = 6,
         progress_bar: bool = True,
         config: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        max_retries: int | None = None,
     ) -> None:
         """
         Creates an GoogleGenAIMultimodalDocumentEmbedder component.
@@ -198,7 +216,10 @@ class GoogleGenAIMultimodalDocumentEmbedder:
             The metadata field in the Document that contains the file path to the file to embed.
         :param root_path:
             The root directory path where document files are located. If provided, file paths in
-            document metadata will be resolved relative to this path. If None, file paths are treated as absolute paths.
+            document metadata will be resolved relative to this path and are guaranteed to stay within it.
+            If None, file paths are treated as absolute paths with no containment check.
+            If document metadata, in particular `file_path_meta_field`, may be influenced by untrusted input,
+            set `root_path` to a dedicated data directory so that path-traversal beyond it is rejected.
         :param image_size:
             Only used for images and PDF pages. If provided, resizes the image to fit within the specified dimensions
             (width, height) while maintaining aspect ratio. This reduces file size, memory usage, and processing time,
@@ -213,11 +234,14 @@ class GoogleGenAIMultimodalDocumentEmbedder:
         :param progress_bar:
             If `True`, shows a progress bar when running.
         :param config:
-            A dictionary of keyword arguments to configure embedding content configuration `types.EmbedContentConfig`.
+            A dictionary of keyword arguments to configure embedding content configuration.
             You can for example set the output dimensionality of the embedding: `{"output_dimensionality": 768}`.
-            It also allows customizing the task type. If the task type is not specified, it defaults to
-            `{"task_type": "RETRIEVAL_DOCUMENT"}`.
-            For more information, see the [Google AI documentation](https://ai.google.dev/gemini-api/docs/embeddings#task-types).
+            See [Google API documentation](https://googleapis.github.io/python-genai/genai.html#genai.types.EmbedContentConfig)
+            for the available options.
+        :param timeout:
+            The timeout in seconds for the underlying Google GenAI client network requests.
+        :param max_retries:
+            The maximum number of retries for the underlying Google GenAI client network requests.
         """
         self._api_key = api_key
         self._api = api
@@ -229,16 +253,72 @@ class GoogleGenAIMultimodalDocumentEmbedder:
         self._image_size = image_size
         self._batch_size = batch_size
         self._progress_bar = progress_bar
-
-        config = config or {}
-        config.setdefault("task_type", "RETRIEVAL_DOCUMENT")
         self._config = config
+        self._timeout = timeout
+        self._max_retries = max_retries
 
-        self._client = _get_client(
-            api_key=api_key,
-            api=api,
-            vertex_ai_project=vertex_ai_project,
-            vertex_ai_location=vertex_ai_location,
+        self._client: Client | None = None
+        self._async_client: AsyncClient | None = None
+
+    def warm_up(self) -> None:
+        """Create the synchronous Google Gen AI client."""
+        if self._client is None:
+            self._client = _get_client(
+                api_key=self._api_key,
+                api=self._api,
+                vertex_ai_project=self._vertex_ai_project,
+                vertex_ai_location=self._vertex_ai_location,
+                timeout=self._timeout,
+                max_retries=self._max_retries,
+            )
+
+    async def warm_up_async(self) -> None:
+        """Create the asynchronous Google Gen AI client."""
+        if self._async_client is None:
+            self._async_client = _get_client(
+                api_key=self._api_key,
+                api=self._api,
+                vertex_ai_project=self._vertex_ai_project,
+                vertex_ai_location=self._vertex_ai_location,
+                timeout=self._timeout,
+                max_retries=self._max_retries,
+                async_client=True,
+            )
+
+    def close(self) -> None:
+        """Close the synchronous Google Gen AI client."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    async def close_async(self) -> None:
+        """Close the asynchronous Google Gen AI client."""
+        if self._async_client is not None:
+            await self._async_client.aclose()
+            self._async_client = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Serializes the component to a dictionary.
+
+        :returns:
+            Dictionary with serialized data.
+        """
+        return default_to_dict(
+            self,
+            model=self._model,
+            file_path_meta_field=self._file_path_meta_field,
+            root_path=self._root_path if self._root_path != "" else None,
+            image_size=self._image_size,
+            batch_size=self._batch_size,
+            progress_bar=self._progress_bar,
+            api_key=self._api_key.to_dict(),
+            api=self._api,
+            vertex_ai_project=self._vertex_ai_project,
+            vertex_ai_location=self._vertex_ai_location,
+            config=self._config,
+            timeout=self._timeout,
+            max_retries=self._max_retries,
         )
 
     def _extract_parts_to_embed(self, documents: list[Document]) -> list[Part]:
@@ -253,6 +333,9 @@ class GoogleGenAIMultimodalDocumentEmbedder:
 
         :raises TypeError:
             If the input is not a list of `Documents`.
+        :raises ValueError:
+            If a document is missing the file path metadata field, its file path escapes `root_path`, or its
+            MIME type is not supported.
         :raises RuntimeError:
             If the conversion of some documents fails.
         """
@@ -318,6 +401,7 @@ class GoogleGenAIMultimodalDocumentEmbedder:
         """
         Embed a list of parts in batches.
         """
+        assert self._client is not None  # noqa: S101
         resolved_config = EmbedContentConfig(**self._config) if self._config else None
 
         all_embeddings: list[list[float] | None] = []
@@ -361,6 +445,7 @@ class GoogleGenAIMultimodalDocumentEmbedder:
         Embed a list of parts in batches asynchronously.
         """
 
+        assert self._async_client is not None  # noqa: S101
         resolved_config = EmbedContentConfig(**self._config) if self._config else None
 
         all_embeddings: list[list[float] | None] = []
@@ -373,7 +458,7 @@ class GoogleGenAIMultimodalDocumentEmbedder:
             if resolved_config:
                 args["config"] = resolved_config
 
-            response = await self._client.aio.models.embed_content(**args)
+            response = await self._async_client.models.embed_content(**args)
 
             embeddings: list[list[float] | None] = []
             if response.embeddings:
@@ -409,7 +494,18 @@ class GoogleGenAIMultimodalDocumentEmbedder:
             A dictionary with the following keys:
             - `documents`: A list of documents with embeddings.
             - `meta`: Information about the usage of the model.
+
+        :raises TypeError:
+            If the input is not a list of `Documents`.
+        :raises ValueError:
+            If a document is missing the file path metadata field, its file path escapes `root_path`, or its
+            MIME type is not supported.
+        :raises RuntimeError:
+            If the conversion of some documents fails.
         """
+
+        self.warm_up()
+        assert self._client is not None  # noqa: S101
 
         parts_to_embed = self._extract_parts_to_embed(documents=documents)
 
@@ -434,7 +530,18 @@ class GoogleGenAIMultimodalDocumentEmbedder:
             A dictionary with the following keys:
             - `documents`: A list of documents with embeddings.
             - `meta`: Information about the usage of the model.
+
+        :raises TypeError:
+            If the input is not a list of `Documents`.
+        :raises ValueError:
+            If a document is missing the file path metadata field, its file path escapes `root_path`, or its
+            MIME type is not supported.
+        :raises RuntimeError:
+            If the conversion of some documents fails.
         """
+
+        await self.warm_up_async()
+        assert self._async_client is not None  # noqa: S101
 
         parts_to_embed = self._extract_parts_to_embed(documents=documents)
 

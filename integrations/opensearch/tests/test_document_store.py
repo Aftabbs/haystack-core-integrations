@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import random
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from haystack.dataclasses.document import Document
@@ -21,6 +21,7 @@ from opensearchpy.exceptions import RequestError, TransportError
 
 from haystack_integrations.document_stores.opensearch import OpenSearchDocumentStore
 from haystack_integrations.document_stores.opensearch.document_store import DEFAULT_MAX_CHUNK_BYTES
+from tests.test_document_store_common import OpenSearchDocumentStoreTestMixin
 
 
 @patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
@@ -184,6 +185,7 @@ def test_get_default_mappings(_mock_opensearch_client):
 def test_routing_extracted_from_metadata(mock_bulk, _mock_opensearch_client):
     """Test routing extraction from document metadata"""
     mock_bulk.return_value = (2, [])
+    _mock_opensearch_client.return_value.indices.exists.return_value = False
 
     store = OpenSearchDocumentStore(hosts="testhost", http_auth=("admin", "admin"))
 
@@ -212,6 +214,7 @@ def test_routing_extracted_from_metadata(mock_bulk, _mock_opensearch_client):
 def test_routing_in_delete(mock_bulk, _mock_opensearch_client):
     """Test routing parameter in delete operations"""
     mock_bulk.return_value = (2, [])
+    _mock_opensearch_client.return_value.indices.exists.return_value = False
 
     store = OpenSearchDocumentStore(hosts="testhost", http_auth=("admin", "admin"))
 
@@ -295,83 +298,67 @@ def test_bm25_retrieval_reraises_other_transport_errors(_mock_opensearch_client)
     assert store._client.search.call_count == 1
 
 
-@pytest.mark.asyncio
-@patch("haystack_integrations.document_stores.opensearch.document_store.AsyncOpenSearch")
 @patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
-async def test_bm25_retrieval_async_retries_with_fuzziness_zero_on_too_many_clauses(
-    _mock_opensearch_client, _mock_async_client, caplog
-):
+def test_get_metadata_field_unique_values_no_search_term_uses_match_all_query(_mock_opensearch_client):
+    """Composite aggregation terms sources don't support `include`/`exclude`, so with no search_term
+    the request body must use a plain `match_all` query and no `include` clause on the terms source."""
     store = OpenSearchDocumentStore(hosts="testhost")
-    store._async_client = AsyncMock()
+    store._client = MagicMock()
+    store._client.search.return_value = {"aggregations": {"unique_values": {"buckets": []}}}
 
-    too_many_clauses_error = TransportError(
-        500, "search_phase_execution_exception", "too_many_clauses: maxClauseCount is set to 1024"
-    )
-    store._async_client.search.side_effect = [
-        too_many_clauses_error,
-        {"hits": {"hits": []}},
-    ]
+    store.get_metadata_field_unique_values("category", search_term=None, size=10)
 
-    results = await store._bm25_retrieval_async("a very long query", fuzziness="AUTO")
-
-    assert results == []
-    assert store._async_client.search.call_count == 2
-    second_call_body = store._async_client.search.call_args_list[1].kwargs["body"]
-    assert second_call_body["query"]["bool"]["must"][0]["multi_match"]["fuzziness"] == 0
-    assert "Retrying with fuzziness=0" in caplog.text
+    body = store._client.search.call_args.kwargs["body"]
+    assert body["query"] == {"match_all": {}}
+    terms_source = body["aggs"]["unique_values"]["composite"]["sources"][0]["category"]["terms"]
+    assert "include" not in terms_source
+    assert terms_source["field"] == "category"
 
 
-@pytest.mark.asyncio
-@patch("haystack_integrations.document_stores.opensearch.document_store.AsyncOpenSearch")
 @patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
-async def test_bm25_retrieval_async_no_retry_when_fuzziness_already_zero(_mock_opensearch_client, _mock_async_client):
+def test_get_metadata_field_unique_values_search_term_filters_on_field_value_not_content(_mock_opensearch_client):
     store = OpenSearchDocumentStore(hosts="testhost")
-    store._async_client = AsyncMock()
+    store._client = MagicMock()
+    store._client.search.return_value = {"aggregations": {"unique_values": {"buckets": []}}}
 
-    too_many_clauses_error = TransportError(
-        500, "search_phase_execution_exception", "too_many_clauses: maxClauseCount is set to 1024"
-    )
-    store._async_client.search.side_effect = too_many_clauses_error
+    store.get_metadata_field_unique_values("category", search_term="needle", size=10)
 
-    with pytest.raises(TransportError):
-        await store._bm25_retrieval_async("a very long query", fuzziness=0)
+    body = store._client.search.call_args.kwargs["body"]
+    # Composite aggregation terms sources don't support `include`/`exclude`, so the substring match
+    # against the aggregated field's own value is applied as a query-level doc-value script filter instead.
+    terms_source = body["aggs"]["unique_values"]["composite"]["sources"][0]["category"]["terms"]
+    assert "include" not in terms_source
+    script = body["query"]["script"]["script"]
+    assert script["params"] == {"field": "category", "term": "needle"}
+    assert "contains(params.term)" in script["source"]
 
-    assert store._async_client.search.call_count == 1
 
-
-@pytest.mark.asyncio
-@patch("haystack_integrations.document_stores.opensearch.document_store.AsyncOpenSearch")
 @patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
-async def test_bm25_retrieval_async_no_retry_with_custom_query(_mock_opensearch_client, _mock_async_client):
+def test_get_metadata_field_unique_values_search_term_is_lowercased_for_case_insensitivity(_mock_opensearch_client):
     store = OpenSearchDocumentStore(hosts="testhost")
-    store._async_client = AsyncMock()
+    store._client = MagicMock()
+    store._client.search.return_value = {"aggregations": {"unique_values": {"buckets": []}}}
 
-    too_many_clauses_error = TransportError(
-        500, "search_phase_execution_exception", "too_many_clauses: maxClauseCount is set to 1024"
-    )
-    store._async_client.search.side_effect = too_many_clauses_error
+    store.get_metadata_field_unique_values("category", search_term="NeEdLe", size=10)
 
-    custom_query = {"query": {"match": {"content": "$query"}}}
-    with pytest.raises(TransportError):
-        await store._bm25_retrieval_async("a very long query", fuzziness="AUTO", custom_query=custom_query)
-
-    assert store._async_client.search.call_count == 1
+    body = store._client.search.call_args.kwargs["body"]
+    script = body["query"]["script"]["script"]
+    assert script["params"]["term"] == "needle"
+    assert "toLowerCase().contains(params.term)" in script["source"]
 
 
-@pytest.mark.asyncio
-@patch("haystack_integrations.document_stores.opensearch.document_store.AsyncOpenSearch")
 @patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
-async def test_bm25_retrieval_async_reraises_other_transport_errors(_mock_opensearch_client, _mock_async_client):
+def test_get_metadata_field_unique_values_search_term_with_regex_metacharacters(_mock_opensearch_client):
+    """search_term is matched as a literal substring (via a doc-value script), so regex metacharacters
+    in the term must be passed through as-is, not treated as a regex pattern."""
     store = OpenSearchDocumentStore(hosts="testhost")
-    store._async_client = AsyncMock()
+    store._client = MagicMock()
+    store._client.search.return_value = {"aggregations": {"unique_values": {"buckets": []}}}
 
-    other_error = TransportError(500, "parsing_exception", {"error": {"reason": "some other error"}})
-    store._async_client.search.side_effect = other_error
+    store.get_metadata_field_unique_values("category", search_term="a.b*c", size=10)
 
-    with pytest.raises(TransportError):
-        await store._bm25_retrieval_async("some query", fuzziness="AUTO")
-
-    assert store._async_client.search.call_count == 1
+    body = store._client.search.call_args.kwargs["body"]
+    assert body["query"]["script"]["script"]["params"]["term"] == "a.b*c"
 
 
 @patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
@@ -494,7 +481,6 @@ def test_wildcard_nested_fields_detected_on_write(mock_bulk, _mock_opensearch_cl
     mock_bulk.return_value = (2, [])
     store = OpenSearchDocumentStore(hosts="testhost", nested_fields="*")
     store._client = MagicMock()
-    store._initialized = True
 
     docs = [
         Document(
@@ -523,7 +509,6 @@ def test_wildcard_nested_fields_incremental_detection(mock_bulk, _mock_opensearc
     mock_bulk.return_value = (1, [])
     store = OpenSearchDocumentStore(hosts="testhost", nested_fields="*")
     store._client = MagicMock()
-    store._initialized = True
 
     # First batch: detects "refs"
     store.write_documents([Document(content="d1", meta={"refs": [{"law": "bgb"}]})])
@@ -542,7 +527,6 @@ def test_explicit_nested_fields_no_detection_on_write(mock_bulk, _mock_opensearc
     mock_bulk.return_value = (1, [])
     store = OpenSearchDocumentStore(hosts="testhost", nested_fields=["refs"])
     store._client = MagicMock()
-    store._initialized = True
 
     store.write_documents([Document(content="d1", meta={"tags": [{"name": "x"}]})])
 
@@ -552,8 +536,130 @@ def test_explicit_nested_fields_no_detection_on_write(mock_bulk, _mock_opensearc
     store._client.indices.put_mapping.assert_not_called()
 
 
+@patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
+def test_ensure_index_exists_direct_index(_mock_opensearch_client):
+    """When an index exists and is referenced directly, mappings are loaded without error."""
+    store = OpenSearchDocumentStore(hosts="testhost", index="my-index", http_auth=("a", "b"))
+    mock_client = MagicMock()
+    store._client = mock_client
+    mock_client.indices.exists.return_value = True
+    mock_client.indices.get_mapping.return_value = {
+        "my-index": {"mappings": {"properties": {"content": {"type": "text"}}}}
+    }
+
+    store._ensure_index_exists()
+
+    mock_client.indices.exists.assert_called_once_with(index="my-index")
+    mock_client.indices.get_mapping.assert_called_once_with(index="my-index")
+    mock_client.indices.create.assert_not_called()
+
+
+@patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
+def test_ensure_index_exists_with_alias(_mock_opensearch_client):
+    """When self._index is an alias, get_mapping keys the response by the real index name.
+
+    Before the fix this raised KeyError because mapping[self._index] was used directly.
+    """
+    store = OpenSearchDocumentStore(hosts="testhost", index="my-alias", http_auth=("a", "b"))
+    mock_client = MagicMock()
+    store._client = mock_client
+    mock_client.indices.exists.return_value = True
+    mock_client.indices.get_mapping.return_value = {
+        "my-real-index-v1": {"mappings": {"properties": {"content": {"type": "text"}}}}
+    }
+
+    store._ensure_index_exists()  # must not raise KeyError
+
+    mock_client.indices.get_mapping.assert_called_once_with(index="my-alias")
+    mock_client.indices.create.assert_not_called()
+
+
+@patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
+def test_ensure_index_exists_creates_index_when_not_exists(_mock_opensearch_client):
+    """When the index does not exist and create_index=True, the index is created."""
+    store = OpenSearchDocumentStore(hosts="testhost", index="new-index", http_auth=("a", "b"))
+    mock_client = MagicMock()
+    store._client = mock_client
+    mock_client.indices.exists.return_value = False
+
+    store._ensure_index_exists()
+
+    mock_client.indices.create.assert_called_once()
+    mock_client.indices.get_mapping.assert_not_called()
+
+
+@patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
+def test_ensure_index_exists_no_create_when_disabled(_mock_opensearch_client):
+    """When the index does not exist and create_index=False, no index is created."""
+    store = OpenSearchDocumentStore(hosts="testhost", index="new-index", create_index=False, http_auth=("a", "b"))
+    mock_client = MagicMock()
+    store._client = mock_client
+    mock_client.indices.exists.return_value = False
+
+    store._ensure_index_exists()
+
+    mock_client.indices.create.assert_not_called()
+    mock_client.indices.get_mapping.assert_not_called()
+
+
+@patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
+def test_delete_all_documents_recreate_raises_for_alias(_mock_opensearch_client):
+    """delete_all_documents(recreate_index=True) raises DocumentStoreError when self._index is an alias."""
+    store = OpenSearchDocumentStore(hosts="testhost", index="my-alias", http_auth=("a", "b"))
+    mock_client = MagicMock()
+    store._client = mock_client
+    # indices.get() returns a key that differs from self._index — signals an alias
+    mock_client.indices.get.return_value = {"my-real-index-v1": {"mappings": {}, "settings": {"index": {}}}}
+
+    with pytest.raises(DocumentStoreError, match="is an alias"):
+        store.delete_all_documents(recreate_index=True)
+
+    mock_client.indices.delete.assert_not_called()
+    mock_client.indices.create.assert_not_called()
+
+
+@patch("haystack_integrations.document_stores.opensearch.document_store.OpenSearch")
+def test_delete_all_documents_recreate_works_for_concrete_index(_mock_opensearch_client):
+    """delete_all_documents(recreate_index=True) proceeds normally when self._index is a concrete index."""
+    store = OpenSearchDocumentStore(hosts="testhost", index="my-index", http_auth=("a", "b"))
+    mock_client = MagicMock()
+    store._client = mock_client
+    mock_client.indices.get.return_value = {"my-index": {"mappings": {}, "settings": {"index": {}}}}
+
+    store.delete_all_documents(recreate_index=True)
+
+    mock_client.indices.delete.assert_called_once_with(index="my-index")
+    mock_client.indices.create.assert_called_once()
+
+
+def test_close():
+    store = OpenSearchDocumentStore(hosts="testhost", http_auth=("a", "b"))
+    mock_client = MagicMock()
+    store._client = mock_client
+
+    store.close()
+
+    mock_client.close.assert_called_once()
+    assert store._client is None
+
+    store.close()
+    mock_client.close.assert_called_once()
+
+
+def test_close_is_exception_safe():
+    store = OpenSearchDocumentStore(hosts="testhost", http_auth=("a", "b"))
+    mock_client = MagicMock()
+    mock_client.close.side_effect = RuntimeError("boom")
+    store._client = mock_client
+
+    store.close()
+
+    assert store._client is None
+
+
 @pytest.mark.integration
 class TestDocumentStore(
+    OpenSearchDocumentStoreTestMixin,
     CountDocumentsByFilterTest,
     CountUniqueMetadataByFilterTest,
     DocumentStoreBaseExtendedTests,
@@ -570,26 +676,15 @@ class TestDocumentStore(
         """Override base class fixture to provide OpenSearch document store."""
         yield document_store
 
-    def assert_documents_are_equal(self, received: list[Document], expected: list[Document]):
-        """
-        The OpenSearchDocumentStore.filter_documents() method returns documents with their score set.
+    def test_close_and_reopen(self, document_store: OpenSearchDocumentStore):
+        assert document_store.count_documents() == 0
+        assert document_store._client is not None
 
-        We don't want to compare the score, so we set it to None before comparing.
+        document_store.close()
+        assert document_store._client is None
 
-        Embeddings are not exactly the same when retrieved from OpenSearch (float round-trip),
-        so we compare them approximately and then set both to None for the final equality check.
-        """
-        assert len(received) == len(expected)
-        received = sorted(received, key=lambda x: x.id)
-        expected = sorted(expected, key=lambda x: x.id)
-        for received_doc, expected_doc in zip(received, expected, strict=True):
-            received_doc.score = None
-            if received_doc.embedding is None:
-                assert expected_doc.embedding is None
-            else:
-                assert received_doc.embedding == pytest.approx(expected_doc.embedding)
-            received_doc.embedding, expected_doc.embedding = None, None
-            assert received_doc == expected_doc
+        assert document_store.count_documents() == 0
+        assert document_store._client is not None
 
     def test_write_documents(self, document_store: OpenSearchDocumentStore):
         docs = [Document(id="1")]
@@ -975,66 +1070,53 @@ class TestDocumentStore(
         assert len(results) == 1
         assert results[0].content == "New document after delete all"
 
-    def test_get_metadata_field_unique_values(self, document_store: OpenSearchDocumentStore):
-        # Test with string values
+    def test_get_metadata_field_unique_values_pagination_beyond_total(self, document_store: OpenSearchDocumentStore):
+        """
+        Edge case not covered by the shared GetMetadataFieldUniqueValuesTest mixin's pagination test:
+        requesting a page starting beyond the total count must return an empty page with the correct total.
+        """
         docs = [
-            Document(content="Python programming", meta={"category": "A", "language": "Python"}),
-            Document(content="Java programming", meta={"category": "B", "language": "Java"}),
-            Document(content="Python scripting", meta={"category": "A", "language": "Python"}),
-            Document(content="JavaScript development", meta={"category": "C", "language": "JavaScript"}),
-            Document(content="Python data science", meta={"category": "A", "language": "Python"}),
-            Document(content="Java backend", meta={"category": "B", "language": "Java"}),
+            Document(content="Doc 1", meta={"category": "A"}),
+            Document(content="Doc 2", meta={"category": "B"}),
+            Document(content="Doc 3", meta={"category": "C"}),
         ]
         document_store.write_documents(docs)
 
-        # Test getting all unique values without search term
-        unique_values, after_key = document_store.get_metadata_field_unique_values("meta.category", None, 10)
-        assert set(unique_values) == {"A", "B", "C"}
-        # after_key should be None when all results are returned
-        assert after_key is None
-
-        # Test with "meta." prefix
-        unique_languages, _ = document_store.get_metadata_field_unique_values("meta.language", None, 10)
-        assert set(unique_languages) == {"Python", "Java", "JavaScript"}
-
-        # Test pagination - first page
-        unique_values_page1, after_key_page1 = document_store.get_metadata_field_unique_values("meta.category", None, 2)
-        assert len(unique_values_page1) == 2
-        assert all(val in ["A", "B", "C"] for val in unique_values_page1)
-        # Should have an after_key for pagination
-        assert after_key_page1 is not None
-
-        # Test pagination - second page using after_key
-        unique_values_page2, after_key_page2 = document_store.get_metadata_field_unique_values(
-            "meta.category", None, 2, after=after_key_page1
+        unique_values_beyond, total_beyond = document_store.get_metadata_field_unique_values(
+            metadata_field="meta.category", search_term=None, from_=10, size=10
         )
-        assert len(unique_values_page2) == 1
-        assert unique_values_page2[0] in ["A", "B", "C"]
-        # Should have no more results
-        assert after_key_page2 is None
+        assert len(unique_values_beyond) == 0
+        assert total_beyond == 3
 
-        # Test with search term - filter by content matching "Python"
-        unique_values_filtered, _ = document_store.get_metadata_field_unique_values("meta.category", "Python", 10)
-        assert set(unique_values_filtered) == {"A"}  # Only category A has documents with "Python" in content
+    def test_get_metadata_field_unique_values_distinct_types(self, document_store: OpenSearchDocumentStore):
+        """
+        Override: the base mixin test stores int, float, str and bool under the *same* metadata field
+        name and expects all four back as distinct values. OpenSearch's dynamic field mapping fixes a
+        field's type from the first document written to it, so that scenario raises a
+        mapper_parsing_exception here instead.
 
-        # Test with search term - filter by content matching "Java"
-        unique_values_java, _ = document_store.get_metadata_field_unique_values("meta.category", "Java", 10)
-        assert set(unique_values_java) == {"B"}  # Only category B has documents with "Java" in content
-
-        # Test with integer values
-        int_docs = [
-            Document(content="Doc 1", meta={"priority": 1}),
-            Document(content="Doc 2", meta={"priority": 2}),
-            Document(content="Doc 3", meta={"priority": 1}),
-            Document(content="Doc 4", meta={"priority": 3}),
+        This adapts the same intent - int, float, str and bool must come back as distinct, unmangled
+        types via get_metadata_field_unique_values() - using one field per type instead of one shared
+        field, which is what OpenSearch can actually support.
+        """
+        docs = [
+            Document(content="Doc 1", meta={"priority_int": 1}),
+            Document(content="Doc 2", meta={"priority_str": "1"}),
+            Document(content="Doc 3", meta={"priority_float": 1.0}),
+            Document(content="Doc 4", meta={"priority_bool": True}),
         ]
-        document_store.write_documents(int_docs)
-        unique_priorities, _ = document_store.get_metadata_field_unique_values("meta.priority", None, 10)
-        assert set(unique_priorities) == {"1", "2", "3"}
+        document_store.write_documents(docs)
 
-        # Test with search term on integer field
-        unique_priorities_filtered, _ = document_store.get_metadata_field_unique_values("meta.priority", "Doc 1", 10)
-        assert set(unique_priorities_filtered) == {"1"}
+        int_values, int_count = document_store.get_metadata_field_unique_values(metadata_field="priority_int")
+        str_values, str_count = document_store.get_metadata_field_unique_values(metadata_field="priority_str")
+        float_values, float_count = document_store.get_metadata_field_unique_values(metadata_field="priority_float")
+        bool_values, bool_count = document_store.get_metadata_field_unique_values(metadata_field="priority_bool")
+
+        assert (int_count, str_count, float_count, bool_count) == (1, 1, 1, 1)
+        assert int_values == [1] and type(int_values[0]) is int
+        assert str_values == ["1"] and type(str_values[0]) is str
+        assert float_values == [1.0] and type(float_values[0]) is float
+        assert bool_values == [True] and type(bool_values[0]) is bool
 
     def test_write_with_routing(self, document_store: OpenSearchDocumentStore):
         """Test writing documents with routing metadata"""
@@ -1506,3 +1588,209 @@ class TestDocumentStore(
         )
         assert len(results) == 1
         assert results[0].content == "both"
+
+    def test_document_store_with_alias(self, document_store: OpenSearchDocumentStore):
+        """Initializing the document store with an alias instead of a concrete index name must not raise KeyError."""
+        alias_name = f"alias_for_{document_store._index}"
+        client = document_store._client
+        client.indices.put_alias(index=document_store._index, name=alias_name)
+        try:
+            alias_store = OpenSearchDocumentStore(
+                hosts=["https://localhost:9200"],
+                http_auth=("admin", "SecureHaystack!2026"),
+                verify_certs=False,
+                index=alias_name,
+                embedding_dim=768,
+            )
+            alias_store._ensure_initialized()
+
+            docs = [Document(content="doc via alias")]
+            assert alias_store.write_documents(docs) == 1
+            results = alias_store.filter_documents()
+            assert len(results) == 1
+            assert results[0].content == "doc via alias"
+        finally:
+            client.indices.delete_alias(index=document_store._index, name=alias_name)
+
+    def test_delete_all_documents_with_alias(self, document_store: OpenSearchDocumentStore):
+        """delete_all_documents(recreate_index=True) raises DocumentStoreError when self._index is an alias."""
+        alias_name = f"alias_del_{document_store._index}"
+        client = document_store._client
+        client.indices.put_alias(index=document_store._index, name=alias_name)
+        try:
+            alias_store = OpenSearchDocumentStore(
+                hosts=["https://localhost:9200"],
+                http_auth=("admin", "SecureHaystack!2026"),
+                verify_certs=False,
+                index=alias_name,
+                embedding_dim=768,
+            )
+            alias_store._ensure_initialized()
+
+            with pytest.raises(DocumentStoreError, match="is an alias"):
+                alias_store.delete_all_documents(recreate_index=True)
+        finally:
+            client.indices.delete_alias(index=document_store._index, name=alias_name)
+
+    def test_delete_all_documents_no_recreate_with_alias(self, document_store: OpenSearchDocumentStore):
+        """delete_all_documents(recreate_index=False) removes all documents when self._index is an alias."""
+        alias_name = f"alias_del_norecr_{document_store._index}"
+        client = document_store._client
+        client.indices.put_alias(index=document_store._index, name=alias_name)
+        try:
+            alias_store = OpenSearchDocumentStore(
+                hosts=["https://localhost:9200"],
+                http_auth=("admin", "SecureHaystack!2026"),
+                verify_certs=False,
+                index=alias_name,
+                embedding_dim=768,
+            )
+            alias_store._ensure_initialized()
+            alias_store.write_documents([Document(content="a"), Document(content="b")])
+            assert alias_store.count_documents() == 2
+
+            alias_store.delete_all_documents(recreate_index=False)
+
+            assert alias_store.count_documents() == 0
+            assert alias_store.write_documents([Document(content="after delete")]) == 1
+        finally:
+            client.indices.delete_alias(index=document_store._index, name=alias_name)
+
+    def test_count_unique_metadata_by_filter_with_alias(self, document_store: OpenSearchDocumentStore):
+        """count_unique_metadata_by_filter reads the mapping via alias without KeyError."""
+        alias_name = f"alias_cnt_{document_store._index}"
+        client = document_store._client
+        client.indices.put_alias(index=document_store._index, name=alias_name)
+        try:
+            alias_store = OpenSearchDocumentStore(
+                hosts=["https://localhost:9200"],
+                http_auth=("admin", "SecureHaystack!2026"),
+                verify_certs=False,
+                index=alias_name,
+                embedding_dim=768,
+            )
+            alias_store._ensure_initialized()
+            alias_store.write_documents(
+                [
+                    Document(content="a", meta={"category": "X"}),
+                    Document(content="b", meta={"category": "X"}),
+                    Document(content="c", meta={"category": "Y"}),
+                ]
+            )
+
+            result = alias_store.count_unique_metadata_by_filter(
+                filters={"field": "meta.category", "operator": "in", "value": ["X", "Y"]},
+                metadata_fields=["category"],
+            )
+            assert result == {"category": 2}
+        finally:
+            client.indices.delete_alias(index=document_store._index, name=alias_name)
+
+    def test_get_metadata_fields_info_with_alias(self, document_store: OpenSearchDocumentStore):
+        """get_metadata_fields_info reads the mapping via alias without KeyError."""
+        alias_name = f"alias_mfi_{document_store._index}"
+        client = document_store._client
+        client.indices.put_alias(index=document_store._index, name=alias_name)
+        try:
+            alias_store = OpenSearchDocumentStore(
+                hosts=["https://localhost:9200"],
+                http_auth=("admin", "SecureHaystack!2026"),
+                verify_certs=False,
+                index=alias_name,
+                embedding_dim=768,
+            )
+            alias_store._ensure_initialized()
+            alias_store.write_documents([Document(content="doc", meta={"category": "A", "count": 1})])
+
+            fields_info = alias_store.get_metadata_fields_info()
+            assert "category" in fields_info
+            assert fields_info["category"]["type"] == "keyword"
+            assert "count" in fields_info
+        finally:
+            client.indices.delete_alias(index=document_store._index, name=alias_name)
+
+    @pytest.mark.parametrize(
+        "filters, expected_prices",
+        [
+            pytest.param(
+                {
+                    "operator": "AND",
+                    "conditions": [
+                        {"field": "meta.price", "operator": ">", "value": 5},
+                        {"field": "meta.price", "operator": ">", "value": 1},
+                    ],
+                },
+                [6],
+                id="and_same_operator",
+            ),
+            pytest.param(
+                {
+                    "operator": "AND",
+                    "conditions": [
+                        {"field": "meta.price", "operator": "<", "value": 3},
+                        {"field": "meta.price", "operator": "<=", "value": 5},
+                    ],
+                },
+                [0, 1, 2],
+                id="and_same_side",
+            ),
+            pytest.param(
+                {
+                    "operator": "NOT",
+                    "conditions": [
+                        {"field": "meta.price", "operator": "<=", "value": 1},
+                        {"field": "meta.price", "operator": "<=", "value": 5},
+                    ],
+                },
+                [2, 3, 4, 5, 6],
+                id="not_same_operator",
+            ),
+        ],
+    )
+    def test_filter_documents_same_field_ranges_keep_every_bound(
+        self, document_store: OpenSearchDocumentStore, filters, expected_prices
+    ):
+        document_store.write_documents([Document(content=f"doc {price}", meta={"price": price}) for price in range(7)])
+
+        result = document_store.filter_documents(filters=filters)
+
+        assert sorted(doc.meta["price"] for doc in result) == expected_prices
+
+    def test_filter_documents_same_field_date_ranges_keep_every_bound(self, document_store: OpenSearchDocumentStore):
+        # the shape FilterPolicy.MERGE produces from init filters and runtime filters on the same field
+        document_store.write_documents(
+            [
+                Document(content="march", meta={"date": "2021-03-01"}),
+                Document(content="september", meta={"date": "2021-09-01"}),
+            ]
+        )
+        filters = {
+            "operator": "AND",
+            "conditions": [
+                {"field": "meta.date", "operator": ">=", "value": "2021-06-01"},
+                {"field": "meta.date", "operator": ">=", "value": "2021-01-01"},
+            ],
+        }
+
+        result = document_store.filter_documents(filters=filters)
+
+        assert [doc.meta["date"] for doc in result] == ["2021-09-01"]
+
+    @pytest.mark.parametrize("key", ["file-name", "x = 1; ctx.op = 'delete'; //"])
+    def test_update_by_filter_treats_meta_keys_as_data(self, document_store: OpenSearchDocumentStore, key: str):
+        # Keys that aren't valid Painless identifiers must neither break the update script nor be executed by it.
+        docs = [
+            Document(content="a", meta={"tenant": "t1"}),
+            Document(content="b", meta={"tenant": "t1"}),
+            Document(content="c", meta={"tenant": "t2"}),
+        ]
+        document_store.write_documents(docs)
+
+        updated = document_store.update_by_filter(
+            filters={"field": "meta.tenant", "operator": "==", "value": "t1"}, meta={key: "v"}, refresh=True
+        )
+
+        assert updated == 2
+        assert document_store.count_documents() == 3
+        result = document_store.filter_documents(filters={"field": "meta.tenant", "operator": "==", "value": "t1"})
+        assert [doc.meta[key] for doc in result] == ["v", "v"]

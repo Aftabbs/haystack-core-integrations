@@ -5,8 +5,8 @@ from unittest.mock import patch
 import pytest
 import pytz
 from haystack import Pipeline
+from haystack.components.agents import Agent
 from haystack.components.generators.utils import print_streaming_chunk
-from haystack.components.tools import ToolInvoker
 from haystack.dataclasses import ChatMessage, ChatRole, StreamingChunk, ToolCall
 from haystack.tools import Tool
 from haystack.utils.auth import Secret
@@ -88,16 +88,24 @@ class TestAIMLAPIChatGenerator:
     def test_init_default(self, monkeypatch):
         monkeypatch.setenv("AIMLAPI_API_KEY", "test-api-key")
         component = AIMLAPIChatGenerator()
-        assert component.client.api_key == "test-api-key"
+        assert component.api_key.resolve_value() == "test-api-key"
         assert component.model == "openai/gpt-5-chat-latest"
         assert component.api_base_url == "https://api.aimlapi.com/v1"
         assert component.streaming_callback is None
         assert not component.generation_kwargs
 
+    def test_warm_up(self, monkeypatch):
+        monkeypatch.setenv("AIMLAPI_API_KEY", "test-api-key")
+        component = AIMLAPIChatGenerator()
+        component.warm_up()  # with haystack-ai >= 3.0 the client is created during warm-up
+        assert component.client.api_key == "test-api-key"
+
     def test_init_fail_wo_api_key(self, monkeypatch):
         monkeypatch.delenv("AIMLAPI_API_KEY", raising=False)
         with pytest.raises(ValueError, match=r"None of the .* environment variables are set"):
-            AIMLAPIChatGenerator()
+            # haystack-ai 2.x raises at init; haystack-ai >= 3.0 raises when the client is created in warm_up
+            component = AIMLAPIChatGenerator()
+            component.warm_up()
 
     def test_init_with_parameters(self):
         component = AIMLAPIChatGenerator(
@@ -107,7 +115,7 @@ class TestAIMLAPIChatGenerator:
             api_base_url="test-base-url",
             generation_kwargs={"max_tokens": 10, "some_test_param": "test-params"},
         )
-        assert component.client.api_key == "test-api-key"
+        assert component.api_key.resolve_value() == "test-api-key"
         assert component.model == "openai/gpt-5-chat-latest"
         assert component.streaming_callback is print_streaming_chunk
         assert component.generation_kwargs == {"max_tokens": 10, "some_test_param": "test-params"}
@@ -203,24 +211,6 @@ class TestAIMLAPIChatGenerator:
         assert component.extra_headers == {"test-header": "test-value"}
         assert component.timeout == 10
         assert component.max_retries == 10
-
-    def test_from_dict_fail_wo_env_var(self, monkeypatch):
-        monkeypatch.delenv("AIMLAPI_API_KEY", raising=False)
-        data = {
-            "type": ("haystack_integrations.components.generators.aimlapi.chat.chat_generator.AIMLAPIChatGenerator"),
-            "init_parameters": {
-                "api_key": {"env_vars": ["AIMLAPI_API_KEY"], "strict": True, "type": "env_var"},
-                "model": "openai/gpt-5-chat-latest",
-                "api_base_url": "test-base-url",
-                "streaming_callback": "haystack.components.generators.utils.print_streaming_chunk",
-                "generation_kwargs": {"max_tokens": 10, "some_test_param": "test-params"},
-                "extra_headers": {"test-header": "test-value"},
-                "timeout": 10,
-                "max_retries": 10,
-            },
-        }
-        with pytest.raises(ValueError, match=r"None of the .* environment variables are set"):
-            AIMLAPIChatGenerator.from_dict(data)
 
     def test_run(self, chat_messages, mock_chat_completion, monkeypatch):  # noqa: ARG002
         monkeypatch.setenv("AIMLAPI_API_KEY", "fake-api-key")
@@ -415,29 +405,15 @@ class TestAIMLAPIChatGenerator:
         reason="Export an env var called AIMLAPI_API_KEY containing the AIMLAPI API key to run this test.",
     )
     @pytest.mark.integration
-    def test_pipeline_with_aimlapi_chat_generator(self, tools):
+    def test_agent_with_aimlapi_chat_generator(self, tools):
         """
-        Test that the AIMLAPIChatGenerator component can be used in a pipeline
+        Test that the AIMLAPIChatGenerator component can drive tool calls in an Agent
         """
-        pipeline = Pipeline()
-        pipeline.add_component("generator", AIMLAPIChatGenerator(tools=tools, model="openai/gpt-5-mini-2025-08-07"))
-        pipeline.add_component("tool_invoker", ToolInvoker(tools=tools))
+        agent = Agent(chat_generator=AIMLAPIChatGenerator(model="openai/gpt-5-mini-2025-08-07"), tools=tools)
+        result = agent.run(messages=[ChatMessage.from_user("What's the weather like in Paris?")])
 
-        pipeline.connect("generator", "tool_invoker")
-
-        results = pipeline.run(
-            data={
-                "generator": {
-                    "messages": [ChatMessage.from_user("What's the weather like in Paris?")],
-                    "generation_kwargs": {"tool_choice": "auto"},
-                }
-            }
-        )
-
-        assert (
-            "The weather in Paris is sunny and 32°C"
-            == results["tool_invoker"]["tool_messages"][0].tool_call_result.result
-        )
+        tool_results = [msg.tool_call_result.result for msg in result["messages"] if msg.tool_call_result]
+        assert "The weather in Paris is sunny and 32°C" in tool_results
 
     def test_serde_in_pipeline(self, monkeypatch):
         """
@@ -469,6 +445,11 @@ class TestAIMLAPIChatGenerator:
 
         # Get pipeline dictionary and verify its structure
         pipeline_dict = pipeline.to_dict()
+
+        # the Tool serialization format is owned by haystack-ai and varies across its versions; the
+        # dumps/loads round-trip below covers the tools, so exclude them from the pinned-dict comparison
+        tools_entries = pipeline_dict["components"]["generator"]["init_parameters"].pop("tools")
+        assert len(tools_entries) == 1
         expected_dict = {
             "metadata": {},
             "max_runs_per_component": 100,
@@ -482,17 +463,6 @@ class TestAIMLAPIChatGenerator:
                         "streaming_callback": "haystack.components.generators.utils.print_streaming_chunk",
                         "api_base_url": "https://api.aimlapi.com/v1",
                         "generation_kwargs": {"temperature": 0.7},
-                        "tools": [
-                            {
-                                "type": "haystack.tools.tool.Tool",
-                                "data": {
-                                    "name": "weather",
-                                    "description": "useful to determine the weather in a given location",
-                                    "parameters": {"city": {"type": "string"}},
-                                    "function": "tests.test_aimlapi_chat_generator.weather",
-                                },
-                            }
-                        ],
                         "http_client_kwargs": None,
                         "extra_headers": None,
                         "timeout": None,
@@ -505,21 +475,6 @@ class TestAIMLAPIChatGenerator:
 
         if not hasattr(pipeline, "_connection_type_validation"):
             expected_dict.pop("connection_type_validation")
-
-        # add outputs_to_string, inputs_from_state and outputs_to_state tool parameters for compatibility with
-        # haystack-ai>=2.12.0
-        if hasattr(tool, "outputs_to_string"):
-            expected_dict["components"]["generator"]["init_parameters"]["tools"][0]["data"]["outputs_to_string"] = (
-                tool.outputs_to_string
-            )
-        if hasattr(tool, "inputs_from_state"):
-            expected_dict["components"]["generator"]["init_parameters"]["tools"][0]["data"]["inputs_from_state"] = (
-                tool.inputs_from_state
-            )
-        if hasattr(tool, "outputs_to_state"):
-            expected_dict["components"]["generator"]["init_parameters"]["tools"][0]["data"]["outputs_to_state"] = (
-                tool.outputs_to_state
-            )
 
         assert pipeline_dict == expected_dict
 
@@ -537,6 +492,74 @@ class TestAIMLAPIChatGenerator:
         assert loaded_generator.tools[0].name == generator.tools[0].name
         assert loaded_generator.tools[0].description == generator.tools[0].description
         assert loaded_generator.tools[0].parameters == generator.tools[0].parameters
+
+    def test_prepare_api_call_with_tools(self, tools, monkeypatch):
+        monkeypatch.setenv("AIMLAPI_API_KEY", "fake-api-key")
+        component = AIMLAPIChatGenerator(tools=tools)
+        args = component._prepare_api_call(messages=[ChatMessage.from_user("hi")])
+
+        assert args["tools"] == [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "description": "useful to determine the weather in a given location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }
+        ]
+        assert "strict" not in args["tools"][0]["function"]
+        assert args["tools"][0]["function"]["parameters"].get("additionalProperties") is None
+
+    def test_prepare_api_call_with_tools_strict(self, tools, monkeypatch):
+        monkeypatch.setenv("AIMLAPI_API_KEY", "fake-api-key")
+        component = AIMLAPIChatGenerator(tools=tools)
+        args = component._prepare_api_call(messages=[ChatMessage.from_user("hi")], tools_strict=True)
+
+        function_spec = args["tools"][0]["function"]
+        assert function_spec["strict"] is True
+        assert function_spec["parameters"]["additionalProperties"] is False
+
+    def test_prepare_api_call_streaming_multiple_responses_raises(self, monkeypatch):
+        monkeypatch.setenv("AIMLAPI_API_KEY", "fake-api-key")
+        component = AIMLAPIChatGenerator()
+        with pytest.raises(ValueError, match="Cannot stream multiple responses"):
+            component._prepare_api_call(
+                messages=[ChatMessage.from_user("hi")],
+                streaming_callback=print_streaming_chunk,
+                generation_kwargs={"n": 2},
+            )
+
+    def test_prepare_api_call_with_response_format_non_streaming(self, monkeypatch):
+        monkeypatch.setenv("AIMLAPI_API_KEY", "fake-api-key")
+        component = AIMLAPIChatGenerator()
+        response_format = {"type": "json_object"}
+        args = component._prepare_api_call(
+            messages=[ChatMessage.from_user("hi")],
+            generation_kwargs={"response_format": response_format},
+        )
+
+        assert args["response_format"] == response_format
+        assert args["openai_endpoint"] == "parse"
+        assert "stream" not in args
+
+    def test_prepare_api_call_with_response_format_streaming(self, monkeypatch):
+        monkeypatch.setenv("AIMLAPI_API_KEY", "fake-api-key")
+        component = AIMLAPIChatGenerator()
+        response_format = {"type": "json_object"}
+        args = component._prepare_api_call(
+            messages=[ChatMessage.from_user("hi")],
+            streaming_callback=print_streaming_chunk,
+            generation_kwargs={"response_format": response_format},
+        )
+
+        assert args["response_format"] == response_format
+        assert args["openai_endpoint"] == "create"
+        assert args["stream"] is True
 
 
 class TestChatCompletionChunkConversion:
@@ -858,18 +881,10 @@ class TestChatCompletionChunkConversion:
         assert result.meta["finish_reason"] == "tool_calls"
         assert result.meta["index"] == 0
         assert result.meta["completion_start_time"] is not None
-        assert result.meta["usage"] == {
-            "completion_tokens": 42,
-            "prompt_tokens": 55,
-            "total_tokens": 97,
-            "completion_tokens_details": {
-                "accepted_prediction_tokens": None,
-                "audio_tokens": None,
-                "reasoning_tokens": 0,
-                "rejected_prediction_tokens": None,
-            },
-            "prompt_tokens_details": {
-                "audio_tokens": None,
-                "cached_tokens": 0,
-            },
-        }
+
+        usage = result.meta["usage"]
+        assert usage["completion_tokens"] == 42
+        assert usage["prompt_tokens"] == 55
+        assert usage["total_tokens"] == 97
+        assert usage["completion_tokens_details"]["reasoning_tokens"] == 0
+        assert usage["prompt_tokens_details"]["cached_tokens"] == 0

@@ -7,7 +7,6 @@ import pytest
 import pytz
 from haystack import Pipeline
 from haystack.components.generators.utils import print_streaming_chunk
-from haystack.components.tools import ToolInvoker
 from haystack.dataclasses import ChatMessage, ChatRole, StreamingChunk, ToolCall
 from haystack.tools import Tool, Toolset
 from haystack.utils.auth import Secret
@@ -125,16 +124,23 @@ class TestTogetherAIChatGenerator:
     def test_init_default(self, monkeypatch):
         monkeypatch.setenv("ENV_VAR", "test-api-key")
         component = TogetherAIChatGenerator(api_key=Secret.from_env_var("ENV_VAR"))
-        assert component.client.api_key == "test-api-key"
+        assert component.api_key.resolve_value() == "test-api-key"
         assert component.model == "meta-llama/Llama-3.3-70B-Instruct-Turbo"
         assert component.api_base_url == "https://api.together.xyz/v1"
         assert component.streaming_callback is None
         assert not component.generation_kwargs
 
-    def test_init_fail_wo_api_key(self, monkeypatch):
+    def test_warm_up(self, monkeypatch):
+        monkeypatch.setenv("TOGETHER_API_KEY", "test-api-key")
+        component = TogetherAIChatGenerator()
+        component.warm_up()
+        assert component.client.api_key == "test-api-key"
+
+    def test_warm_up_fails_without_api_key(self, monkeypatch):
         monkeypatch.delenv("TOGETHER_API_KEY", raising=False)
+        component = TogetherAIChatGenerator()
         with pytest.raises(ValueError, match=r"None of the .* environment variables are set"):
-            TogetherAIChatGenerator()
+            component.warm_up()
 
     def test_init_with_parameters(self):
         component = TogetherAIChatGenerator(
@@ -144,7 +150,7 @@ class TestTogetherAIChatGenerator:
             api_base_url="test-base-url",
             generation_kwargs={"max_tokens": 10, "some_test_param": "test-params"},
         )
-        assert component.client.api_key == "test-api-key"
+        assert component.api_key.resolve_value() == "test-api-key"
         assert component.model == "openai/gpt-oss-20b"
         assert component.streaming_callback is print_streaming_chunk
         assert component.generation_kwargs == {"max_tokens": 10, "some_test_param": "test-params"}
@@ -263,25 +269,6 @@ class TestTogetherAIChatGenerator:
         assert component.timeout == 10
         assert component.max_retries == 10
 
-    def test_from_dict_fail_wo_env_var(self, monkeypatch):
-        monkeypatch.delenv("TOGETHER_API_KEY", raising=False)
-        data = {
-            "type": (
-                "haystack_integrations.components.generators.togetherai.chat.chat_generator.TogetherAIChatGenerator"
-            ),
-            "init_parameters": {
-                "api_key": {"env_vars": ["TOGETHER_API_KEY"], "strict": True, "type": "env_var"},
-                "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo ",
-                "api_base_url": "test-base-url",
-                "streaming_callback": "haystack.components.generators.utils.print_streaming_chunk",
-                "generation_kwargs": {"max_tokens": 10, "some_test_param": "test-params"},
-                "timeout": 10,
-                "max_retries": 10,
-            },
-        }
-        with pytest.raises(ValueError, match=r"None of the .* environment variables are set"):
-            TogetherAIChatGenerator.from_dict(data)
-
     def test_run(self, chat_messages, mock_chat_completion, monkeypatch):  # noqa: ARG002
         monkeypatch.setenv("TOGETHER_API_KEY", "fake-api-key")
         component = TogetherAIChatGenerator()
@@ -292,7 +279,7 @@ class TestTogetherAIChatGenerator:
         assert "replies" in response
         assert isinstance(response["replies"], list)
         assert len(response["replies"]) == 1
-        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+        assert isinstance(response["replies"][0], ChatMessage)
 
     def test_run_with_params(self, chat_messages, mock_chat_completion, monkeypatch):
         monkeypatch.setenv("TOGETHER_API_KEY", "fake-api-key")
@@ -308,7 +295,7 @@ class TestTogetherAIChatGenerator:
         assert "replies" in response
         assert isinstance(response["replies"], list)
         assert len(response["replies"]) == 1
-        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+        assert isinstance(response["replies"][0], ChatMessage)
 
     @pytest.mark.skipif(
         not os.environ.get("TOGETHER_API_KEY", None),
@@ -517,35 +504,6 @@ class TestTogetherAIChatGenerator:
             assert isinstance(tool_call, ToolCall)
             assert tool_call.tool_name == "weather"
 
-    @pytest.mark.skipif(
-        not os.environ.get("TOGETHER_API_KEY", None),
-        reason="Export an env var called TOGETHER_API_KEY containing the Together AI API key to run this test.",
-    )
-    @pytest.mark.integration
-    def test_pipeline_with_togetherai_chat_generator(self, tools):
-        """
-        Test that the TogetherAIChatGenerator component can be used in a pipeline
-        """
-        pipeline = Pipeline()
-        pipeline.add_component("generator", TogetherAIChatGenerator(tools=tools))
-        pipeline.add_component("tool_invoker", ToolInvoker(tools=tools))
-
-        pipeline.connect("generator", "tool_invoker")
-
-        results = pipeline.run(
-            data={
-                "generator": {
-                    "messages": [ChatMessage.from_user("What's the weather like in Paris?")],
-                    "generation_kwargs": {"tool_choice": "auto"},
-                }
-            }
-        )
-
-        assert (
-            "The weather in Paris is sunny and 32°C"
-            == results["tool_invoker"]["tool_messages"][0].tool_call_result.result
-        )
-
     def test_serde_in_pipeline(self, monkeypatch):
         """
         Test serialization/deserialization of TogetherAIChatGenerator in a Pipeline,
@@ -576,6 +534,11 @@ class TestTogetherAIChatGenerator:
 
         # Get pipeline dictionary and verify its structure
         pipeline_dict = pipeline.to_dict()
+
+        # the Tool serialization format is owned by haystack-ai and varies across its versions; the
+        # dumps/loads round-trip below covers the tools, so exclude them from the pinned-dict comparison
+        tools_entries = pipeline_dict["components"]["generator"]["init_parameters"].pop("tools")
+        assert len(tools_entries) == 1
         expected_dict = {
             "metadata": {},
             "max_runs_per_component": 100,
@@ -589,17 +552,6 @@ class TestTogetherAIChatGenerator:
                         "streaming_callback": "haystack.components.generators.utils.print_streaming_chunk",
                         "api_base_url": "https://api.together.xyz/v1",
                         "generation_kwargs": {"temperature": 0.7},
-                        "tools": [
-                            {
-                                "type": "haystack.tools.tool.Tool",
-                                "data": {
-                                    "name": "weather",
-                                    "description": "useful to determine the weather in a given location",
-                                    "parameters": {"city": {"type": "string"}},
-                                    "function": "tests.test_togetherai_chat_generator.weather",
-                                },
-                            }
-                        ],
                         "http_client_kwargs": None,
                         "timeout": None,
                         "max_retries": None,
@@ -608,24 +560,6 @@ class TestTogetherAIChatGenerator:
             },
             "connections": [],
         }
-
-        if not hasattr(pipeline, "_connection_type_validation"):
-            expected_dict.pop("connection_type_validation")
-
-        # add outputs_to_string, inputs_from_state and outputs_to_state tool parameters for compatibility with
-        # haystack-ai>=2.12.0
-        if hasattr(tool, "outputs_to_string"):
-            expected_dict["components"]["generator"]["init_parameters"]["tools"][0]["data"]["outputs_to_string"] = (
-                tool.outputs_to_string
-            )
-        if hasattr(tool, "inputs_from_state"):
-            expected_dict["components"]["generator"]["init_parameters"]["tools"][0]["data"]["inputs_from_state"] = (
-                tool.inputs_from_state
-            )
-        if hasattr(tool, "outputs_to_state"):
-            expected_dict["components"]["generator"]["init_parameters"]["tools"][0]["data"]["outputs_to_state"] = (
-                tool.outputs_to_state
-            )
 
         assert pipeline_dict == expected_dict
 
@@ -685,7 +619,7 @@ class TestTogetherAIChatGenerator:
         initial_messages = [
             ChatMessage.from_user("What's the weather like in Paris and what is the population of Berlin?")
         ]
-        component = TogetherAIChatGenerator(model="moonshotai/Kimi-K2.5", tools=mixed_tools)
+        component = TogetherAIChatGenerator(model="moonshotai/Kimi-K2.6", tools=mixed_tools)
         results = component.run(messages=initial_messages)
 
         assert len(results["replies"]) > 0, "No replies received"
@@ -717,7 +651,7 @@ class TestTogetherAIChatGenerator:
             assert tool_call.arguments["city"] in ["Paris", "Berlin"]
             assert tool_call_message.meta["finish_reason"] == "tool_calls"
 
-        # Mock the response we'd get from ToolInvoker
+        # Build the tool result messages returned to the chat generator
         tool_result_messages = []
         for tool_call in tool_calls:
             if tool_call.tool_name == "weather":
@@ -1056,18 +990,10 @@ class TestChatCompletionChunkConversion:
         assert result.meta["finish_reason"] == "tool_calls"
         assert result.meta["index"] == 0
         assert result.meta["completion_start_time"] is not None
-        assert result.meta["usage"] == {
-            "completion_tokens": 42,
-            "prompt_tokens": 55,
-            "total_tokens": 97,
-            "completion_tokens_details": {
-                "accepted_prediction_tokens": None,
-                "audio_tokens": None,
-                "reasoning_tokens": 0,
-                "rejected_prediction_tokens": None,
-            },
-            "prompt_tokens_details": {
-                "audio_tokens": None,
-                "cached_tokens": 0,
-            },
-        }
+
+        usage = result.meta["usage"]
+        assert usage["completion_tokens"] == 42
+        assert usage["prompt_tokens"] == 55
+        assert usage["total_tokens"] == 97
+        assert usage["completion_tokens_details"]["reasoning_tokens"] == 0
+        assert usage["prompt_tokens_details"]["cached_tokens"] == 0

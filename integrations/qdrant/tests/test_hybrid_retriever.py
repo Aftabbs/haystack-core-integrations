@@ -1,8 +1,9 @@
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from haystack.dataclasses import Document, SparseEmbedding
 from haystack.document_stores.types import FilterPolicy
+from qdrant_client.http import models as rest
 
 from haystack_integrations.components.retrievers.qdrant import (
     QdrantHybridRetriever,
@@ -11,6 +12,10 @@ from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
 
 
 class TestQdrantHybridRetriever:
+    def test_init_raises_when_document_store_is_not_qdrant(self):
+        with pytest.raises(ValueError, match="must be an instance of QdrantDocumentStore"):
+            QdrantHybridRetriever(document_store="not a document store")
+
     def test_init_default(self):
         document_store = QdrantDocumentStore(location=":memory:", index="test", use_sparse_embeddings=True)
         retriever = QdrantHybridRetriever(document_store=document_store)
@@ -23,6 +28,8 @@ class TestQdrantHybridRetriever:
         assert retriever._score_threshold is None
         assert retriever._group_by is None
         assert retriever._group_size is None
+        assert retriever._rrf_k is None
+        assert retriever._rrf_weights is None
 
         retriever = QdrantHybridRetriever(document_store=document_store, filter_policy="replace")
         assert retriever._filter_policy == FilterPolicy.REPLACE
@@ -83,8 +90,17 @@ class TestQdrantHybridRetriever:
                 "score_threshold": None,
                 "group_by": None,
                 "group_size": None,
+                "rrf_k": None,
+                "rrf_weights": None,
             },
         }
+
+    def test_to_dict_with_rrf_params(self):
+        document_store = QdrantDocumentStore(location=":memory:", index="test")
+        retriever = QdrantHybridRetriever(document_store=document_store, rrf_k=20, rrf_weights=[2.0, 1.0])
+        res = retriever.to_dict()
+        assert res["init_parameters"]["rrf_k"] == 20
+        assert res["init_parameters"]["rrf_weights"] == [2.0, 1.0]
 
     def test_from_dict(self):
         data = {
@@ -141,6 +157,26 @@ class TestQdrantHybridRetriever:
         assert retriever._group_by is None
         assert retriever._group_size is None
 
+    def test_close(self):
+        mock_store = Mock(spec=QdrantDocumentStore)
+        retriever = QdrantHybridRetriever(document_store=mock_store)
+
+        retriever.close()
+
+        mock_store.close.assert_called_once_with()
+        assert retriever._document_store is mock_store
+
+    @pytest.mark.asyncio
+    async def test_close_async(self):
+        mock_store = Mock(spec=QdrantDocumentStore)
+        mock_store.close_async = AsyncMock()
+        retriever = QdrantHybridRetriever(document_store=mock_store)
+
+        await retriever.close_async()
+
+        mock_store.close_async.assert_awaited_once_with()
+        assert retriever._document_store is mock_store
+
     def test_run(self):
         mock_store = Mock(spec=QdrantDocumentStore)
         sparse_embedding = SparseEmbedding(indices=[0, 1, 2, 3], values=[0.1, 0.8, 0.05, 0.33])
@@ -159,10 +195,72 @@ class TestQdrantHybridRetriever:
         assert call_args[1]["query_sparse_embedding"].values == [0.1, 0.7]
         assert call_args[1]["top_k"] == 10
         assert call_args[1]["return_embedding"] is False
+        assert call_args[1]["rrf_k"] is None
+        assert call_args[1]["rrf_weights"] is None
 
         assert res["documents"][0].content == "Test doc"
         assert res["documents"][0].embedding == [0.1, 0.2]
         assert res["documents"][0].sparse_embedding == sparse_embedding
+
+        # rrf params are forwarded when set at init
+        mock_store._query_hybrid.return_value = []
+        retriever_rrf = QdrantHybridRetriever(document_store=mock_store, rrf_k=20, rrf_weights=[2.0, 1.0])
+        retriever_rrf.run(
+            query_embedding=[0.5, 0.7],
+            query_sparse_embedding=SparseEmbedding(indices=[0, 5], values=[0.1, 0.7]),
+        )
+        call_args = mock_store._query_hybrid.call_args
+        assert call_args[1]["rrf_k"] == 20
+        assert call_args[1]["rrf_weights"] == [2.0, 1.0]
+
+    def test_run_runtime_rrf_params_override_init(self):
+        mock_store = Mock(spec=QdrantDocumentStore)
+        mock_store._query_hybrid.return_value = []
+
+        retriever = QdrantHybridRetriever(document_store=mock_store, rrf_k=20, rrf_weights=[2.0, 1.0])
+        retriever.run(
+            query_embedding=[0.5, 0.7],
+            query_sparse_embedding=SparseEmbedding(indices=[0, 5], values=[0.1, 0.7]),
+            rrf_k=100,
+            rrf_weights=[3.0, 1.0],
+        )
+
+        call_args = mock_store._query_hybrid.call_args
+        assert call_args[1]["rrf_k"] == 100
+        assert call_args[1]["rrf_weights"] == [3.0, 1.0]
+
+    def test_run_falsy_runtime_values_override_init(self):
+        mock_store = Mock(spec=QdrantDocumentStore)
+        mock_store._query_hybrid.return_value = []
+
+        retriever = QdrantHybridRetriever(document_store=mock_store, return_embedding=True, score_threshold=0.5)
+        retriever.run(
+            query_embedding=[0.5, 0.7],
+            query_sparse_embedding=SparseEmbedding(indices=[0, 5], values=[0.1, 0.7]),
+            return_embedding=False,
+            score_threshold=0.0,
+        )
+
+        call_args = mock_store._query_hybrid.call_args
+        assert call_args[1]["return_embedding"] is False
+        assert call_args[1]["score_threshold"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_run_async_falsy_runtime_values_override_init(self):
+        mock_store = Mock(spec=QdrantDocumentStore)
+        mock_store._query_hybrid_async = AsyncMock(return_value=[])
+
+        retriever = QdrantHybridRetriever(document_store=mock_store, return_embedding=True, score_threshold=0.5)
+        await retriever.run_async(
+            query_embedding=[0.5, 0.7],
+            query_sparse_embedding=SparseEmbedding(indices=[0, 5], values=[0.1, 0.7]),
+            return_embedding=False,
+            score_threshold=0.0,
+        )
+
+        call_args = mock_store._query_hybrid_async.call_args
+        assert call_args[1]["return_embedding"] is False
+        assert call_args[1]["score_threshold"] == 0.0
 
     def test_run_with_group_by(self):
         mock_store = Mock(spec=QdrantDocumentStore)
@@ -244,3 +342,24 @@ class TestQdrantHybridRetriever:
         assert result["documents"][0].content == "Test doc"
         assert result["documents"][0].embedding == [0.1, 0.2]
         assert result["documents"][0].sparse_embedding == sparse_embedding
+
+    def test_run_raises_when_merge_with_native_filter(self):
+        document_store = QdrantDocumentStore(location=":memory:", index="test")
+        retriever = QdrantHybridRetriever(
+            document_store=document_store,
+            filters=rest.Filter(must=[]),
+            filter_policy=FilterPolicy.MERGE,
+        )
+        sparse = SparseEmbedding(indices=[0], values=[0.1])
+        with pytest.raises(ValueError, match="Native Qdrant filters"):
+            retriever.run(query_embedding=[0.1], query_sparse_embedding=sparse)
+
+    @pytest.mark.asyncio
+    async def test_run_async_raises_when_merge_with_native_filter(self):
+        document_store = QdrantDocumentStore(location=":memory:", index="test")
+        retriever = QdrantHybridRetriever(document_store=document_store, filter_policy=FilterPolicy.MERGE)
+        sparse = SparseEmbedding(indices=[0], values=[0.1])
+        with pytest.raises(ValueError, match="Native Qdrant filters"):
+            await retriever.run_async(
+                query_embedding=[0.1], query_sparse_embedding=sparse, filters=rest.Filter(must=[])
+            )

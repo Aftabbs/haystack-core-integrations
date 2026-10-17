@@ -1,0 +1,543 @@
+# SPDX-FileCopyrightText: 2022-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from asyncio import Semaphore, gather
+from collections.abc import AsyncIterator
+from dataclasses import replace
+from itertools import chain
+from typing import Any
+
+from haystack import component, default_from_dict, default_to_dict, logging
+from haystack.dataclasses import Document
+from haystack.lazy_imports import LazyImport
+from haystack.utils import Secret
+from haystack.utils.url_validation import is_valid_http_url
+from huggingface_hub import AsyncInferenceClient, InferenceClient
+from tqdm import tqdm
+
+from haystack_integrations.common.huggingface_api.utils import (
+    HFEmbeddingAPIType,
+    HFModelType,
+    _build_grpc_embedding_request,
+    _check_valid_model,
+    _check_valid_model_async,
+    _grpc_metadata,
+)
+
+with LazyImport("Run 'pip install \"huggingface-api-haystack[grpc]\"' for grpc support.") as grpc_import:
+    from grpc_requests import Client
+    from grpc_requests.aio import AsyncClient
+
+
+logger = logging.getLogger(__name__)
+
+# batched embeddings returned by the API are expected to have shape (batch_size, embedding_dim)
+_EXPECTED_EMBEDDING_NDIM = 2
+
+
+@component
+class HuggingFaceAPIDocumentEmbedder:
+    """
+    Embeds documents using Hugging Face APIs.
+
+    Use it with the following Hugging Face APIs:
+    - [Free Serverless Inference API](https://huggingface.co/inference-api)
+    - [Paid Inference Endpoints](https://huggingface.co/inference-endpoints)
+    - [Self-hosted Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference)
+
+
+    ### Usage examples
+
+    #### With free serverless inference API
+
+    ```python
+    from haystack_integrations.components.embedders.huggingface_api import HuggingFaceAPIDocumentEmbedder
+    from haystack.utils import Secret
+    from haystack.dataclasses import Document
+
+    doc = Document(content="I love pizza!")
+
+    doc_embedder = HuggingFaceAPIDocumentEmbedder(api_type="serverless_inference_api",
+                                                  api_params={"model": "BAAI/bge-small-en-v1.5"},
+                                                  token=Secret.from_token("<your-api-key>"))
+
+    result = document_embedder.run([doc])
+    print(result["documents"][0].embedding)
+
+    # [0.017020374536514282, -0.023255806416273117, ...]
+    ```
+
+    #### With paid inference endpoints
+
+    ```python
+    from haystack_integrations.components.embedders.huggingface_api import HuggingFaceAPIDocumentEmbedder
+    from haystack.utils import Secret
+    from haystack.dataclasses import Document
+
+    doc = Document(content="I love pizza!")
+
+    doc_embedder = HuggingFaceAPIDocumentEmbedder(api_type="inference_endpoints",
+                                                  api_params={"url": "<your-inference-endpoint-url>"},
+                                                  token=Secret.from_token("<your-api-key>"))
+
+    result = document_embedder.run([doc])
+    print(result["documents"][0].embedding)
+
+    # [0.017020374536514282, -0.023255806416273117, ...]
+    ```
+
+    #### With self-hosted text embeddings inference
+
+    ```python
+    from haystack_integrations.components.embedders.huggingface_api import HuggingFaceAPIDocumentEmbedder
+    from haystack.dataclasses import Document
+
+    doc = Document(content="I love pizza!")
+
+    doc_embedder = HuggingFaceAPIDocumentEmbedder(api_type="text_embeddings_inference",
+                                                  api_params={"url": "http://localhost:8080"})
+
+    result = document_embedder.run([doc])
+    print(result["documents"][0].embedding)
+
+    # [0.017020374536514282, -0.023255806416273117, ...]
+    ```
+    """
+
+    def __init__(
+        self,
+        api_type: HFEmbeddingAPIType | str,
+        api_params: dict[str, str],
+        token: Secret | None = Secret.from_env_var(["HF_API_TOKEN", "HF_TOKEN"], strict=False),
+        prefix: str = "",
+        suffix: str = "",
+        truncate: bool | None = True,
+        normalize: bool | None = False,
+        batch_size: int = 32,
+        progress_bar: bool = True,
+        meta_fields_to_embed: list[str] | None = None,
+        embedding_separator: str = "\n",
+        concurrency_limit: int = 4,
+        use_grpc: bool = False,
+    ) -> None:
+        """
+        Creates a HuggingFaceAPIDocumentEmbedder component.
+
+        :param api_type:
+            The type of Hugging Face API to use.
+        :param api_params:
+            A dictionary with the following keys:
+            - `model`: Hugging Face model ID. Required when `api_type` is `SERVERLESS_INFERENCE_API`.
+            - `url`: URL of the inference endpoint, or gRPC target. Required when `api_type` is
+            `INFERENCE_ENDPOINTS` or `TEXT_EMBEDDINGS_INFERENCE`.
+        :param token: The Hugging Face token to use as bearer authorization.
+            Check your HF token in your [account settings](https://huggingface.co/settings/tokens).
+        :param prefix:
+            A string to add at the beginning of each text.
+        :param suffix:
+            A string to add at the end of each text.
+        :param truncate:
+            Truncates the input text to the maximum length supported by the model.
+            Applicable when `api_type` is `TEXT_EMBEDDINGS_INFERENCE`, or `INFERENCE_ENDPOINTS`
+            if the backend uses Text Embeddings Inference.
+            If `api_type` is `SERVERLESS_INFERENCE_API`, this parameter is ignored.
+        :param normalize:
+            Normalizes the embeddings to unit length.
+            Applicable when `api_type` is `TEXT_EMBEDDINGS_INFERENCE`, or `INFERENCE_ENDPOINTS`
+            if the backend uses Text Embeddings Inference.
+            If `api_type` is `SERVERLESS_INFERENCE_API`, this parameter is ignored.
+        :param batch_size:
+            Number of documents to process at once. Only used with HTTP.
+        :param progress_bar:
+            If `True`, shows a progress bar when running.
+        :param meta_fields_to_embed:
+            List of metadata fields to embed along with the document text.
+        :param embedding_separator:
+            Separator used to concatenate the metadata fields to the document text.
+        :param concurrency_limit:
+            The maximum number of HTTP requests or gRPC streams that should be allowed to run concurrently.
+            This parameter is only used in the `run_async` method.
+        :param use_grpc:
+            Use gRPC instead of HTTP. Requires `huggingface-api-haystack[grpc]`.
+        :raises ValueError:
+            If the required `model` or `url` is missing from `api_params`, the HTTP `url` is invalid,
+            or the `api_type` is unknown or is `SERVERLESS_INFERENCE_API` with `use_grpc=True`.
+        """
+        if isinstance(api_type, str):
+            api_type = HFEmbeddingAPIType.from_str(api_type)
+
+        if use_grpc and api_type == HFEmbeddingAPIType.SERVERLESS_INFERENCE_API:
+            msg = "gRPC is not supported by the Serverless Inference API."
+            raise ValueError(msg)
+
+        api_params = api_params or {}
+
+        if api_type == HFEmbeddingAPIType.SERVERLESS_INFERENCE_API:
+            model = api_params.get("model")
+            if model is None:
+                msg = "To use the Serverless Inference API, you need to specify the `model` parameter in `api_params`."
+                raise ValueError(msg)
+            model_or_url = model
+        elif api_type in [HFEmbeddingAPIType.INFERENCE_ENDPOINTS, HFEmbeddingAPIType.TEXT_EMBEDDINGS_INFERENCE]:
+            url = api_params.get("url")
+            if url is None:
+                msg = (
+                    "To use Text Embeddings Inference or Inference Endpoints, you need to specify the `url` "
+                    "parameter in `api_params`."
+                )
+                raise ValueError(msg)
+            if not use_grpc and not is_valid_http_url(url):
+                msg = f"Invalid URL: {url}"
+                raise ValueError(msg)
+            model_or_url = url
+        else:
+            msg = f"Unknown api_type {api_type}"
+            raise ValueError(msg)
+
+        if use_grpc:
+            grpc_import.check()
+
+        self.api_type = api_type
+        self.api_params = api_params
+        self.token = token
+        self.prefix = prefix
+        self.suffix = suffix
+        self.truncate = truncate
+        self.normalize = normalize
+        self.use_grpc = use_grpc
+        self.batch_size = batch_size
+        self.progress_bar = progress_bar
+        self.meta_fields_to_embed = meta_fields_to_embed or []
+        self.embedding_separator = embedding_separator
+        self.concurrency_limit = concurrency_limit
+        self._model_or_url = model_or_url
+        self._client: InferenceClient | None = None
+        self._async_client: AsyncInferenceClient | None = None
+        self._grpc_client: Client | None = None
+        self._async_grpc_client: AsyncClient | None = None
+
+    def _client_kwargs(self) -> dict[str, Any]:
+        """Build the keyword arguments used to create Hugging Face clients."""
+        return {"model": self._model_or_url, "token": self.token.resolve_value() if self.token else None}
+
+    def warm_up(self) -> None:
+        """Create the synchronous client."""
+        if self.use_grpc:
+            if self._grpc_client is None:
+                self._grpc_client = Client(self._model_or_url)
+            return
+
+        if self._client is None:
+            if self.api_type == HFEmbeddingAPIType.SERVERLESS_INFERENCE_API:
+                _check_valid_model(self._model_or_url, HFModelType.EMBEDDING, self.token)
+            self._client = InferenceClient(**self._client_kwargs())
+
+    async def warm_up_async(self) -> None:
+        """Create the asynchronous client."""
+        if self.use_grpc:
+            if self._async_grpc_client is None:
+                self._async_grpc_client = await AsyncClient.create(self._model_or_url)
+            return
+
+        if self._async_client is None:
+            if self.api_type == HFEmbeddingAPIType.SERVERLESS_INFERENCE_API:
+                await _check_valid_model_async(self._model_or_url, HFModelType.EMBEDDING, self.token)
+            self._async_client = AsyncInferenceClient(**self._client_kwargs())
+
+    def close(self) -> None:
+        """Close the synchronous client."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+        if self._grpc_client is not None:
+            self._grpc_client.channel.close()
+            self._grpc_client = None
+
+    async def close_async(self) -> None:
+        """Close the asynchronous client."""
+        if self._async_client is not None:
+            await self._async_client.close()
+            self._async_client = None
+        if self._async_grpc_client is not None:
+            await self._async_grpc_client.channel.close()
+            self._async_grpc_client = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Serializes the component to a dictionary.
+
+        :returns:
+            Dictionary with serialized data.
+        """
+        return default_to_dict(
+            self,
+            api_type=str(self.api_type),
+            api_params=self.api_params,
+            prefix=self.prefix,
+            suffix=self.suffix,
+            token=self.token,
+            truncate=self.truncate,
+            normalize=self.normalize,
+            use_grpc=self.use_grpc,
+            batch_size=self.batch_size,
+            progress_bar=self.progress_bar,
+            meta_fields_to_embed=self.meta_fields_to_embed,
+            embedding_separator=self.embedding_separator,
+            concurrency_limit=self.concurrency_limit,
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "HuggingFaceAPIDocumentEmbedder":
+        """
+        Deserializes the component from a dictionary.
+
+        :param data:
+            Dictionary to deserialize from.
+        :returns:
+            Deserialized component.
+        """
+        return default_from_dict(cls, data)
+
+    def _prepare_texts_to_embed(self, documents: list[Document]) -> list[str]:
+        """
+        Prepare the texts to embed by concatenating the Document text with the metadata fields to embed.
+        """
+        texts_to_embed = []
+        for doc in documents:
+            meta_values_to_embed = [
+                str(doc.meta[key]) for key in self.meta_fields_to_embed if key in doc.meta and doc.meta[key] is not None
+            ]
+
+            text_to_embed = (
+                self.prefix + self.embedding_separator.join([*meta_values_to_embed, doc.content or ""]) + self.suffix
+            )
+
+            texts_to_embed.append(text_to_embed)
+        return texts_to_embed
+
+    @staticmethod
+    def _adjust_api_parameters(
+        truncate: bool | None, normalize: bool | None, api_type: HFEmbeddingAPIType
+    ) -> tuple[bool | None, bool | None]:
+        """
+        Adjust the truncate and normalize parameters based on the API type.
+        """
+        if api_type == HFEmbeddingAPIType.SERVERLESS_INFERENCE_API:
+            if truncate is not None:
+                msg = "`truncate` parameter is not supported for Serverless Inference API. It will be ignored."
+                logger.warning(msg)
+                truncate = None
+            if normalize is not None:
+                msg = "`normalize` parameter is not supported for Serverless Inference API. It will be ignored."
+                logger.warning(msg)
+                normalize = None
+        return truncate, normalize
+
+    def _embed_batch_grpc(self, texts_to_embed: list[str]) -> list[list[float]]:
+        """Embed all texts through a single gRPC stream."""
+        if not texts_to_embed:
+            return []
+
+        assert self._grpc_client is not None  # noqa: S101
+        responses = self._grpc_client.stream_stream(
+            "tei.v1.Embed",
+            "EmbedStream",
+            (_build_grpc_embedding_request(text, self.truncate, self.normalize) for text in texts_to_embed),
+            metadata=_grpc_metadata(self.token),
+        )
+        embeddings = [
+            response["embeddings"]
+            for response in tqdm(
+                responses,
+                total=len(texts_to_embed),
+                disable=not self.progress_bar,
+                desc="Calculating embeddings",
+            )
+        ]
+        if len(embeddings) != len(texts_to_embed):
+            msg = f"Expected {len(texts_to_embed)} embeddings, got {len(embeddings)}"
+            raise ValueError(msg)
+        return embeddings
+
+    def _embed_batch(self, texts_to_embed: list[str], batch_size: int) -> list[list[float]]:
+        """
+        Embed a list of texts in batches.
+        """
+        assert self._client is not None  # noqa: S101
+        truncate, normalize = self._adjust_api_parameters(self.truncate, self.normalize, self.api_type)
+
+        all_embeddings: list = []
+        for i in tqdm(
+            range(0, len(texts_to_embed), batch_size), disable=not self.progress_bar, desc="Calculating embeddings"
+        ):
+            batch = texts_to_embed[i : i + batch_size]
+
+            # a batch is accepted but text is typed as str
+            np_embeddings = self._client.feature_extraction(
+                text=batch,  # type: ignore[arg-type]
+                truncate=truncate,
+                normalize=normalize,
+            )
+
+            if np_embeddings.ndim != _EXPECTED_EMBEDDING_NDIM or np_embeddings.shape[0] != len(batch):
+                msg = f"Expected embedding shape ({batch_size}, embedding_dim), got {np_embeddings.shape}"
+                raise ValueError(msg)
+
+            all_embeddings.extend(np_embeddings.tolist())
+
+        return all_embeddings
+
+    async def _embed_batch_grpc_async(self, texts_to_embed: list[str]) -> list[list[float]]:
+        """Embed texts through concurrent gRPC streams."""
+        if not texts_to_embed:
+            return []
+
+        # Split texts evenly into ordered streams, up to the concurrency limit.
+        stream_count = min(max(1, self.concurrency_limit), len(texts_to_embed))
+        streams = [
+            texts_to_embed[len(texts_to_embed) * i // stream_count : len(texts_to_embed) * (i + 1) // stream_count]
+            for i in range(stream_count)
+        ]
+
+        pbar = tqdm(total=stream_count, disable=not self.progress_bar, desc="Calculating embeddings")
+
+        async def _runner(texts: list[str]) -> list[list[float]]:
+            async def _requests() -> AsyncIterator[dict[str, Any]]:
+                for text in texts:
+                    yield _build_grpc_embedding_request(text, self.truncate, self.normalize)
+
+            assert self._async_grpc_client is not None  # noqa: S101
+            responses = await self._async_grpc_client.stream_stream(
+                "tei.v1.Embed", "EmbedStream", _requests(), metadata=_grpc_metadata(self.token)
+            )
+            embeddings = [response["embeddings"] async for response in responses]
+            if len(embeddings) != len(texts):
+                msg = f"Expected {len(texts)} embeddings, got {len(embeddings)}"
+                raise ValueError(msg)
+            pbar.update(1)
+            return embeddings
+
+        try:
+            return [*chain(*await gather(*(_runner(texts) for texts in streams)))]
+        finally:
+            pbar.close()
+
+    async def _embed_batch_async(self, texts_to_embed: list[str], batch_size: int) -> list[list[float]]:
+        """
+        Embed a list of texts in batches asynchronously.
+        """
+        assert self._async_client is not None  # noqa: S101
+        async_client = self._async_client
+        truncate, normalize = self._adjust_api_parameters(self.truncate, self.normalize, self.api_type)
+        sem = Semaphore(max(1, self.concurrency_limit))
+        num_batches = (len(texts_to_embed) + batch_size - 1) // batch_size
+        pbar = tqdm(total=num_batches, disable=not self.progress_bar, desc="Calculating embeddings")
+
+        async def _runner(batch: list[str]) -> list[list[float]]:
+            async with sem:
+                # a batch is accepted but text is typed as str
+                np_embeddings = await async_client.feature_extraction(
+                    text=batch,  # type: ignore[arg-type]
+                    truncate=truncate,
+                    normalize=normalize,
+                )
+
+                if np_embeddings.ndim != _EXPECTED_EMBEDDING_NDIM or np_embeddings.shape[0] != len(batch):
+                    msg = f"Expected embedding shape ({batch_size}, embedding_dim), got {np_embeddings.shape}"
+                    raise ValueError(msg)
+
+                pbar.update(1)
+                return np_embeddings.tolist()
+
+        try:
+            all_embeddings = [
+                *chain(
+                    *await gather(
+                        *[
+                            _runner(texts_to_embed[i : i + batch_size])
+                            for i in range(0, len(texts_to_embed), batch_size)
+                        ]
+                    )
+                )
+            ]
+        finally:
+            pbar.close()
+
+        return all_embeddings
+
+    @component.output_types(documents=list[Document])
+    def run(self, documents: list[Document]) -> dict[str, list[Document]]:
+        """
+        Embeds a list of documents.
+
+        :param documents:
+            Documents to embed.
+
+        :raises TypeError:
+            If `documents` is not a list of Documents.
+        :raises ValueError:
+            If the embeddings returned by the API have an unexpected shape.
+        :returns:
+            A dictionary with the following keys:
+            - `documents`: A list of documents with embeddings.
+        """
+        self.warm_up()
+
+        if not isinstance(documents, list) or (documents and not isinstance(documents[0], Document)):
+            msg = (
+                "HuggingFaceAPIDocumentEmbedder expects a list of Documents as input."
+                " In case you want to embed a string, please use the HuggingFaceAPITextEmbedder."
+            )
+            raise TypeError(msg)
+
+        texts_to_embed = self._prepare_texts_to_embed(documents=documents)
+
+        if self.use_grpc:
+            embeddings = self._embed_batch_grpc(texts_to_embed)
+        else:
+            embeddings = self._embed_batch(texts_to_embed=texts_to_embed, batch_size=self.batch_size)
+
+        new_documents = []
+        for doc, emb in zip(documents, embeddings, strict=True):
+            new_documents.append(replace(doc, embedding=emb))
+
+        return {"documents": new_documents}
+
+    @component.output_types(documents=list[Document])
+    async def run_async(self, documents: list[Document]) -> dict[str, list[Document]]:
+        """
+        Embeds a list of documents asynchronously.
+
+        :param documents:
+            Documents to embed.
+
+        :raises TypeError:
+            If `documents` is not a list of Documents.
+        :raises ValueError:
+            If the embeddings returned by the API have an unexpected shape.
+        :returns:
+            A dictionary with the following keys:
+            - `documents`: A list of documents with embeddings.
+        """
+        await self.warm_up_async()
+
+        if not isinstance(documents, list) or (documents and not isinstance(documents[0], Document)):
+            msg = (
+                "HuggingFaceAPIDocumentEmbedder expects a list of Documents as input."
+                " In case you want to embed a string, please use the HuggingFaceAPITextEmbedder."
+            )
+            raise TypeError(msg)
+
+        texts_to_embed = self._prepare_texts_to_embed(documents=documents)
+
+        if self.use_grpc:
+            embeddings = await self._embed_batch_grpc_async(texts_to_embed)
+        else:
+            embeddings = await self._embed_batch_async(texts_to_embed=texts_to_embed, batch_size=self.batch_size)
+
+        new_documents = []
+        for doc, emb in zip(documents, embeddings, strict=True):
+            new_documents.append(replace(doc, embedding=emb))
+
+        return {"documents": new_documents}

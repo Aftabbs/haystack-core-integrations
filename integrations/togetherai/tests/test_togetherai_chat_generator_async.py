@@ -77,20 +77,21 @@ def mock_async_chat_completion():
                 "total_tokens": 97,
             },
         )
-        # For async mocks, the return value should be awaitable
+        # AsyncMock returns this completion when awaited
         mock_chat_completion_create.return_value = completion
         yield mock_chat_completion_create
 
 
 class TestTogetherAIChatGeneratorAsync:
-    def test_init_default_async(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_warm_up_async(self, monkeypatch):
         monkeypatch.setenv("TOGETHER_API_KEY", "test-api-key")
         component = TogetherAIChatGenerator()
+        await component.warm_up_async()
 
         assert isinstance(component.async_client, AsyncOpenAI)
         assert component.async_client.api_key == "test-api-key"
         assert component.async_client.base_url == "https://api.together.xyz/v1/"
-        assert not component.generation_kwargs
 
     @pytest.mark.asyncio
     async def test_run_async(self, chat_messages, mock_async_chat_completion, monkeypatch):  # noqa: ARG002
@@ -103,7 +104,7 @@ class TestTogetherAIChatGeneratorAsync:
         assert "replies" in response
         assert isinstance(response["replies"], list)
         assert len(response["replies"]) == 1
-        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+        assert isinstance(response["replies"][0], ChatMessage)
 
     @pytest.mark.asyncio
     async def test_run_async_with_params(self, chat_messages, mock_async_chat_completion, monkeypatch):
@@ -121,7 +122,7 @@ class TestTogetherAIChatGeneratorAsync:
         assert "replies" in response
         assert isinstance(response["replies"], list)
         assert len(response["replies"]) == 1
-        assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
+        assert isinstance(response["replies"][0], ChatMessage)
 
     @pytest.mark.skipif(
         not os.environ.get("TOGETHER_API_KEY", None),
@@ -176,7 +177,7 @@ class TestTogetherAIChatGeneratorAsync:
     @pytest.mark.asyncio
     async def test_live_run_with_tools_and_response_async(self, tools):
         initial_messages = [ChatMessage.from_user("What's the weather like in Paris?")]
-        component = TogetherAIChatGenerator(model="openai/gpt-oss-20b", tools=tools)
+        component = TogetherAIChatGenerator(model="openai/gpt-oss-120b", tools=tools)
         results = await component.run_async(messages=initial_messages, generation_kwargs={"tool_choice": "auto"})
 
         assert len(results["replies"]) > 0, "No replies received"

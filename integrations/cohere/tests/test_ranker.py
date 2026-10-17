@@ -35,7 +35,25 @@ def mock_ranker_response():
         yield mock_ranker_response
 
 
-class TestCohereRanker:
+@pytest.fixture
+def mock_async_ranker_response():
+    with patch("cohere.AsyncClientV2.rerank", autospec=True) as mock_ranker_response:
+        mock_response = Mock()
+
+        mock_ranker_res_obj1 = Mock()
+        mock_ranker_res_obj1.index = 2
+        mock_ranker_res_obj1.relevance_score = 0.98
+
+        mock_ranker_res_obj2 = Mock()
+        mock_ranker_res_obj2.index = 1
+        mock_ranker_res_obj2.relevance_score = 0.95
+
+        mock_response.results = [mock_ranker_res_obj1, mock_ranker_res_obj2]
+        mock_ranker_response.return_value = mock_response
+        yield mock_ranker_response
+
+
+class TestInitializationAndSerialization:
     def test_init_default(self, monkeypatch):
         monkeypatch.setenv("CO_API_KEY", "test-api-key")
         component = CohereRanker()
@@ -46,12 +64,8 @@ class TestCohereRanker:
         assert component.meta_fields_to_embed == []
         assert component.meta_data_separator == "\n"
         assert component.max_tokens_per_doc == 4096
-
-    def test_init_fail_wo_api_key(self, monkeypatch):
-        monkeypatch.delenv("CO_API_KEY", raising=False)
-        monkeypatch.delenv("COHERE_API_KEY", raising=False)
-        with pytest.raises(ValueError, match=r"None of the following authentication environment variables are set: *"):
-            CohereRanker()
+        assert component._cohere_client is None
+        assert component._cohere_async_client is None
 
     def test_init_with_parameters(self, monkeypatch):
         monkeypatch.setenv("CO_API_KEY", "test-api-key")
@@ -137,21 +151,39 @@ class TestCohereRanker:
         assert component.meta_data_separator == ","
         assert component.max_tokens_per_doc == 100
 
-    def test_from_dict_fail_wo_env_var(self, monkeypatch):
-        monkeypatch.delenv("CO_API_KEY", raising=False)
-        monkeypatch.delenv("COHERE_API_KEY", raising=False)
-        data = {
-            "type": "haystack_integrations.components.rankers.cohere.ranker.CohereRanker",
-            "init_parameters": {
-                "model": "rerank-multilingual-v3.0",
-                "api_key": {"env_vars": ["COHERE_API_KEY", "CO_API_KEY"], "strict": True, "type": "env_var"},
-                "top_k": 2,
-                "max_tokens_per_doc": 100,
-            },
-        }
-        with pytest.raises(ValueError, match=r"None of the following authentication environment variables are set: *"):
-            CohereRanker.from_dict(data)
 
+class TestComponentLifecycle:
+    def test_key_resolved_at_warm_up_not_init(self, monkeypatch):
+        monkeypatch.delenv("MISSING_COHERE_API_KEY", raising=False)
+        component = CohereRanker(api_key=Secret.from_env_var("MISSING_COHERE_API_KEY"))
+
+        with pytest.raises(ValueError, match="MISSING_COHERE_API_KEY"):
+            component.warm_up()
+
+    @patch("haystack_integrations.components.rankers.cohere.ranker.ClientV2")
+    def test_warm_up_is_idempotent(self, mock_client_cls):
+        component = CohereRanker(api_key=Secret.from_token("test-api-key"))
+
+        component.warm_up()
+        component.warm_up()
+
+        mock_client_cls.assert_called_once_with(api_key="test-api-key", base_url=COHERE_API_URL, client_name="haystack")
+        assert component._cohere_client is mock_client_cls.return_value
+        assert component._cohere_async_client is None
+
+    @patch("haystack_integrations.components.rankers.cohere.ranker.AsyncClientV2")
+    async def test_warm_up_async_is_idempotent(self, mock_client_cls):
+        component = CohereRanker(api_key=Secret.from_token("test-api-key"))
+
+        await component.warm_up_async()
+        await component.warm_up_async()
+
+        mock_client_cls.assert_called_once_with(api_key="test-api-key", base_url=COHERE_API_URL, client_name="haystack")
+        assert component._cohere_async_client is mock_client_cls.return_value
+        assert component._cohere_client is None
+
+
+class TestRun:
     def test_prepare_cohere_input_docs_default_separator(self, monkeypatch):
         monkeypatch.setenv("CO_API_KEY", "test-api-key")
         component = CohereRanker(meta_fields_to_embed=["meta_field_1", "meta_field_2"])
@@ -167,7 +199,7 @@ class TestCohereRanker:
             for i in range(5)
         ]
 
-        texts = component._prepare_cohere_input_docs(documents=documents)
+        texts, top_k = component._prepare_cohere_input_docs(documents=documents)
 
         assert texts == [
             "meta_value_1 0\nmeta_value_2 5\ndocument number 0",
@@ -176,6 +208,7 @@ class TestCohereRanker:
             "meta_value_1 3\nmeta_value_2 8\ndocument number 3",
             "meta_value_1 4\nmeta_value_2 9\ndocument number 4",
         ]
+        assert top_k == 10
 
     def test_prepare_cohere_input_docs_custom_separator(self, monkeypatch):
         monkeypatch.setenv("CO_API_KEY", "test-api-key")
@@ -192,7 +225,7 @@ class TestCohereRanker:
             for i in range(5)
         ]
 
-        texts = component._prepare_cohere_input_docs(documents=documents)
+        texts, top_k = component._prepare_cohere_input_docs(documents=documents)
 
         assert texts == [
             "meta_value_1 0 meta_value_2 5 document number 0",
@@ -201,13 +234,14 @@ class TestCohereRanker:
             "meta_value_1 3 meta_value_2 8 document number 3",
             "meta_value_1 4 meta_value_2 9 document number 4",
         ]
+        assert top_k == 10
 
     def test_prepare_cohere_input_docs_no_meta_data(self, monkeypatch):
         monkeypatch.setenv("CO_API_KEY", "test-api-key")
         component = CohereRanker(meta_fields_to_embed=["meta_field_1", "meta_field_2"], meta_data_separator=" ")
         documents = [Document(content=f"document number {i}") for i in range(5)]
 
-        texts = component._prepare_cohere_input_docs(documents=documents)
+        texts, top_k = component._prepare_cohere_input_docs(documents=documents)
 
         assert texts == [
             "document number 0",
@@ -216,46 +250,51 @@ class TestCohereRanker:
             "document number 3",
             "document number 4",
         ]
+        assert top_k == 10
 
     def test_prepare_cohere_input_docs_no_docs(self, monkeypatch):
         monkeypatch.setenv("CO_API_KEY", "test-api-key")
         component = CohereRanker(meta_fields_to_embed=["meta_field_1", "meta_field_2"], meta_data_separator=" ")
         documents = []
 
-        texts = component._prepare_cohere_input_docs(documents=documents)
+        texts, top_k = component._prepare_cohere_input_docs(documents=documents)
 
         assert texts == []
+        assert top_k == 10
 
-    def test_run_negative_topk_in_init(self, monkeypatch):
+    def test_init_negative_topk(self, monkeypatch):
         monkeypatch.setenv("CO_API_KEY", "test-api-key")
-        ranker = CohereRanker(top_k=-2)
-        query = "test"
-        documents = [Document(content="doc1"), Document(content="doc2"), Document(content="doc3")]
-        with pytest.raises(ValueError, match=r"top_k must be > 0, but got *"):
-            ranker.run(query, documents)
+        with pytest.raises(ValueError, match=r"top_k must be > 0, but got -2"):
+            CohereRanker(top_k=-2)
 
-    def test_run_zero_topk_in_init(self, monkeypatch):
+    def test_init_zero_topk(self, monkeypatch):
         monkeypatch.setenv("CO_API_KEY", "test-api-key")
-        ranker = CohereRanker(top_k=0)
-        query = "test"
-        documents = [Document(content="doc1"), Document(content="doc2"), Document(content="doc3")]
-        with pytest.raises(ValueError, match=r"top_k must be > 0, but got *"):
-            ranker.run(query, documents)
+        with pytest.raises(ValueError, match=r"top_k must be > 0, but got 0"):
+            CohereRanker(top_k=0)
 
     def test_run_negative_topk_in_run(self, monkeypatch):
         monkeypatch.setenv("CO_API_KEY", "test-api-key")
         ranker = CohereRanker()
         query = "test"
         documents = [Document(content="doc1"), Document(content="doc2"), Document(content="doc3")]
-        with pytest.raises(ValueError, match=r"top_k must be > 0, but got *"):
+        with pytest.raises(ValueError, match=r"top_k must be > 0, but got -3"):
             ranker.run(query, documents, -3)
 
-    def test_run_zero_topk_in_run_and_init(self, monkeypatch):
+    def test_run_zero_topk_in_run(self, monkeypatch):
         monkeypatch.setenv("CO_API_KEY", "test-api-key")
-        ranker = CohereRanker(top_k=0)
+        ranker = CohereRanker()
         query = "test"
         documents = [Document(content="doc1"), Document(content="doc2"), Document(content="doc3")]
-        with pytest.raises(ValueError, match=r"top_k must be > 0, but got *"):
+        with pytest.raises(ValueError, match=r"top_k must be > 0, but got 0"):
+            ranker.run(query, documents, 0)
+
+    def test_run_zero_topk_does_not_fall_back_to_instance_topk(self, monkeypatch):
+        # a runtime top_k=0 must raise, not silently fall back to the instance top_k
+        monkeypatch.setenv("CO_API_KEY", "test-api-key")
+        ranker = CohereRanker(top_k=5)
+        query = "test"
+        documents = [Document(content="doc1"), Document(content="doc2"), Document(content="doc3")]
+        with pytest.raises(ValueError, match=r"top_k must be > 0, but got 0"):
             ranker.run(query, documents, 0)
 
     def test_run_documents_provided(self, monkeypatch, mock_ranker_response):  # noqa: ARG002
@@ -316,6 +355,44 @@ class TestCohereRanker:
         for doc in reranked_docs:
             assert doc.score is not None
 
+    @pytest.mark.asyncio
+    async def test_run_async(self, monkeypatch, mock_async_ranker_response):  # noqa: ARG002
+        monkeypatch.setenv("CO_API_KEY", "test-api-key")
+        ranker = CohereRanker(top_k=2)
+        query = "test"
+        documents = [
+            Document(id="abcd", content="doc1", meta={"meta_field": "meta_value_1"}),
+            Document(id="efgh", content="doc2", meta={"meta_field": "meta_value_2"}),
+            Document(id="ijkl", content="doc3", meta={"meta_field": "meta_value_3"}),
+        ]
+        ranker_results = await ranker.run_async(query, documents, 2)
+
+        assert isinstance(ranker_results, dict)
+        reranked_docs = ranker_results["documents"]
+        assert reranked_docs == [
+            Document(id="ijkl", content="doc3", meta={"meta_field": "meta_value_3"}, score=0.98),
+            Document(id="efgh", content="doc2", meta={"meta_field": "meta_value_2"}, score=0.95),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_run_async_negative_topk(self, monkeypatch):
+        monkeypatch.setenv("CO_API_KEY", "test-api-key")
+        ranker = CohereRanker()
+        query = "test"
+        documents = [Document(content="doc1"), Document(content="doc2"), Document(content="doc3")]
+        with pytest.raises(ValueError, match=r"top_k must be > 0, but got -3"):
+            await ranker.run_async(query, documents, -3)
+
+    @pytest.mark.asyncio
+    async def test_run_async_zero_topk_does_not_fall_back_to_instance_topk(self, monkeypatch):
+        # a runtime top_k=0 must raise, not silently fall back to the instance top_k
+        monkeypatch.setenv("CO_API_KEY", "test-api-key")
+        ranker = CohereRanker(top_k=5)
+        query = "test"
+        documents = [Document(content="doc1"), Document(content="doc2"), Document(content="doc3")]
+        with pytest.raises(ValueError, match=r"top_k must be > 0, but got 0"):
+            await ranker.run_async(query, documents, 0)
+
     @pytest.mark.skipif(
         not os.environ.get("COHERE_API_KEY", None) and not os.environ.get("CO_API_KEY", None),
         reason="Export an env var called COHERE_API_KEY/CO_API_KEY containing the Cohere API key to run this test.",
@@ -361,5 +438,29 @@ class TestCohereRanker:
         assert isinstance(ranker_result, dict)
         assert isinstance(ranker_result["documents"], list)
         assert len(ranker_result["documents"]) == 3
+        assert all(isinstance(doc, Document) for doc in ranker_result["documents"])
+        assert set(result_documents_contents) == set(expected_documents_content)
+
+    @pytest.mark.skipif(
+        not os.environ.get("COHERE_API_KEY", None) and not os.environ.get("CO_API_KEY", None),
+        reason="Export an env var called COHERE_API_KEY/CO_API_KEY containing the Cohere API key to run this test.",
+    )
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_live_run_async(self):
+        component = CohereRanker()
+        documents = [
+            Document(id="abcd", content="Paris is in France"),
+            Document(id="efgh", content="Berlin is in Germany"),
+            Document(id="ijkl", content="Lyon is in France"),
+        ]
+
+        ranker_result = await component.run_async("Cities in France", documents, 2)
+        expected_documents_content = ["Paris is in France", "Lyon is in France"]
+        result_documents_contents = [doc.content for doc in ranker_result["documents"]]
+
+        assert isinstance(ranker_result, dict)
+        assert isinstance(ranker_result["documents"], list)
+        assert len(ranker_result["documents"]) == 2
         assert all(isinstance(doc, Document) for doc in ranker_result["documents"])
         assert set(result_documents_contents) == set(expected_documents_content)

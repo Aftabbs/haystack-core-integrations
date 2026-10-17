@@ -3,13 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import re
-from typing import Any, Literal
+from contextlib import suppress
+from typing import Any, Literal, overload
 
 from haystack import default_from_dict, default_to_dict, logging
 from haystack.dataclasses.document import Document
 from haystack.document_stores.errors import DocumentStoreError, DuplicateDocumentError
 from haystack.document_stores.types import DuplicatePolicy
-from haystack.utils import Secret, deserialize_secrets_inplace
+from haystack.utils import Secret
 from pymongo import AsyncMongoClient, InsertOne, MongoClient, ReplaceOne, UpdateOne
 from pymongo.asynchronous.collection import AsyncCollection
 from pymongo.collection import Collection
@@ -19,6 +20,10 @@ from pymongo.errors import BulkWriteError
 from haystack_integrations.document_stores.mongodb_atlas.filters import _normalize_filters
 
 logger = logging.getLogger(__name__)
+
+# Sentinel object used by _pop_nested_value to distinguish "path not found"
+# from "path exists and its value is None".
+_MISSING: object = object()
 
 
 class MongoDBAtlasDocumentStore:
@@ -67,6 +72,7 @@ class MongoDBAtlasDocumentStore:
         full_text_search_index: str,
         embedding_field: str = "embedding",
         content_field: str = "content",
+        meta_project_mapping: dict[str, str] | None = None,
     ) -> None:
         """
         Creates a new MongoDBAtlasDocumentStore instance.
@@ -91,6 +97,10 @@ class MongoDBAtlasDocumentStore:
             This field allows defining which field to load into the Haystack Document object as content.
             It can be particularly useful when integrating with an existing collection for retrieval. We discourage
             using this parameter when working with collections created by Haystack.
+        :param meta_project_mapping: A dictionary mapping metadata fields in the Haystack Document (keys)
+            to custom fields in the MongoDB document (values). Values must be bare field paths, e.g.
+            ``"source"`` or ``"metadata.author"``. A leading ``"$"`` is accepted for backward compatibility
+            and is stripped once during initialization. Default is None.
         :raises ValueError: If the collection name contains invalid characters.
         """
         if collection_name and not bool(re.match(r"^[a-zA-Z0-9\-_]+$", collection_name)):
@@ -105,17 +115,38 @@ class MongoDBAtlasDocumentStore:
         self.full_text_search_index = full_text_search_index
         self.embedding_field = embedding_field
         self.content_field = content_field
+        # Normalize meta_project_mapping values once: strip a leading "$" if present so that all
+        # downstream code can assume clean bare field paths.
+        if meta_project_mapping is not None:
+            self.meta_project_mapping: dict[str, str] | None = {
+                k: (v[1:] if v.startswith("$") else v) for k, v in meta_project_mapping.items()
+            }
+        else:
+            self.meta_project_mapping = None
         self._connection: MongoClient | None = None
         self._connection_async: AsyncMongoClient | None = None
         self._collection: Collection | None = None
         self._collection_async: AsyncCollection | None = None
 
-    def __del__(self) -> None:
+    def close(self) -> None:
         """
-        Destructor method to close MongoDB connections when the instance is destroyed.
+        Release the associated synchronous resources.
         """
-        if self._connection:
-            self._connection.close()
+        if self._connection is not None:
+            with suppress(Exception):
+                self._connection.close()
+            self._connection = None
+            self._collection = None
+
+    async def close_async(self) -> None:
+        """
+        Release the associated asynchronous resources.
+        """
+        if self._connection_async is not None:
+            with suppress(Exception):
+                await self._connection_async.close()
+            self._connection_async = None
+            self._collection_async = None
 
     @property
     def connection(self) -> AsyncMongoClient | MongoClient:
@@ -245,6 +276,9 @@ class MongoDBAtlasDocumentStore:
             collection_name=self.collection_name,
             vector_search_index=self.vector_search_index,
             full_text_search_index=self.full_text_search_index,
+            embedding_field=self.embedding_field,
+            content_field=self.content_field,
+            meta_project_mapping=self.meta_project_mapping,
         )
 
     @classmethod
@@ -257,7 +291,6 @@ class MongoDBAtlasDocumentStore:
         :returns:
               Deserialized component.
         """
-        deserialize_secrets_inplace(data["init_parameters"], keys=["mongo_connection_string"])
         return default_from_dict(cls, data)
 
     def count_documents(self) -> int:
@@ -289,7 +322,8 @@ class MongoDBAtlasDocumentStore:
         """
         self._ensure_connection_setup()
         assert self._collection is not None
-        normalized_filters = _normalize_filters(filters)
+        translated_filters = self._translate_filters(filters)
+        normalized_filters = _normalize_filters(translated_filters)
         return self._collection.count_documents(normalized_filters)
 
     async def count_documents_by_filter_async(self, filters: dict[str, Any]) -> int:
@@ -301,18 +335,22 @@ class MongoDBAtlasDocumentStore:
         """
         await self._ensure_connection_setup_async()
         assert self._collection_async is not None
-        normalized_filters = _normalize_filters(filters)
+        translated_filters = self._translate_filters(filters)
+        normalized_filters = _normalize_filters(translated_filters)
         return await self._collection_async.count_documents(normalized_filters)
 
     def _create_count_unique_metadata_pipeline(
         self, filters: dict[str, Any], metadata_fields: list[str]
     ) -> list[dict[str, Any]]:
-        normalized_filters = _normalize_filters(filters) if filters else {}
+        translated_filters = self._translate_filters(filters) if filters else {}
+        normalized_filters = _normalize_filters(translated_filters) if translated_filters else {}
         pipeline = [{"$match": normalized_filters}]
         facet_stages = {}
         for field in metadata_fields:
-            # metadata fields are stored in "meta" field in MongoDB
-            mongo_field = f"meta.{field}"
+            if self.meta_project_mapping and field in self.meta_project_mapping:
+                mongo_field = self.meta_project_mapping[field]
+            else:
+                mongo_field = f"meta.{field}"
             facet_stages[field] = [{"$group": {"_id": f"${mongo_field}"}}, {"$count": "count"}]
 
         pipeline.append({"$facet": facet_stages})
@@ -381,9 +419,14 @@ class MongoDBAtlasDocumentStore:
         type_mapping = {str: "keyword", int: "long", float: "float", bool: "boolean", list: "list", dict: "object"}
 
         for doc in docs:
-            if "meta" not in doc:
-                continue
-            for key, value in doc["meta"].items():
+            meta = doc.get("meta", {})
+            if self.meta_project_mapping:
+                meta = dict(meta)
+                for meta_key, mongo_field in self.meta_project_mapping.items():
+                    val = self._get_nested_value(doc, mongo_field)
+                    if val is not None:
+                        meta[meta_key] = val
+            for key, value in meta.items():
                 if key not in fields_info:
                     fields_info[key] = {"type": type_mapping.get(type(value), "string")}
         return fields_info
@@ -401,7 +444,11 @@ class MongoDBAtlasDocumentStore:
 
         try:
             # Sample latest 50 documents
-            cursor = self._collection.find({}, {"meta": 1}).sort("_id", -1).limit(50)
+            projection = {"meta": 1}
+            if self.meta_project_mapping:
+                for mongo_field in self.meta_project_mapping.values():
+                    projection[mongo_field] = 1
+            cursor = self._collection.find({}, projection).sort("_id", -1).limit(50)
             return self._compute_metadata_fields_info(list(cursor))
         except Exception as e:
             msg = f"Failed to get metadata fields info from MongoDB Atlas: {e}"
@@ -420,7 +467,11 @@ class MongoDBAtlasDocumentStore:
 
         try:
             # Sample latest 50 documents
-            cursor = self._collection_async.find({}, {"meta": 1}).sort("_id", -1).limit(50)
+            projection = {"meta": 1}
+            if self.meta_project_mapping:
+                for mongo_field in self.meta_project_mapping.values():
+                    projection[mongo_field] = 1
+            cursor = self._collection_async.find({}, projection).sort("_id", -1).limit(50)
             docs = await cursor.to_list(length=50)
             return self._compute_metadata_fields_info(docs)
         except Exception as e:
@@ -428,7 +479,10 @@ class MongoDBAtlasDocumentStore:
             raise DocumentStoreError(msg) from e
 
     def _create_min_max_pipeline(self, metadata_field: str) -> list[dict[str, Any]]:
-        if metadata_field.startswith("meta."):
+        clean_key = metadata_field[5:] if metadata_field.startswith("meta.") else metadata_field
+        if self.meta_project_mapping and clean_key in self.meta_project_mapping:
+            mongo_field = f"${self.meta_project_mapping[clean_key]}"
+        elif metadata_field.startswith("meta."):
             mongo_field = f"${metadata_field}"
         else:
             mongo_field = f"$meta.{metadata_field}"
@@ -487,11 +541,35 @@ class MongoDBAtlasDocumentStore:
             raise DocumentStoreError(msg) from e
 
     def _create_unique_values_pipeline(
-        self, metadata_field: str, search_term: str | None, from_: int, size: int
+        self,
+        metadata_field: str,
+        search_term: str | None,
+        from_: int,
+        size: int,
+        filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        pipeline: list[dict[str, Any]] = [
-            {"$group": {"_id": f"$meta.{metadata_field}"}},
-        ]
+        clean_key = metadata_field[5:] if metadata_field.startswith("meta.") else metadata_field
+        if self.meta_project_mapping and clean_key in self.meta_project_mapping:
+            mongo_field = f"${self.meta_project_mapping[clean_key]}"
+        elif metadata_field.startswith("meta."):
+            mongo_field = f"${metadata_field}"
+        else:
+            mongo_field = f"$meta.{metadata_field}"
+        pipeline: list[dict[str, Any]] = []
+
+        if filters:
+            translated_filters = self._translate_filters(filters)
+            pipeline.append({"$match": _normalize_filters(translated_filters)})
+
+        pipeline.append({"$group": {"_id": mongo_field}})
+        # MongoDB evaluates a missing field as null, so documents that don't have `metadata_field` at all
+        # still produce a `_id: null` group here. Drop it so an absent field yields no unique values,
+        # consistent with the other document stores.
+        #
+        # Separately (nothing to fix here): `$group` compares numeric values across BSON subtypes, so a
+        # whole-number float (1.0) and a numerically equal int (1) collapse into the same group even when
+        # nothing else shares this field - see get_metadata_field_unique_values()'s docstring.
+        pipeline.append({"$match": {"_id": {"$ne": None}}})
 
         if search_term:
             pipeline.append({"$match": {"_id": {"$regex": re.escape(search_term), "$options": "i"}}})
@@ -506,7 +584,7 @@ class MongoDBAtlasDocumentStore:
         )
         return pipeline
 
-    def _process_unique_values_result(self, result: list[Any]) -> tuple[list[str], int]:
+    def _process_unique_values_result(self, result: list[Any]) -> tuple[list[Any], int]:
         if not result or not result[0]["values"]:
             return [], 0
 
@@ -516,22 +594,35 @@ class MongoDBAtlasDocumentStore:
         return values, total_count
 
     def get_metadata_field_unique_values(
-        self, metadata_field: str, search_term: str | None = None, from_: int = 0, size: int = 10
-    ) -> tuple[list[str], int]:
+        self,
+        metadata_field: str,
+        search_term: str | None = None,
+        from_: int = 0,
+        size: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], int]:
         """
         Retrieves unique values for a field matching a search_term or all possible values if no search term is given.
+
+        **Note**: values of different types are kept distinct even when they compare equal in Python
+        (e.g. the int `1`, the bool `True` and the str `"1"` are returned as three separate values), with
+        one exception: MongoDB's aggregation `$group` compares numeric values across BSON subtypes, so a
+        whole-number float (e.g. `1.0`) is grouped together with a numerically equal int (`1`) and only
+        one of the two survives - regardless of whether they were written to the same metadata field.
+        Floats with a fractional part (e.g. `1.5`) are unaffected and stay distinct from ints.
 
         :param metadata_field: The metadata field to retrieve unique values for.
         :param search_term: The search term to filter values. Matches as a case-insensitive substring.
         :param from_: The starting index for pagination.
         :param size: The number of values to return.
-        :returns: A tuple containing a list of unique values and the total count of unique values matching the
-        search term.
+        :param filters: Optional filters to restrict the documents considered.
+        :returns: A tuple containing a list of unique values (in their original type) and the total count
+            of unique values matching the search term.
         """
         self._ensure_connection_setup()
         assert self._collection is not None
 
-        pipeline = self._create_unique_values_pipeline(metadata_field, search_term, from_, size)
+        pipeline = self._create_unique_values_pipeline(metadata_field, search_term, from_, size, filters)
 
         try:
             result = list(self._collection.aggregate(pipeline))
@@ -541,22 +632,36 @@ class MongoDBAtlasDocumentStore:
             raise DocumentStoreError(msg) from e
 
     async def get_metadata_field_unique_values_async(
-        self, metadata_field: str, search_term: str | None = None, from_: int = 0, size: int = 10
-    ) -> tuple[list[str], int]:
+        self,
+        metadata_field: str,
+        search_term: str | None = None,
+        from_: int = 0,
+        size: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> tuple[list[Any], int]:
         """
+         Asynchronously retrieves unique values for a metadata field, optionally filtered by a search term.
+
         Asynchronously retrieves unique values for a metadata field, optionally filtered by a search term.
+        **Note**: values of different types are kept distinct even when they compare equal in Python
+        (e.g. the int `1`, the bool `True` and the str `"1"` are returned as three separate values), with
+        one exception: MongoDB's aggregation `$group` compares numeric values across BSON subtypes, so a
+        whole-number float (e.g. `1.0`) is grouped together with a numerically equal int (`1`) and only
+        one of the two survives - regardless of whether they were written to the same metadata field.
+        Floats with a fractional part (e.g. `1.5`) are unaffected and stay distinct from ints.
 
         :param metadata_field: The metadata field to retrieve unique values for.
-        :param search_term: The search term to filter values. Matches as a case-insensitive substring.
-        :param from_: The starting index for pagination.
-        :param size: The number of values to return.
-        :returns: A tuple containing a list of unique values and the total count of unique values matching the
-        search term.
+         :param search_term: The search term to filter values. Matches as a case-insensitive substring.
+         :param from_: The starting index for pagination.
+         :param size: The number of values to return.
+         :param filters: Optional filters to restrict the documents considered.
+         :returns: A tuple containing a list of unique values (in their original type) and the total count
+             of unique values matching the search term.
         """
         await self._ensure_connection_setup_async()
         assert self._collection_async is not None
 
-        pipeline = self._create_unique_values_pipeline(metadata_field, search_term, from_, size)
+        pipeline = self._create_unique_values_pipeline(metadata_field, search_term, from_, size, filters)
 
         try:
             cursor = await self._collection_async.aggregate(pipeline)
@@ -578,7 +683,8 @@ class MongoDBAtlasDocumentStore:
         """
         self._ensure_connection_setup()
         assert self._collection is not None
-        filters = _normalize_filters(filters) if filters else None
+        translated_filters = self._translate_filters(filters) if filters else None
+        filters = _normalize_filters(translated_filters) if translated_filters else None
         documents = list(self._collection.find(filters))
         return [self._mongo_doc_to_haystack_doc(doc) for doc in documents]
 
@@ -594,7 +700,8 @@ class MongoDBAtlasDocumentStore:
         """
         await self._ensure_connection_setup_async()
         assert self._collection_async is not None
-        filters = _normalize_filters(filters) if filters else None
+        translated_filters = self._translate_filters(filters) if filters else None
+        filters = _normalize_filters(translated_filters) if translated_filters else None
         documents = await self._collection_async.find(filters).to_list()
         return [self._mongo_doc_to_haystack_doc(doc) for doc in documents]
 
@@ -723,7 +830,8 @@ class MongoDBAtlasDocumentStore:
         assert self._collection is not None
 
         try:
-            normalized_filters = _normalize_filters(filters)
+            translated_filters = self._translate_filters(filters)
+            normalized_filters = _normalize_filters(translated_filters)
             result = self._collection.delete_many(filter=normalized_filters)
             deleted_count = result.deleted_count
             logger.info(
@@ -748,7 +856,8 @@ class MongoDBAtlasDocumentStore:
         assert self._collection_async is not None
 
         try:
-            normalized_filters = _normalize_filters(filters)
+            translated_filters = self._translate_filters(filters)
+            normalized_filters = _normalize_filters(translated_filters)
             result = await self._collection_async.delete_many(filter=normalized_filters)
             deleted_count = result.deleted_count
             logger.info(
@@ -774,10 +883,15 @@ class MongoDBAtlasDocumentStore:
         assert self._collection is not None
 
         try:
-            normalized_filters = _normalize_filters(filters)
+            translated_filters = self._translate_filters(filters)
+            normalized_filters = _normalize_filters(translated_filters)
             # Build update operation to set metadata fields
-            # MongoDB stores documents with flatten=False, so metadata is in the "meta" field
-            update_fields = {f"meta.{key}": value for key, value in meta.items()}
+            update_fields = {}
+            for key, value in meta.items():
+                if self.meta_project_mapping and key in self.meta_project_mapping:
+                    update_fields[self.meta_project_mapping[key]] = value
+                else:
+                    update_fields[f"meta.{key}"] = value
             result = self._collection.update_many(filter=normalized_filters, update={"$set": update_fields})
             updated_count = result.modified_count
             logger.info(
@@ -803,10 +917,15 @@ class MongoDBAtlasDocumentStore:
         assert self._collection_async is not None
 
         try:
-            normalized_filters = _normalize_filters(filters)
+            translated_filters = self._translate_filters(filters)
+            normalized_filters = _normalize_filters(translated_filters)
             # Build update operation to set metadata fields
-            # MongoDB stores documents with flatten=False, so metadata is in the "meta" field
-            update_fields = {f"meta.{key}": value for key, value in meta.items()}
+            update_fields = {}
+            for key, value in meta.items():
+                if self.meta_project_mapping and key in self.meta_project_mapping:
+                    update_fields[self.meta_project_mapping[key]] = value
+                else:
+                    update_fields[f"meta.{key}"] = value
             result = await self._collection_async.update_many(filter=normalized_filters, update={"$set": update_fields})
             updated_count = result.modified_count
             logger.info(
@@ -943,7 +1062,8 @@ class MongoDBAtlasDocumentStore:
             msg = "Query embedding must not be empty"
             raise ValueError(msg)
 
-        filters = _normalize_filters(filters) if filters else {}
+        translated_filters = self._translate_filters(filters) if filters else {}
+        filters = _normalize_filters(translated_filters) if translated_filters else {}
 
         pipeline: list[dict[str, Any]] = [
             {
@@ -992,7 +1112,8 @@ class MongoDBAtlasDocumentStore:
             msg = "Query embedding must not be empty"
             raise ValueError(msg)
 
-        filters = _normalize_filters(filters) if filters else {}
+        translated_filters = self._translate_filters(filters) if filters else {}
+        filters = _normalize_filters(translated_filters) if translated_filters else {}
 
         pipeline: list[dict[str, Any]] = [
             {
@@ -1076,7 +1197,8 @@ class MongoDBAtlasDocumentStore:
                 "Atlas Search matches terms in exact order by default, which may change in future versions."
             )
 
-        filters = _normalize_filters(filters) if filters else {}
+        translated_filters = self._translate_filters(filters) if filters else {}
+        filters = _normalize_filters(translated_filters) if translated_filters else {}
 
         # Build the text search options
         text_search: dict[str, Any] = {"path": self.content_field or "content", "query": query}
@@ -1169,7 +1291,8 @@ class MongoDBAtlasDocumentStore:
                 "Atlas Search matches terms in exact order by default, which may change in future versions."
             )
 
-        filters = _normalize_filters(filters) if filters else {}
+        translated_filters = self._translate_filters(filters) if filters else {}
+        filters = _normalize_filters(translated_filters) if translated_filters else {}
 
         # Build the text search options
         text_search: dict[str, Any] = {"path": self.content_field or "content", "query": query}
@@ -1210,6 +1333,93 @@ class MongoDBAtlasDocumentStore:
 
         return [self._mongo_doc_to_haystack_doc(doc) for doc in documents]
 
+    @staticmethod
+    def _get_nested_value(doc: dict[str, Any], path: str) -> Any:
+        """Return the value at *path* (dot-separated) in *doc*, or ``None`` if absent."""
+        parts = path.split(".")
+        val: Any = doc
+        for part in parts:
+            if isinstance(val, dict) and part in val:
+                val = val[part]
+            else:
+                return None
+        return val
+
+    @staticmethod
+    def _set_nested_value(doc: dict[str, Any], path: str, value: Any) -> None:
+        """Set *value* at *path* (dot-separated) in *doc*, creating intermediate dicts as needed."""
+        parts = path.split(".")
+        val = doc
+        for part in parts[:-1]:
+            if part not in val or not isinstance(val[part], dict):
+                val[part] = {}
+            val = val[part]
+        val[parts[-1]] = value
+
+    @staticmethod
+    def _pop_nested_value(doc: dict[str, Any], path: str, *, default: Any = _MISSING) -> Any:
+        """
+        Remove and return the value at *path* (dot-separated) in *doc*.
+
+        Empty intermediate dicts are pruned after removal.
+
+        :param doc: The document dictionary to pop from.
+        :param path: Dot-separated key path, e.g. ``"meta.author"``.
+        :param default: Value to return when the path does not exist.  Defaults
+            to the module-level ``_MISSING`` sentinel so callers can distinguish
+            between "path not found" and "path exists with value ``None``".
+        :returns: The value at *path*, or *default* if the path does not exist.
+        """
+        parts = path.split(".")
+
+        def rec_pop(d: dict[str, Any], path_parts: list[str]) -> tuple[Any, bool]:
+            if not path_parts:
+                return default, False
+            key = path_parts[0]
+            if len(path_parts) == 1:
+                if key in d:
+                    val = d.pop(key)
+                    return val, len(d) == 0
+                return default, False
+
+            if key in d and isinstance(d[key], dict):
+                val, should_delete_parent = rec_pop(d[key], path_parts[1:])
+                if should_delete_parent:
+                    d.pop(key)
+                return val, len(d) == 0
+            return default, False
+
+        val, _ = rec_pop(doc, parts)
+        return val
+
+    @overload
+    def _translate_filters(self, filters: None) -> None: ...
+
+    @overload
+    def _translate_filters(self, filters: dict[str, Any]) -> dict[str, Any]: ...
+
+    def _translate_filters(self, filters: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not filters:
+            return filters
+        if not self.meta_project_mapping:
+            return filters
+
+        translated = dict(filters)
+        if "field" in translated:
+            field = translated["field"]
+            if field.startswith("meta."):
+                meta_key = field[5:]
+                if meta_key in self.meta_project_mapping:
+                    translated["field"] = self.meta_project_mapping[meta_key]
+        elif "conditions" in translated:
+            translated["conditions"] = [self._translate_filters(c) for c in translated["conditions"]]
+        return translated
+
+    # Fields that Document.from_dict() recognises as named parameters (not flattened metadata).
+    _DOCUMENT_FIELDS: frozenset[str] = frozenset(
+        {"id", "content", "blob", "meta", "score", "embedding", "sparse_embedding"}
+    )
+
     def _mongo_doc_to_haystack_doc(self, mongo_doc: dict[str, Any]) -> Document:
         """
         Converts the dictionary coming out of MongoDB into a Haystack document
@@ -1222,6 +1432,34 @@ class MongoDBAtlasDocumentStore:
             mongo_doc["content"] = mongo_doc.pop(self.content_field, None)
         if self.embedding_field != "embedding":
             mongo_doc["embedding"] = mongo_doc.pop(self.embedding_field, None)
+
+        if self.meta_project_mapping:
+            # Phase 1: collect mapped values before touching mongo_doc["meta"].
+            # Using _MISSING as sentinel so that an explicit None value in the source
+            # is preserved and not confused with "field absent".
+            mapped_meta: dict[str, Any] = {}
+            for meta_key, mongo_field in self.meta_project_mapping.items():
+                val = self._pop_nested_value(mongo_doc, mongo_field, default=_MISSING)
+                if val is not _MISSING:
+                    mapped_meta[meta_key] = val
+
+            # Phase 2: With an explicit mapping, unmapped root-level MongoDB fields
+            # must not become Haystack metadata - discard them unconditionally so
+            # that behavior is consistent regardless of which mapped fields were
+            # present in any given document.
+            for key in list(mongo_doc):
+                if key not in self._DOCUMENT_FIELDS:
+                    mongo_doc.pop(key)
+
+            # Phase 3: Re-read meta fresh (Phase 1's _pop_nested_value may have
+            # pruned or detached the original "meta" dict when the mapped path was
+            # inside meta, e.g. "meta.author").  Only then merge mapped values in.
+            meta = mongo_doc.get("meta")
+            if not isinstance(meta, dict):
+                meta = {}
+            meta.update(mapped_meta)
+            mongo_doc["meta"] = meta
+
         return Document.from_dict(mongo_doc)
 
     def _haystack_doc_to_mongo_doc(self, haystack_doc: Document) -> dict[str, Any]:
@@ -1245,5 +1483,15 @@ class MongoDBAtlasDocumentStore:
                     "The `sparse_embedding` field will be ignored.",
                     id=haystack_doc.id,
                 )
+
+        if self.meta_project_mapping and "meta" in mongo_doc and isinstance(mongo_doc["meta"], dict):
+            meta = mongo_doc["meta"]
+            for meta_key, mongo_field in self.meta_project_mapping.items():
+                if meta_key in meta:
+                    val = meta.pop(meta_key)
+                    self._set_nested_value(mongo_doc, mongo_field, val)
+            if not meta:
+                mongo_doc.pop("meta", None)
+
         mongo_doc.pop("_id", None)
         return mongo_doc

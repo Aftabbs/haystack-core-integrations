@@ -1,5 +1,72 @@
 # Changelog
 
+## [integrations/llama_cpp-v3.0.1] - 2026-10-15
+
+### 🐛 Bug Fixes
+
+- *(llama_cpp)* Allow contentless assistant messages in the chat message converter (#4107)
+
+
+## [integrations/llama_cpp-v3.0.0] - 2026-09-08
+
+### 🚀 Features
+
+- Llama.cpp - add close method (#3924)
+
+### 🐛 Bug Fixes
+
+- Replace in-place dataclass mutations in anthropic, llama_cpp, olama, pinecone tests (#3551)
+- Fix new issues raised by ruff 0.16.0 (#3670)
+
+### 📚 Documentation
+
+- Replace old haystack core imports with haystack_integrations paths (#3545)
+
+### 🧪 Testing
+
+- Trust test modules under Haystack 3.0's deserialization allowlist (#3537)
+
+### ⚙️ CI
+
+- Add hf token to CI env (#3427)
+- Improve changelog generation; fix existing changelogs (#3883)
+
+### 🧹 Chores
+
+- Re-standardize READMEs (#3768)
+- Clarify how generation_kwargs passed in run are handled (#3805)
+- [**breaking**] Remove deprecated `LlamaCppGenerator` (use `LlamaCppChatGenerator` instead) (#3888)
+
+
+## [integrations/llama_cpp-v2.3.0] - 2026-06-04
+
+### 🚀 Features
+
+- Llama.cpp - accept str as ChatGenerator input; deprecate generator; migrate generator example to chat generator (#3400)
+
+### 📚 Documentation
+
+- Generate missing API reference for Chat Generator (#2842)
+- *(llama_cpp)* Remove explicit warm_up calls (#2852)
+- Simplify pydoc configs (#2855)
+
+### 🧪 Testing
+
+- Test compatible integrations with python 3.14; update pyproject (#3001)
+- Track test coverage for all integrations (#3065)
+
+### ⚙️ CI
+
+- Refactor some workflows (#3074)
+- Llama.cpp - simplify test setup (#3113)
+
+### 🧹 Chores
+
+- Remove unused allow-direct-references (#2866)
+- Add ANN ruff ruleset to llama_cpp, llama_stack, mcp, meta_llama, mistral, mongodb_atlas, nvidia, ollama, openrouter, opensearch (#2991)
+- Enforce ruff docstring rules (D102/D103/D205/D209/D213/D417/D419) in integrations 21-30 (#3010)
+
+
 ## [integrations/llama_cpp-v2.2.0] - 2026-02-16
 
 ### 🚀 Features
@@ -165,6 +232,23 @@
 
 ## [integrations/llama_cpp-v0.4.0] - 2024-05-13
 
+### 📚 Documentation
+
+- Small consistency improvements (#536)
+- Disable-class-def (#556)
+
+### 🌀 Miscellaneous
+
+- Llama.cpp - review docstrings (#510)
+- Llama.cpp - update examples (#511)
+- Make tests show coverage (#566)
+- Remove references to Python 3.7 (#601)
+- Chore: add license classifiers (#680)
+- Chore: change the pydoc renderer class (#718)
+- Basic implementation of llama.cpp chat generation (#723)
+
+## [integrations/llama_cpp-v0.3.0] - 2024-02-27
+
 ### 🐛 Bug Fixes
 
 - Llama.cpp: change wrong links and imports (#436)
@@ -173,8 +257,6 @@
 ### 📚 Documentation
 
 - Update category slug (#442)
-- Small consistency improvements (#536)
-- Disable-class-def (#556)
 
 ### 🧹 Chores
 
@@ -184,13 +266,6 @@
 
 - Generate api docs (#353)
 - Model_name_or_path > model (#418)
-- Llama.cpp - review docstrings (#510)
-- Llama.cpp - update examples (#511)
-- Make tests show coverage (#566)
-- Remove references to Python 3.7 (#601)
-- Chore: add license classifiers (#680)
-- Chore: change the pydoc renderer class (#718)
-- Basic implementation of llama.cpp chat generation (#723)
 
 ## [integrations/llama_cpp-v0.2.1] - 2024-01-18
 

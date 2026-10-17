@@ -4,7 +4,7 @@
 
 import base64
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from google.genai import types
@@ -53,6 +53,18 @@ GOOGLE_GENAI_SUPPORTED_MIME_TYPES = {
     "image/heic": "heic",
     "image/heif": "heif",
 }
+
+
+def _encode_thought_signature(signature: bytes | str) -> str:
+    """
+    Encode a thought signature as a base64 string so it can be safely stored in meta and serialized.
+
+    :param signature: The raw thought signature bytes returned by the Google GenAI API.
+    :returns: The base64-encoded signature.
+    """
+    if isinstance(signature, bytes):
+        return base64.b64encode(signature).decode("utf-8")
+    return signature
 
 
 def _process_response_format(generation_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -233,8 +245,11 @@ def _convert_message_to_google_genai_format(message: ChatMessage) -> types.Conte
     :returns: Google Gen AI Content object.
     """
     # Check if message has content
-    if not message._content:
-        msg = "A `ChatMessage` must contain at least one content part."
+    if not message._content and not message.is_from(ChatRole.ASSISTANT):
+        msg = (
+            f"A `ChatMessage` from `{message._role.value}` must contain at least one content part. "
+            "Only assistant messages can be empty."
+        )
         raise ValueError(msg)
 
     parts = []
@@ -275,6 +290,7 @@ def _convert_message_to_google_genai_format(message: ChatMessage) -> types.Conte
                     tool_call_index += 1  # Move to next tool call for next part
 
             # Add the thought signature to preserve context
+            # Passed through as is: the Google GenAI SDK decodes base64 strings back into bytes
             part_dict["thought_signature"] = sig_info["signature"]
 
             parts.append(types.Part(**part_dict))
@@ -367,10 +383,18 @@ def _convert_message_to_google_genai_format(message: ChatMessage) -> types.Conte
                                 ),
                             )
                         )
+                    elif isinstance(item, FileContent):
+                        tool_call_result_parts.append(
+                            types.FunctionResponsePart(
+                                inline_data=types.FunctionResponseBlob(
+                                    data=base64.b64decode(item.base64_data), mime_type=item.mime_type
+                                ),
+                            )
+                        )
                     else:
                         msg = (
                             "Unsupported content type in tool call result list. "
-                            "Only TextContent and ImageContent are supported."
+                            "Only TextContent, ImageContent, and FileContent are supported."
                         )
                         raise ValueError(msg)
                 parts.append(
@@ -511,7 +535,7 @@ def _convert_google_genai_response_to_chatmessage(response: types.GenerateConten
                     thought_signatures.append(
                         {
                             "part_index": i,
-                            "signature": part.thought_signature,
+                            "signature": _encode_thought_signature(part.thought_signature),
                             "has_text": part.text is not None,
                             "has_function_call": part.function_call is not None,
                             "is_thought": hasattr(part, "thought") and part.thought,
@@ -550,12 +574,9 @@ def _convert_google_genai_response_to_chatmessage(response: types.GenerateConten
         usage["thoughts_token_count"] = usage_metadata.thoughts_token_count
 
     # Add cached content token count if available (implicit or explicit context caching)
-    if (
-        usage_metadata
-        and hasattr(usage_metadata, "cached_content_token_count")
-        and usage_metadata.cached_content_token_count
-    ):
-        usage["cached_content_token_count"] = usage_metadata.cached_content_token_count
+    cached_content_token_count = getattr(usage_metadata, "cached_content_token_count", None) if usage_metadata else None
+    if cached_content_token_count is not None:
+        usage["cached_content_token_count"] = cached_content_token_count
 
     usage.update(_convert_usage_metadata_to_serializable(usage_metadata))
 
@@ -593,6 +614,8 @@ def _convert_google_chunk_to_streaming_chunk(
     index: int,
     component_info: ComponentInfo,
     model: str,
+    *,
+    tool_calls_seen: bool = False,
 ) -> StreamingChunk:
     """
     Convert a chunk from Google Gen AI to a Haystack StreamingChunk.
@@ -601,6 +624,8 @@ def _convert_google_chunk_to_streaming_chunk(
     :param index: The index of the chunk.
     :param component_info: The component info.
     :param model: The model name.
+    :param tool_calls_seen: Whether an earlier chunk of the same stream already carried a tool call. Needed to
+        report the correct finish reason, since Gemini 3 models send the terminal finish reason in its own chunk.
     :returns: A StreamingChunk object.
     """
     content = ""
@@ -625,7 +650,12 @@ def _convert_google_chunk_to_streaming_chunk(
     if usage_metadata and hasattr(usage_metadata, "thoughts_token_count") and usage_metadata.thoughts_token_count:
         usage["thoughts_token_count"] = usage_metadata.thoughts_token_count
 
-    if candidate.content and candidate.content.parts:
+    # Add cached content token count if available (context caching)
+    cached_content_token_count = getattr(usage_metadata, "cached_content_token_count", None) if usage_metadata else None
+    if cached_content_token_count is not None:
+        usage["cached_content_token_count"] = cached_content_token_count
+
+    if chunk.candidates and candidate.content and candidate.content.parts:
         tc_index = -1
         for part_index, part in enumerate(candidate.content.parts):
             # Check for thought signature on this part (for multi-turn context)
@@ -633,7 +663,7 @@ def _convert_google_chunk_to_streaming_chunk(
                 thought_signature_deltas.append(
                     {
                         "part_index": part_index,
-                        "signature": part.thought_signature,
+                        "signature": _encode_thought_signature(part.thought_signature),
                         "has_text": part.text is not None,
                         "has_function_call": part.function_call is not None,
                         "is_thought": hasattr(part, "thought") and part.thought,
@@ -667,7 +697,7 @@ def _convert_google_chunk_to_streaming_chunk(
     start = index == 0 or len(tool_calls) > 0
 
     meta: dict[str, Any] = {
-        "received_at": datetime.now(timezone.utc).isoformat(),
+        "received_at": datetime.now(UTC).isoformat(),
         "model": model,
         "usage": usage,
     }
@@ -683,8 +713,10 @@ def _convert_google_chunk_to_streaming_chunk(
 
     # Remap finish_reason to "tool_calls" when tool calls are present, since Google GenAI returns
     # "STOP" for both normal completions and tool calls (no dedicated FUNCTION_CALL finish reason).
+    # Gemini 3 models send the finish reason in its own chunk, after the one holding the tool call, so we also
+    # consider tool calls from earlier chunks of the same stream.
     mapped_finish_reason = FINISH_REASON_MAPPING.get(finish_reason or "")
-    if mapped_finish_reason == "stop" and tool_calls:
+    if mapped_finish_reason == "stop" and (tool_calls or tool_calls_seen):
         mapped_finish_reason = "tool_calls"
 
     return StreamingChunk(
@@ -717,6 +749,7 @@ def _aggregate_streaming_chunks_with_reasoning(chunks: list[StreamingChunk]) -> 
     reasoning_text_parts: list[str] = []
     thought_signatures: list[dict[str, Any]] = []
     thoughts_token_count = None
+    cached_content_token_count = None
 
     for chunk in chunks:
         # Extract reasoning from the StreamingChunk.reasoning field
@@ -731,17 +764,25 @@ def _aggregate_streaming_chunks_with_reasoning(chunks: list[StreamingChunk]) -> 
                 # We'll keep the last set of signatures as they represent the complete state
                 thought_signatures = signature_deltas
 
-        # Extract thinking token usage (from the last chunk that has it)
+        # Extract token usage metadata (from the last chunk that has it)
         if chunk.meta and "usage" in chunk.meta:
             chunk_usage = chunk.meta["usage"]
             if "thoughts_token_count" in chunk_usage:
                 thoughts_token_count = chunk_usage["thoughts_token_count"]
+            if "cached_content_token_count" in chunk_usage:
+                cached_content_token_count = chunk_usage["cached_content_token_count"]
 
     # Add thinking token count to usage if present
     if thoughts_token_count is not None and "usage" in message.meta:
         if message.meta["usage"] is None:
             message.meta["usage"] = {}
         message.meta["usage"]["thoughts_token_count"] = thoughts_token_count
+
+    # Add cached content token count to usage if present
+    if cached_content_token_count is not None and "usage" in message.meta:
+        if message.meta["usage"] is None:
+            message.meta["usage"] = {}
+        message.meta["usage"]["cached_content_token_count"] = cached_content_token_count
 
     # Add thought signatures to meta if present (for multi-turn context preservation)
     if thought_signatures:

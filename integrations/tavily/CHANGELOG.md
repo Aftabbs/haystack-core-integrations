@@ -1,5 +1,53 @@
 # Changelog
 
+## [integrations/tavily-v1.0.0] - 2026-09-10
+
+### 🚀 Features
+
+- [**breaking**] Tavily - add lifecycle handling (#3938)
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+### 🧹 Chores
+
+- Re-standardize READMEs (#3768)
+
+
+## [integrations/tavily-v0.4.0] - 2026-07-15
+
+### 🚀 Features
+
+- Add TavilyWebSearchTool (#3597)
+
+
+## [integrations/tavily-v0.3.0] - 2026-07-14
+
+### 🚀 Features
+
+- *(tavily)* Add TavilyFetcher component using the Extract API (#3561)
+
+
+## [integrations/tavily-v0.2.1] - 2026-07-08
+
+
+## [integrations/tavily-v0.2.0] - 2026-07-03
+
+### 🚀 Features
+
+- Hardcode client name for Tavily (#3540)
+
+### 🧪 Testing
+
+- Track test coverage for all integrations (#3065)
+- Tavily - add 2 unit tests (#3222)
+
+
 ## [integrations/tavily-v0.1.0] - 2026-03-27
 
 ### 🚀 Features

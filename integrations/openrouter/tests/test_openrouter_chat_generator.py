@@ -1,14 +1,14 @@
 import json
 import os
 from datetime import datetime
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import pytz
 from haystack import Pipeline
 from haystack.components.generators.utils import print_streaming_chunk
-from haystack.components.tools import ToolInvoker
-from haystack.dataclasses import ChatMessage, ChatRole, StreamingChunk, ToolCall
+from haystack.dataclasses import ChatMessage, ChatRole, ReasoningContent, StreamingChunk, ToolCall
 from haystack.tools import Tool, Toolset
 from haystack.utils.auth import Secret
 from openai import OpenAIError
@@ -19,7 +19,22 @@ from openai.types.chat.chat_completion_chunk import ChoiceDelta, ChoiceDeltaTool
 from openai.types.completion_usage import CompletionTokensDetails, CompletionUsage, PromptTokensDetails
 from pydantic import BaseModel
 
-from haystack_integrations.components.generators.openrouter.chat.chat_generator import OpenRouterChatGenerator
+from haystack_integrations.components.generators.openrouter.chat.chat_generator import (
+    OpenRouterChatGenerator,
+    _convert_openrouter_completion_to_chat_message,
+    _extract_reasoning,
+    _merge_reasoning_details,
+)
+
+
+def _chunk(delta: ChoiceDelta, finish_reason: str | None = None) -> ChatCompletionChunk:
+    return ChatCompletionChunk(
+        id="gen-1",
+        choices=[ChoiceChunk(delta=delta, index=0, finish_reason=finish_reason)],
+        created=1750162525,
+        model="anthropic/claude-sonnet-4.5",
+        object="chat.completion.chunk",
+    )
 
 
 class CalendarEvent(BaseModel):
@@ -97,20 +112,28 @@ def mock_chat_completion():
         yield mock_chat_completion_create
 
 
-class TestOpenRouterChatGenerator:
+class TestOpenRouterChatGeneratorUnit:
     def test_init_default(self, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "test-api-key")
         component = OpenRouterChatGenerator()
-        assert component.client.api_key == "test-api-key"
+        assert component.api_key.resolve_value() == "test-api-key"
         assert component.model == "openai/gpt-5-mini"
         assert component.api_base_url == "https://openrouter.ai/api/v1"
         assert component.streaming_callback is None
         assert not component.generation_kwargs
 
+    def test_warm_up(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-api-key")
+        component = OpenRouterChatGenerator()
+        component.warm_up()  # with haystack-ai >= 3.0 the client is created during warm-up
+        assert component.client.api_key == "test-api-key"
+
     def test_init_fail_wo_api_key(self, monkeypatch):
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         with pytest.raises(ValueError, match=r"None of the .* environment variables are set"):
-            OpenRouterChatGenerator()
+            # haystack-ai 2.x raises at init; haystack-ai >= 3.0 raises when the client is created in warm_up
+            component = OpenRouterChatGenerator()
+            component.warm_up()
 
     def test_init_with_parameters(self):
         component = OpenRouterChatGenerator(
@@ -120,7 +143,7 @@ class TestOpenRouterChatGenerator:
             api_base_url="test-base-url",
             generation_kwargs={"max_tokens": 10, "some_test_param": "test-params"},
         )
-        assert component.client.api_key == "test-api-key"
+        assert component.api_key.resolve_value() == "test-api-key"
         assert component.model == "openai/gpt-5"
         assert component.streaming_callback is print_streaming_chunk
         assert component.generation_kwargs == {"max_tokens": 10, "some_test_param": "test-params"}
@@ -219,26 +242,6 @@ class TestOpenRouterChatGenerator:
         assert component.timeout == 10
         assert component.max_retries == 10
 
-    def test_from_dict_fail_wo_env_var(self, monkeypatch):
-        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-        data = {
-            "type": (
-                "haystack_integrations.components.generators.openrouter.chat.chat_generator.OpenRouterChatGenerator"
-            ),
-            "init_parameters": {
-                "api_key": {"env_vars": ["OPENROUTER_API_KEY"], "strict": True, "type": "env_var"},
-                "model": "openai/gpt-5-mini",
-                "api_base_url": "test-base-url",
-                "streaming_callback": "haystack.components.generators.utils.print_streaming_chunk",
-                "generation_kwargs": {"max_tokens": 10, "some_test_param": "test-params"},
-                "extra_headers": {"test-header": "test-value"},
-                "timeout": 10,
-                "max_retries": 10,
-            },
-        }
-        with pytest.raises(ValueError, match=r"None of the .* environment variables are set"):
-            OpenRouterChatGenerator.from_dict(data)
-
     def test_run(self, chat_messages, mock_chat_completion, monkeypatch):  # noqa: ARG002
         monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
         component = OpenRouterChatGenerator()
@@ -268,92 +271,151 @@ class TestOpenRouterChatGenerator:
         assert len(response["replies"]) == 1
         assert [isinstance(reply, ChatMessage) for reply in response["replies"]]
 
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenRouter API key to run this test.",
-    )
-    @pytest.mark.integration
-    def test_live_run(self):
-        chat_messages = [ChatMessage.from_user("What's the capital of France")]
-        component = OpenRouterChatGenerator()
-        results = component.run(chat_messages)
-        assert len(results["replies"]) == 1
-        message: ChatMessage = results["replies"][0]
-        assert "Paris" in message.text
-        assert "openai/gpt-5-mini" in message.meta["model"]
-        assert message.meta["finish_reason"] == "stop"
+    def test_run_with_generation_kwargs(self, chat_messages, mock_chat_completion, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+        component = OpenRouterChatGenerator(generation_kwargs={"max_tokens": 10, "temperature": 0.5})
+        component.run(chat_messages, generation_kwargs={"temperature": 0.9})
 
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenAI API key to run this test.",
-    )
-    @pytest.mark.integration
-    def test_live_run_wrong_model(self, chat_messages):
-        component = OpenRouterChatGenerator(model="something-obviously-wrong")
-        with pytest.raises(OpenAIError):
-            component.run(chat_messages)
+        _, kwargs = mock_chat_completion.call_args
+        assert kwargs["extra_body"]["max_tokens"] == 10
+        assert kwargs["extra_body"]["temperature"] == 0.9
 
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenAI API key to run this test.",
-    )
-    @pytest.mark.integration
-    def test_live_run_streaming(self):
-        class Callback:
-            def __init__(self):
-                self.responses = ""
-                self.counter = 0
+    def test_prepare_api_call_with_tools_strict(self, chat_messages, tools, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+        component = OpenRouterChatGenerator(tools=tools)
+        api_args = component._prepare_api_call(messages=chat_messages, tools_strict=True)
 
-            def __call__(self, chunk: StreamingChunk) -> None:
-                self.counter += 1
-                self.responses += chunk.content if chunk.content else ""
+        assert api_args["tools"][0]["type"] == "function"
+        function_spec = api_args["tools"][0]["function"]
+        assert function_spec["name"] == "weather"
+        assert function_spec["strict"] is True
+        assert function_spec["parameters"]["additionalProperties"] is False
 
-        callback = Callback()
-        component = OpenRouterChatGenerator(streaming_callback=callback)
+    def test_prepare_api_call_raises_when_streaming_with_multiple_responses(self, chat_messages, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+        component = OpenRouterChatGenerator(generation_kwargs={"n": 2})
+        with pytest.raises(ValueError, match="Cannot stream multiple responses"):
+            component._prepare_api_call(messages=chat_messages, streaming_callback=print_streaming_chunk)
+
+    def test_prepare_api_call_with_response_format_and_streaming(self, chat_messages, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+        response_format = {"type": "json_schema", "json_schema": {"name": "Foo", "schema": {"type": "object"}}}
+        component = OpenRouterChatGenerator(generation_kwargs={"response_format": response_format})
+        api_args = component._prepare_api_call(messages=chat_messages, streaming_callback=print_streaming_chunk)
+
+        assert api_args["stream"] is True
+        assert api_args["openai_endpoint"] == "create"
+        assert api_args["response_format"] == response_format
+
+    def test_serde_in_pipeline(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+        tool = Tool(
+            name="weather",
+            description="useful to determine the weather in a given location",
+            parameters={"city": {"type": "string"}},
+            function=weather,
+        )
+
+        generator = OpenRouterChatGenerator(
+            generation_kwargs={"temperature": 0.7},
+            streaming_callback=print_streaming_chunk,
+            tools=[tool],
+        )
+
+        pipeline = Pipeline()
+        pipeline.add_component("generator", generator)
+
+        pipeline_dict = pipeline.to_dict()
+
+        # the Tool serialization format is owned by haystack-ai and varies across its versions; the
+        # dumps/loads round-trip below covers the tools, so exclude them from the pinned-dict comparison
+        tools_entries = pipeline_dict["components"]["generator"]["init_parameters"].pop("tools")
+        assert len(tools_entries) == 1
+        expected_dict = {
+            "metadata": {},
+            "max_runs_per_component": 100,
+            "connection_type_validation": True,
+            "components": {
+                "generator": {
+                    "type": (
+                        "haystack_integrations.components.generators.openrouter.chat.chat_generator"
+                        ".OpenRouterChatGenerator"
+                    ),
+                    "init_parameters": {
+                        "api_key": {"type": "env_var", "env_vars": ["OPENROUTER_API_KEY"], "strict": True},
+                        "model": "openai/gpt-5-mini",
+                        "streaming_callback": "haystack.components.generators.utils.print_streaming_chunk",
+                        "api_base_url": "https://openrouter.ai/api/v1",
+                        "generation_kwargs": {"temperature": 0.7},
+                        "http_client_kwargs": None,
+                        "extra_headers": None,
+                        "timeout": None,
+                        "max_retries": None,
+                    },
+                }
+            },
+            "connections": [],
+        }
+
+        if not hasattr(pipeline, "_connection_type_validation"):
+            expected_dict.pop("connection_type_validation")
+
+        assert pipeline_dict == expected_dict
+
+        pipeline_yaml = pipeline.dumps()
+        new_pipeline = Pipeline.loads(pipeline_yaml)
+        assert new_pipeline == pipeline
+
+        loaded_generator = new_pipeline.get_component("generator")
+        assert loaded_generator.model == generator.model
+        assert loaded_generator.generation_kwargs == generator.generation_kwargs
+        assert loaded_generator.streaming_callback == generator.streaming_callback
+        assert len(loaded_generator.tools) == len(generator.tools)
+        assert loaded_generator.tools[0].name == generator.tools[0].name
+        assert loaded_generator.tools[0].description == generator.tools[0].description
+        assert loaded_generator.tools[0].parameters == generator.tools[0].parameters
+
+
+@pytest.mark.skipif(
+    not os.environ.get("OPENROUTER_API_KEY", None),
+    reason="Export an env var called OPENROUTER_API_KEY containing the OpenRouter API key to run this test.",
+)
+@pytest.mark.integration
+class TestOpenRouterChatGeneratorIntegration:
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_live_run(self, streaming):
+        callback = CollectorCallback() if streaming else None
+        component = OpenRouterChatGenerator(streaming_callback=callback, generation_kwargs={"max_tokens": 1000})
         results = component.run([ChatMessage.from_user("What's the capital of France?")])
 
         assert len(results["replies"]) == 1
         message: ChatMessage = results["replies"][0]
         assert "Paris" in message.text
-
         assert "openai/gpt-5-mini" in message.meta["model"]
         assert message.meta["finish_reason"] == "stop"
 
-        assert callback.counter > 1
-        assert "Paris" in callback.responses
+        if streaming:
+            assert len(callback.chunks) > 1
+            assert "Paris" in "".join(chunk.content for chunk in callback.chunks)
 
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenAI API key to run this test.",
-    )
-    @pytest.mark.integration
-    def test_live_run_with_tools(self, tools):
-        chat_messages = [ChatMessage.from_user("What's the weather like in Paris?")]
-        component = OpenRouterChatGenerator(tools=tools)
-        results = component.run(chat_messages)
-        assert len(results["replies"]) == 1
-        message = results["replies"][0]
-        assert not message.text
+    def test_live_run_wrong_model(self, chat_messages):
+        component = OpenRouterChatGenerator(model="something-obviously-wrong")
+        with pytest.raises(OpenAIError):
+            component.run(chat_messages)
 
-        assert message.tool_calls
-        tool_call = message.tool_call
-        assert isinstance(tool_call, ToolCall)
-        assert tool_call.tool_name == "weather"
-        assert "paris" in tool_call.arguments["city"].lower(), f"Expected 'paris' in city: {tool_call.arguments}"
-        assert message.meta["finish_reason"] == "tool_calls"
-
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenAI API key to run this test.",
-    )
-    @pytest.mark.integration
-    def test_live_run_with_tools_and_response(self, tools):
+    @pytest.mark.parametrize("streaming_callback", [None, print_streaming_chunk])
+    def test_live_run_with_tools_and_response(self, tools, streaming_callback):
         """
         Integration test that the OpenRouterChatGenerator component can run with tools and get a response.
         """
         initial_messages = [ChatMessage.from_user("What's the weather like in Paris and Berlin?")]
-        component = OpenRouterChatGenerator(tools=tools)
-        results = component.run(messages=initial_messages, generation_kwargs={"tool_choice": "auto"})
+        component = OpenRouterChatGenerator(
+            tools=tools,
+            streaming_callback=streaming_callback,
+            generation_kwargs={"max_tokens": 1000, "tool_choice": "auto"},
+        )
+        results = component.run(messages=initial_messages)
 
         assert len(results["replies"]) == 1
 
@@ -361,6 +423,8 @@ class TestOpenRouterChatGenerator:
         tool_message = results["replies"][0]
 
         assert isinstance(tool_message, ChatMessage)
+        assert tool_message.meta["finish_reason"] == "tool_calls"
+        assert not tool_message.text
         tool_calls = tool_message.tool_calls
         assert len(tool_calls) == 2
         assert ChatMessage.is_from(tool_message, ChatRole.ASSISTANT)
@@ -395,78 +459,28 @@ class TestOpenRouterChatGenerator:
         assert "paris" in final_message.text.lower()
         assert "berlin" in final_message.text.lower()
 
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenAI API key to run this test.",
-    )
-    @pytest.mark.integration
-    def test_live_run_with_tools_streaming(self, tools):
-        """
-        Integration test that the OpenRouterChatGenerator component can run with tools and streaming.
-        """
-        component = OpenRouterChatGenerator(tools=tools, streaming_callback=print_streaming_chunk)
-        results = component.run(
-            [ChatMessage.from_user("What's the weather like in Paris and Berlin?")],
-            generation_kwargs={"tool_choice": "auto"},
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_live_run_with_reasoning(self, streaming):
+        callback = CollectorCallback() if streaming else None
+        chat_messages = [ChatMessage.from_user("If x + 3 = 7, what is x?")]
+        component = OpenRouterChatGenerator(
+            model="deepseek/deepseek-r1",
+            streaming_callback=callback,
+            generation_kwargs={"reasoning": {"effort": "high"}, "max_tokens": 1000},
         )
+        results = component.run(chat_messages)
 
+        if callback:
+            assert any(chunk.reasoning for chunk in callback.chunks)
         assert len(results["replies"]) == 1
+        message: ChatMessage = results["replies"][0]
+        assert message.reasoning is not None
+        assert message.reasoning.reasoning_text
+        assert message.reasoning.extra.get("reasoning_details")
+        assert message.text
+        assert "4" in message.text
+        assert message.meta["finish_reason"] == "stop"
 
-        # Find the message with tool calls
-        tool_message = results["replies"][0]
-
-        assert isinstance(tool_message, ChatMessage)
-        tool_calls = tool_message.tool_calls
-        assert len(tool_calls) == 2
-        assert ChatMessage.is_from(tool_message, ChatRole.ASSISTANT)
-
-        for tool_call in tool_calls:
-            assert tool_call.id is not None
-            assert isinstance(tool_call, ToolCall)
-            assert tool_call.tool_name == "weather"
-
-        arguments = [tool_call.arguments for tool_call in tool_calls]
-        # Extract city names and check they contain the expected cities
-        # (LLM may return "Paris, France" or "Berlin, Germany" instead of just city names)
-        cities = [arg["city"].lower() for arg in arguments]
-        assert len(cities) == 2
-        assert any("berlin" in city for city in cities), f"Expected 'berlin' in one of {cities}"
-        assert any("paris" in city for city in cities), f"Expected 'paris' in one of {cities}"
-        assert tool_message.meta["finish_reason"] == "tool_calls"
-
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenAI API key to run this test.",
-    )
-    @pytest.mark.integration
-    def test_pipeline_with_openrouter_chat_generator(self, tools):
-        """
-        Test that the OpenRouterChatGenerator component can be used in a pipeline
-        """
-        pipeline = Pipeline()
-        pipeline.add_component("generator", OpenRouterChatGenerator(tools=tools))
-        pipeline.add_component("tool_invoker", ToolInvoker(tools=tools))
-
-        pipeline.connect("generator", "tool_invoker")
-
-        results = pipeline.run(
-            data={
-                "generator": {
-                    "messages": [ChatMessage.from_user("What's the weather like in Paris?")],
-                    "generation_kwargs": {"tool_choice": "auto"},
-                }
-            }
-        )
-
-        result = results["tool_invoker"]["tool_messages"][0].tool_call_result.result
-        assert "paris" in result.lower(), f"Expected 'paris' in result: {result}"
-        assert "sunny and 32°c" in result.lower(), f"Expected 'sunny and 32°c' in result: {result}"
-
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenRouter API key to run this test.",
-    )
-    @pytest.mark.integration
     def test_live_run_with_response_format_json_schema(self):
         response_schema = {
             "type": "json_schema",
@@ -495,7 +509,7 @@ class TestOpenRouterChatGenerator:
             )
         ]
         comp = OpenRouterChatGenerator(
-            model="openai/gpt-5-mini", generation_kwargs={"response_format": response_schema}
+            model="openai/gpt-5-mini", generation_kwargs={"response_format": response_schema, "max_tokens": 1000}
         )
         results = comp.run(chat_messages)
         assert len(results["replies"]) == 1
@@ -517,109 +531,6 @@ class TestOpenRouterChatGenerator:
         assert "france" in msg["country"].lower(), f"Expected 'France' in country field, got: {msg['country']}"
         assert message.meta["finish_reason"] == "stop"
 
-    def test_serde_in_pipeline(self, monkeypatch):
-        """
-        Test serialization/deserialization of OpenRouterChatGenerator in a Pipeline,
-        including YAML conversion and detailed dictionary validation
-        """
-        # Set mock API key
-        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-
-        # Create a test tool
-        tool = Tool(
-            name="weather",
-            description="useful to determine the weather in a given location",
-            parameters={"city": {"type": "string"}},
-            function=weather,
-        )
-
-        # Create generator with specific configuration
-        generator = OpenRouterChatGenerator(
-            generation_kwargs={"temperature": 0.7},
-            streaming_callback=print_streaming_chunk,
-            tools=[tool],
-        )
-
-        # Create and configure pipeline
-        pipeline = Pipeline()
-        pipeline.add_component("generator", generator)
-
-        # Get pipeline dictionary and verify its structure
-        pipeline_dict = pipeline.to_dict()
-        expected_dict = {
-            "metadata": {},
-            "max_runs_per_component": 100,
-            "connection_type_validation": True,
-            "components": {
-                "generator": {
-                    "type": "haystack_integrations.components.generators.openrouter.chat.chat_generator.OpenRouterChatGenerator",  # noqa: E501
-                    "init_parameters": {
-                        "api_key": {"type": "env_var", "env_vars": ["OPENROUTER_API_KEY"], "strict": True},
-                        "model": "openai/gpt-5-mini",
-                        "streaming_callback": "haystack.components.generators.utils.print_streaming_chunk",
-                        "api_base_url": "https://openrouter.ai/api/v1",
-                        "generation_kwargs": {"temperature": 0.7},
-                        "tools": [
-                            {
-                                "type": "haystack.tools.tool.Tool",
-                                "data": {
-                                    "name": "weather",
-                                    "description": "useful to determine the weather in a given location",
-                                    "parameters": {"city": {"type": "string"}},
-                                    "function": "tests.test_openrouter_chat_generator.weather",
-                                },
-                            }
-                        ],
-                        "http_client_kwargs": None,
-                        "extra_headers": None,
-                        "timeout": None,
-                        "max_retries": None,
-                    },
-                }
-            },
-            "connections": [],
-        }
-
-        if not hasattr(pipeline, "_connection_type_validation"):
-            expected_dict.pop("connection_type_validation")
-
-        # add outputs_to_string, inputs_from_state and outputs_to_state tool parameters for compatibility with
-        # haystack-ai>=2.12.0
-        if hasattr(tool, "outputs_to_string"):
-            expected_dict["components"]["generator"]["init_parameters"]["tools"][0]["data"]["outputs_to_string"] = (
-                tool.outputs_to_string
-            )
-        if hasattr(tool, "inputs_from_state"):
-            expected_dict["components"]["generator"]["init_parameters"]["tools"][0]["data"]["inputs_from_state"] = (
-                tool.inputs_from_state
-            )
-        if hasattr(tool, "outputs_to_state"):
-            expected_dict["components"]["generator"]["init_parameters"]["tools"][0]["data"]["outputs_to_state"] = (
-                tool.outputs_to_state
-            )
-
-        assert pipeline_dict == expected_dict
-
-        # Test YAML serialization/deserialization
-        pipeline_yaml = pipeline.dumps()
-        new_pipeline = Pipeline.loads(pipeline_yaml)
-        assert new_pipeline == pipeline
-
-        # Verify the loaded pipeline's generator has the same configuration
-        loaded_generator = new_pipeline.get_component("generator")
-        assert loaded_generator.model == generator.model
-        assert loaded_generator.generation_kwargs == generator.generation_kwargs
-        assert loaded_generator.streaming_callback == generator.streaming_callback
-        assert len(loaded_generator.tools) == len(generator.tools)
-        assert loaded_generator.tools[0].name == generator.tools[0].name
-        assert loaded_generator.tools[0].description == generator.tools[0].description
-        assert loaded_generator.tools[0].parameters == generator.tools[0].parameters
-
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenRouter API key to run this test.",
-    )
-    @pytest.mark.integration
     def test_live_run_with_response_format_pydantic_model(self, calendar_event_model):
         # Use a more explicit prompt that emphasizes JSON structure requirement
         chat_messages = [
@@ -630,7 +541,7 @@ class TestOpenRouterChatGenerator:
             )
         ]
         component = OpenRouterChatGenerator(
-            model="openai/gpt-5-mini", generation_kwargs={"response_format": calendar_event_model}
+            model="openai/gpt-5-mini", generation_kwargs={"response_format": calendar_event_model, "max_tokens": 1000}
         )
         results = component.run(chat_messages)
         assert len(results["replies"]) == 1
@@ -658,11 +569,6 @@ class TestOpenRouterChatGenerator:
             f"Expected event_location to be string, got: {type(msg['event_location'])}"
         )
 
-    @pytest.mark.skipif(
-        not os.environ.get("OPENROUTER_API_KEY", None),
-        reason="Export an env var called OPENROUTER_API_KEY containing the OpenRouter API key to run this test.",
-    )
-    @pytest.mark.integration
     def test_integration_mixing_tools_and_toolset(self):
         """Test mixing Tool list and Toolset at runtime."""
 
@@ -704,7 +610,7 @@ class TestOpenRouterChatGenerator:
         toolset = Toolset([weather_tool, time_tool])
 
         # Initialize with no tools, we'll pass them at runtime
-        component = OpenRouterChatGenerator()
+        component = OpenRouterChatGenerator(generation_kwargs={"max_tokens": 1000})
 
         # Pass mixed list: echo_tool (individual) and toolset (weather + time) at runtime
         # This tests that both individual tools and toolsets can be combined
@@ -1040,18 +946,524 @@ class TestChatCompletionChunkConversion:
         assert result.meta["finish_reason"] == "tool_calls"
         assert result.meta["index"] == 0
         assert result.meta["completion_start_time"] is not None
-        assert result.meta["usage"] == {
-            "completion_tokens": 42,
-            "prompt_tokens": 55,
-            "total_tokens": 97,
-            "completion_tokens_details": {
-                "accepted_prediction_tokens": None,
-                "audio_tokens": None,
-                "reasoning_tokens": 0,
-                "rejected_prediction_tokens": None,
-            },
-            "prompt_tokens_details": {
-                "audio_tokens": None,
-                "cached_tokens": 0,
-            },
-        }
+
+        usage = result.meta["usage"]
+        assert usage["completion_tokens"] == 42
+        assert usage["prompt_tokens"] == 55
+        assert usage["total_tokens"] == 97
+        assert usage["completion_tokens_details"]["reasoning_tokens"] == 0
+        assert usage["prompt_tokens_details"]["cached_tokens"] == 0
+
+
+class TestReasoningSupport:
+    def test_extract_reasoning_with_text_and_details(self):
+        msg = SimpleNamespace(
+            reasoning="Let me think step by step...",
+            reasoning_details=[{"type": "reasoning.text", "text": "Let me think step by step..."}],
+        )
+        result = _extract_reasoning(msg)
+        assert result is not None
+        assert result.reasoning_text == "Let me think step by step..."
+        assert result.extra["reasoning_details"] == [{"type": "reasoning.text", "text": "Let me think step by step..."}]
+
+    def test_extract_reasoning_returns_none_without_reasoning(self):
+        msg = SimpleNamespace()
+        result = _extract_reasoning(msg)
+        assert result is None
+
+    def test_extract_reasoning_from_details_only(self):
+        msg = SimpleNamespace(
+            reasoning=None,
+            reasoning_details=[
+                {"type": "reasoning.text", "text": "Step 1. "},
+                {"type": "reasoning.summary", "summary": "Conclusion."},
+            ],
+        )
+        result = _extract_reasoning(msg)
+        assert result is not None
+        assert result.reasoning_text == "Step 1. Conclusion."
+        assert len(result.extra["reasoning_details"]) == 2
+
+    def test_extract_reasoning_handles_model_dump_objects(self):
+        detail = Mock()
+        detail.model_dump.return_value = {"type": "reasoning.text", "text": "Thinking..."}
+        msg = SimpleNamespace(
+            reasoning="Thinking...",
+            reasoning_details=[detail],
+        )
+        result = _extract_reasoning(msg)
+        assert result is not None
+        assert result.extra["reasoning_details"] == [{"type": "reasoning.text", "text": "Thinking..."}]
+
+    def test_extract_reasoning_vars_fallback(self):
+        detail = SimpleNamespace(type="reasoning.text", text="Fallback path")
+        msg = SimpleNamespace(
+            reasoning="Fallback path",
+            reasoning_details=[detail],
+        )
+        result = _extract_reasoning(msg)
+        assert result is not None
+        assert result.extra["reasoning_details"] == [{"type": "reasoning.text", "text": "Fallback path"}]
+
+    def test_extract_reasoning_unknown_detail_type(self):
+        msg = SimpleNamespace(
+            reasoning=None,
+            reasoning_details=[
+                {"type": "reasoning.internal_monologue", "content": "hidden"},
+                {"type": "reasoning.text", "text": "Visible."},
+            ],
+        )
+        result = _extract_reasoning(msg)
+        assert result is not None
+        assert result.reasoning_text == "Visible."
+        assert len(result.extra["reasoning_details"]) == 2
+
+    def test_convert_completion_with_reasoning_and_tool_calls(self):
+        completion = ChatCompletion(
+            id="test-reasoning-tools",
+            model="deepseek/deepseek-r1",
+            object="chat.completion",
+            choices=[
+                Choice(
+                    finish_reason="tool_calls",
+                    logprobs=None,
+                    index=0,
+                    message=ChatCompletionMessage(
+                        content=None,
+                        role="assistant",
+                        reasoning="I need to check the weather.",
+                        reasoning_details=[{"type": "reasoning.text", "text": "I need to check the weather."}],
+                        tool_calls=[
+                            {
+                                "id": "call_abc123",
+                                "type": "function",
+                                "function": {"name": "weather", "arguments": '{"city": "Paris"}'},
+                            }
+                        ],
+                    ),
+                )
+            ],
+            created=int(datetime.now(tz=pytz.timezone("UTC")).timestamp()),
+            usage={"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50},
+        )
+
+        result = _convert_openrouter_completion_to_chat_message(completion, completion.choices[0])
+        assert result.text is None
+        assert result.reasoning is not None
+        assert result.reasoning.reasoning_text == "I need to check the weather."
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].tool_name == "weather"
+        assert result.tool_calls[0].arguments == {"city": "Paris"}
+        assert result.meta["finish_reason"] == "tool_calls"
+
+    def test_convert_completion_with_reasoning(self):
+        completion = ChatCompletion(
+            id="test-reasoning",
+            model="deepseek/deepseek-r1",
+            object="chat.completion",
+            choices=[
+                Choice(
+                    finish_reason="stop",
+                    logprobs=None,
+                    index=0,
+                    message=ChatCompletionMessage(
+                        content="The answer is 42.",
+                        role="assistant",
+                        reasoning="Let me think about this...",
+                        reasoning_details=[{"type": "reasoning.text", "text": "Let me think about this..."}],
+                    ),
+                )
+            ],
+            created=int(datetime.now(tz=pytz.timezone("UTC")).timestamp()),
+            usage={"prompt_tokens": 57, "completion_tokens": 40, "total_tokens": 97},
+        )
+
+        result = _convert_openrouter_completion_to_chat_message(completion, completion.choices[0])
+        assert result.text == "The answer is 42."
+        assert result.reasoning is not None
+        assert result.reasoning.reasoning_text == "Let me think about this..."
+        assert result.reasoning.extra["reasoning_details"] == [
+            {"type": "reasoning.text", "text": "Let me think about this..."}
+        ]
+        assert result.meta["model"] == "deepseek/deepseek-r1"
+        assert result.meta["finish_reason"] == "stop"
+
+    def test_convert_completion_without_reasoning(self):
+        completion = ChatCompletion(
+            id="test-no-reasoning",
+            model="openai/gpt-5-mini",
+            object="chat.completion",
+            choices=[
+                Choice(
+                    finish_reason="stop",
+                    logprobs=None,
+                    index=0,
+                    message=ChatCompletionMessage(content="Hello!", role="assistant"),
+                )
+            ],
+            created=int(datetime.now(tz=pytz.timezone("UTC")).timestamp()),
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        )
+
+        result = _convert_openrouter_completion_to_chat_message(completion, completion.choices[0])
+        assert result.text == "Hello!"
+        assert result.reasoning is None
+
+    def test_run_with_reasoning(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+
+        with patch("openai.resources.chat.completions.Completions.create") as mock_create:
+            completion = ChatCompletion(
+                id="test-run-reasoning",
+                model="deepseek/deepseek-r1",
+                object="chat.completion",
+                choices=[
+                    Choice(
+                        finish_reason="stop",
+                        logprobs=None,
+                        index=0,
+                        message=ChatCompletionMessage(
+                            content="Paris is the capital of France.",
+                            role="assistant",
+                            reasoning="The user asked about capitals. France's capital is Paris.",
+                            reasoning_details=[
+                                {
+                                    "type": "reasoning.text",
+                                    "text": "The user asked about capitals. France's capital is Paris.",
+                                }
+                            ],
+                        ),
+                    )
+                ],
+                created=int(datetime.now(tz=pytz.timezone("UTC")).timestamp()),
+                usage={"prompt_tokens": 57, "completion_tokens": 40, "total_tokens": 97},
+            )
+            mock_create.return_value = completion
+
+            component = OpenRouterChatGenerator(
+                model="deepseek/deepseek-r1",
+                generation_kwargs={"reasoning": {"effort": "high"}},
+            )
+            response = component.run([ChatMessage.from_user("What's the capital of France?")])
+
+            assert len(response["replies"]) == 1
+            reply = response["replies"][0]
+            assert reply.text == "Paris is the capital of France."
+            assert reply.reasoning is not None
+            assert "capitals" in reply.reasoning.reasoning_text
+            assert reply.reasoning.extra["reasoning_details"][0]["type"] == "reasoning.text"
+
+    def test_run_with_string_input(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+
+        with patch("openai.resources.chat.completions.Completions.create") as mock_create:
+            completion = ChatCompletion(
+                id="test-string-input",
+                model="openai/gpt-5-mini",
+                object="chat.completion",
+                choices=[
+                    Choice(
+                        finish_reason="stop",
+                        logprobs=None,
+                        index=0,
+                        message=ChatCompletionMessage(content="Paris.", role="assistant"),
+                    )
+                ],
+                created=int(datetime.now(tz=pytz.timezone("UTC")).timestamp()),
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            )
+            mock_create.return_value = completion
+
+            component = OpenRouterChatGenerator()
+            response = component.run("What's the capital of France?")
+
+            # the backend should receive exactly one user message
+            _, kwargs = mock_create.call_args
+            assert kwargs["messages"] == [{"role": "user", "content": "What's the capital of France?"}]
+
+            assert len(response["replies"]) == 1
+            assert response["replies"][0].text == "Paris."
+
+    def test_handle_stream_response_with_reasoning(self):
+        # mirrors OpenRouter's stream shape: `role` on every chunk, reasoning in both `reasoning` and
+        # `reasoning_details`, and the signature arriving in a separate final fragment
+        fmt = "anthropic-claude-v1"
+        chunks = [
+            _chunk(
+                ChoiceDelta(
+                    content="",
+                    role="assistant",
+                    reasoning="Compare ",
+                    reasoning_details=[{"type": "reasoning.text", "text": "Compare ", "format": fmt, "index": 0}],
+                )
+            ),
+            _chunk(
+                ChoiceDelta(
+                    content="",
+                    role="assistant",
+                    reasoning="9.9 and 9.11.",
+                    reasoning_details=[{"type": "reasoning.text", "text": "9.9 and 9.11.", "format": fmt, "index": 0}],
+                )
+            ),
+            _chunk(
+                ChoiceDelta(
+                    content="",
+                    role="assistant",
+                    reasoning_details=[
+                        {"type": "reasoning.text", "text": "", "signature": "sig-123", "format": fmt, "index": 0}
+                    ],
+                )
+            ),
+            _chunk(ChoiceDelta(content="9.9 is ", role="assistant")),
+            _chunk(ChoiceDelta(content="bigger.", role="assistant")),
+            _chunk(ChoiceDelta(content="", role="assistant"), finish_reason="stop"),
+            ChatCompletionChunk(
+                id="gen-1",
+                choices=[],
+                created=1750162525,
+                model="anthropic/claude-sonnet-4.5",
+                object="chat.completion.chunk",
+                usage=CompletionUsage(
+                    completion_tokens=30,
+                    prompt_tokens=20,
+                    total_tokens=50,
+                    completion_tokens_details=CompletionTokensDetails(reasoning_tokens=12),
+                ),
+            ),
+        ]
+
+        callback = CollectorCallback()
+        llm = OpenRouterChatGenerator(api_key=Secret.from_token("test-api-key"))
+        result = llm._handle_stream_response(chunks, callback=callback)[0]  # type: ignore[arg-type]
+
+        streamed = callback.chunks
+        assert len(streamed) == 7
+        assert [c.reasoning.reasoning_text for c in streamed[:3]] == ["Compare ", "9.9 and 9.11.", ""]
+        assert [c.start for c in streamed[:3]] == [True, False, False]
+        assert [c.index for c in streamed[:3]] == [0, 0, 0]
+        assert all(c.content == "" for c in streamed[:3])
+        assert streamed[2].reasoning.extra["reasoning_details"][0]["signature"] == "sig-123"
+        # the text forms its own block after the reasoning block, so print_streaming_chunk separates them
+        assert [c.content for c in streamed[3:5]] == ["9.9 is ", "bigger."]
+        assert all(c.reasoning is None for c in streamed[3:5])
+        assert [c.start for c in streamed[3:5]] == [True, False]
+        assert [c.index for c in streamed[3:5]] == [1, 1]
+        assert streamed[5].finish_reason == "stop"
+        assert streamed[6].meta["usage"]["completion_tokens"] == 30
+
+        assert result.text == "9.9 is bigger."
+        assert result.reasoning is not None
+        assert result.reasoning.reasoning_text == "Compare 9.9 and 9.11."
+        assert result.reasoning.extra["reasoning_details"] == [
+            {
+                "type": "reasoning.text",
+                "text": "Compare 9.9 and 9.11.",
+                "signature": "sig-123",
+                "format": fmt,
+                "index": 0,
+            }
+        ]
+        assert result.meta["finish_reason"] == "stop"
+        assert result.meta["usage"]["completion_tokens_details"]["reasoning_tokens"] == 12
+        assert result.meta["completion_start_time"] is not None
+
+    def test_handle_stream_response_splits_delta_with_reasoning_and_tool_call(self):
+        tool_call = ChoiceDeltaToolCall(
+            index=0,
+            id="call_1",
+            function=ChoiceDeltaToolCallFunction(name="weather", arguments='{"city": "Paris"}'),
+            type="function",
+        )
+        chunks = [
+            _chunk(ChoiceDelta(role="assistant", reasoning="I need the weather.")),
+            # a StreamingChunk can't hold both, so this delta must be split instead of dropping either part
+            _chunk(ChoiceDelta(role="assistant", reasoning=" Calling the tool.", tool_calls=[tool_call])),
+            _chunk(ChoiceDelta(role="assistant"), finish_reason="tool_calls"),
+        ]
+
+        callback = CollectorCallback()
+        llm = OpenRouterChatGenerator(api_key=Secret.from_token("test-api-key"))
+        result = llm._handle_stream_response(chunks, callback=callback)[0]  # type: ignore[arg-type]
+
+        streamed = callback.chunks
+        assert len(streamed) == 4
+        assert [c.reasoning.reasoning_text for c in streamed[:2]] == ["I need the weather.", " Calling the tool."]
+        assert [c.start for c in streamed[:2]] == [True, False]
+        assert streamed[1].finish_reason is None
+        assert streamed[2].reasoning is None
+        assert streamed[2].tool_calls[0].tool_name == "weather"
+        assert streamed[2].start is True
+        assert streamed[2].index == 1
+        assert streamed[2].tool_calls[0].index == 0
+        assert streamed[3].finish_reason == "tool_calls"
+
+        assert result.text is None
+        assert result.reasoning is not None
+        assert result.reasoning.reasoning_text == "I need the weather. Calling the tool."
+        # no `reasoning_details` were streamed, so there is nothing to send back in later turns
+        assert result.reasoning.extra == {}
+        assert result.tool_calls == [ToolCall(id="call_1", tool_name="weather", arguments={"city": "Paris"})]
+        assert result.meta["finish_reason"] == "tool_calls"
+
+    def test_handle_stream_response_numbers_tool_call_blocks_after_reasoning_and_text(self):
+        def tool_call_delta(index: int, name: str | None = None, arguments: str = "") -> ChoiceDelta:
+            function = ChoiceDeltaToolCallFunction(name=name, arguments=arguments)
+            tool_call = ChoiceDeltaToolCall(index=index, id=f"call_{index}" if name else None, function=function)
+            return ChoiceDelta(role="assistant", tool_calls=[tool_call])
+
+        chunks = [
+            _chunk(ChoiceDelta(content="", role="assistant", reasoning="I need the weather.")),
+            _chunk(ChoiceDelta(content="Let me check.", role="assistant")),
+            _chunk(tool_call_delta(0, name="weather")),
+            _chunk(tool_call_delta(0, arguments='{"city": "Paris"}')),
+            # some models stream whitespace between tool calls, which must not reset the shift of the next tool call
+            _chunk(ChoiceDelta(content="\n", role="assistant")),
+            _chunk(tool_call_delta(1, name="weather")),
+            _chunk(tool_call_delta(1, arguments='{"city": "Berlin"}')),
+            _chunk(ChoiceDelta(role="assistant"), finish_reason="tool_calls"),
+        ]
+
+        callback = CollectorCallback()
+        llm = OpenRouterChatGenerator(api_key=Secret.from_token("test-api-key"))
+        result = llm._handle_stream_response(chunks, callback=callback)[0]  # type: ignore[arg-type]
+
+        # every block gets an index after the previous one, so print_streaming_chunk separates them, while
+        # `ToolCallDelta.index` keeps the provider's tool call index
+        streamed = [c for c in callback.chunks if c.reasoning or c.content or c.tool_calls]
+        assert [(c.start, c.index) for c in streamed] == [
+            (True, 0),
+            (True, 1),
+            (True, 2),
+            (False, 2),
+            (False, None),
+            (True, 3),
+            (False, 3),
+        ]
+        assert [c.tool_calls[0].index for c in streamed if c.tool_calls] == [0, 0, 1, 1]
+
+        assert result.text == "Let me check.\n"
+        assert result.reasoning is not None
+        assert result.reasoning.reasoning_text == "I need the weather."
+        assert result.tool_calls == [
+            ToolCall(id="call_0", tool_name="weather", arguments={"city": "Paris"}),
+            ToolCall(id="call_1", tool_name="weather", arguments={"city": "Berlin"}),
+        ]
+
+    def test_handle_stream_response_marks_text_start_in_first_chunk(self):
+        # OpenRouter can stream text in the very first chunk, which the parent converter assumes only carries `role`
+        chunks = [
+            _chunk(ChoiceDelta(content="I", role="assistant")),
+            _chunk(ChoiceDelta(content="'ll check", role="assistant")),
+            _chunk(ChoiceDelta(content=" the weather.", role="assistant")),
+            _chunk(ChoiceDelta(content="", role="assistant"), finish_reason="stop"),
+        ]
+
+        callback = CollectorCallback()
+        llm = OpenRouterChatGenerator(api_key=Secret.from_token("test-api-key"))
+        result = llm._handle_stream_response(chunks, callback=callback)[0]  # type: ignore[arg-type]
+
+        text_chunks = [c for c in callback.chunks if c.content]
+        assert [c.start for c in text_chunks] == [True, False, False]
+        assert result.text == "I'll check the weather."
+
+    def test_merge_reasoning_details(self):
+        details = [
+            {"type": "reasoning.summary", "summary": "First ", "format": "openai-responses-v1", "index": 0},
+            {"type": "reasoning.summary", "summary": "second.", "format": "openai-responses-v1", "index": 0},
+            {"type": "reasoning.encrypted", "data": "abc", "id": None, "index": 1},
+            {"type": "reasoning.encrypted", "data": "def", "id": "rs_1", "index": 1},
+        ]
+
+        assert _merge_reasoning_details(details) == [
+            {"type": "reasoning.summary", "summary": "First second.", "format": "openai-responses-v1", "index": 0},
+            {"type": "reasoning.encrypted", "data": "abcdef", "id": "rs_1", "index": 1},
+        ]
+        # the streamed fragments are left untouched
+        assert details[0]["summary"] == "First "
+
+    def test_prepare_api_call_preserves_reasoning(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+        component = OpenRouterChatGenerator()
+
+        reasoning = ReasoningContent(
+            reasoning_text="Step by step analysis...",
+            extra={"reasoning_details": [{"type": "reasoning.text", "text": "Step by step analysis..."}]},
+        )
+        messages = [
+            ChatMessage.from_user("Explain quantum computing."),
+            ChatMessage.from_assistant(text="Quantum computing uses qubits.", reasoning=reasoning),
+            ChatMessage.from_user("Tell me more."),
+        ]
+
+        api_args = component._prepare_api_call(messages=messages)
+        formatted = api_args["messages"]
+
+        assert "reasoning_details" in formatted[1]
+        assert formatted[1]["reasoning_details"] == [{"type": "reasoning.text", "text": "Step by step analysis..."}]
+        assert "reasoning_details" not in formatted[0]
+        assert "reasoning_details" not in formatted[2]
+
+    def test_run_empty_messages(self, monkeypatch):
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-api-key")
+        component = OpenRouterChatGenerator()
+        response = component.run([])
+        assert response == {"replies": []}
+
+    def test_convert_completion_with_logprobs(self):
+        completion = ChatCompletion(
+            id="test-logprobs",
+            model="openai/gpt-5-mini",
+            object="chat.completion",
+            choices=[
+                Choice(
+                    finish_reason="stop",
+                    logprobs={
+                        "content": [
+                            {"token": "Hello", "logprob": -0.5, "top_logprobs": [], "bytes": [72, 101, 108, 108, 111]}
+                        ]
+                    },
+                    index=0,
+                    message=ChatCompletionMessage(content="Hello!", role="assistant"),
+                )
+            ],
+            created=int(datetime.now(tz=pytz.timezone("UTC")).timestamp()),
+            usage={"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+        )
+        result = _convert_openrouter_completion_to_chat_message(completion, completion.choices[0])
+        assert result.text == "Hello!"
+        assert "logprobs" in result.meta
+
+    def test_convert_completion_malformed_tool_call_json(self):
+        completion = ChatCompletion(
+            id="test-bad-json",
+            model="openai/gpt-5-mini",
+            object="chat.completion",
+            choices=[
+                Choice(
+                    finish_reason="tool_calls",
+                    logprobs=None,
+                    index=0,
+                    message=ChatCompletionMessage(
+                        content=None,
+                        role="assistant",
+                        tool_calls=[
+                            {
+                                "id": "call_bad",
+                                "type": "function",
+                                "function": {"name": "weather", "arguments": "{invalid json}"},
+                            },
+                            {
+                                "id": "call_good",
+                                "type": "function",
+                                "function": {"name": "weather", "arguments": '{"city": "Paris"}'},
+                            },
+                        ],
+                    ),
+                )
+            ],
+            created=int(datetime.now(tz=pytz.timezone("UTC")).timestamp()),
+            usage={"prompt_tokens": 10, "completion_tokens": 15, "total_tokens": 25},
+        )
+        result = _convert_openrouter_completion_to_chat_message(completion, completion.choices[0])
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].id == "call_good"

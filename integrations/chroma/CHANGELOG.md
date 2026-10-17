@@ -1,5 +1,69 @@
 # Changelog
 
+## [integrations/chroma-v4.5.0] - 2026-09-01
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- `ChromDocumentStore` get_metadata_field_unique_values setting list of values to return to `Any` (#3707)
+- Chroma adding optional parameter `filters` to `get_metadata_field_unique_values()` (#3742)
+- Standardize license files (#3771)
+- `ChromaDocumentStore` removing duplicated tests already covered by haystack Mixin tests + fixing dedup values (#3777)
+
+### 🧹 Chores
+
+- Re-standardize READMEs (#3768)
+
+
+## [integrations/chroma-v4.4.0] - 2026-07-24
+
+### 🚀 Features
+
+- Chroma - add sync closing methods (#3660)
+
+### 🐛 Bug Fixes
+
+- `ChromaDocumentStore` match `search_term` against metadata field value, not content (#3644)
+
+
+## [integrations/chroma-v4.3.2] - 2026-07-17
+
+### 🐛 Bug Fixes
+
+- *(chroma)* Raise a clear error for id filters with a non-'==' operator (#3587)
+
+
+## [integrations/chroma-v4.3.1] - 2026-06-29
+
+### 🐛 Bug Fixes
+
+- Serialize ChromaDocumentStore metadata in to_dict (#3445)
+
+
+## [integrations/chroma-v4.3.0] - 2026-04-29
+
+### 🚀 Features
+
+- *(chroma)* Support DuplicatePolicy in write_documents and use async mixin tests (#3245)
+
+### 🚜 Refactor
+
+- Weaviate, chroma, elasticsearch, opensearch, azure_ai_search use `_normalize_metadata_field_name` from haystack.utils (#2953)
+
+### 🧪 Testing
+
+- `ChromaDocumentStore` use Mixin tests (#3026)
+- Track test coverage for all integrations (#3065)
+- Better categorize some Document Stores tests (#3085)
+- Chroma - add unit tests (#3175)
+
+### 🧹 Chores
+
+- Add missing -> None return type annotations to chroma __init__ methods (#2976)
+- Enforce ruff docstring rules (D102/D103/D205/D209/D213/D417/D419) in first 10 integrations (#3008)
+- Increase lower pins for 3.14 support in some integrations + test with 3.14 (#3033)
+
+
 ## [integrations/chroma-v4.2.0] - 2026-03-11
 
 ### 🚀 Features
@@ -60,10 +124,6 @@
 - Adding `delete_by_filter()` and `update_by_filter()` to `ChromaDocumentStore` (#2649)
 
 
-### ⚙️ CI
-
-- Change pytest command (#2475)
-
 ### 🧹 Chores
 
 - Remove Readme API CI workflow and configs (#2573)
@@ -71,6 +131,13 @@
 ### 🌀 Miscellaneous
 
 - Adopt PEP 585 type hinting (part 1) (#2509)
+
+## [integrations/chroma-v3.4.1] - 2025-11-11
+
+### ⚙️ CI
+
+- Change pytest command (#2475)
+
 
 ## [integrations/chroma-v3.4.0] - 2025-10-27
 
@@ -110,6 +177,8 @@
 ### 🧹 Chores
 
 - Align core-integrations Hatch scripts (#1898)
+
+## [integrations/chroma-v3.1.0] - 2025-04-14
 
 
 ## [integrations/chroma-v2.0.3] - 2025-04-04
@@ -230,15 +299,29 @@
 
 ## [integrations/chroma-v0.20.1] - 2024-07-15
 
+### 🐛 Bug Fixes
+
+- `Chroma` - Fallback to default filter policy when deserializing retrievers without the init parameter (#897)
+
+## [integrations/chroma-v0.20.0] - 2024-07-15
+
 ### 🚀 Features
 
-- Added distance_function property to ChromadocumentStore (#817)
 - Add filter_policy to chroma integration (#826)
 
 ### 🐛 Bug Fixes
 
 - Allow search in ChromaDocumentStore without metadata (#863)
-- `Chroma` - Fallback to default filter policy when deserializing retrievers without the init parameter (#897)
+
+### 🌀 Miscellaneous
+
+- Chore: Minor retriever pydoc fix (#884)
+
+## [integrations/chroma-v0.19.0] - 2024-07-01
+
+### 🚀 Features
+
+- Added distance_function property to ChromadocumentStore (#817)
 
 ### ⚙️ CI
 
@@ -251,7 +334,6 @@
 ### 🌀 Miscellaneous
 
 - Ci: install `pytest-rerunfailures` where needed; add retry config to `test-cov` script (#845)
-- Chore: Minor retriever pydoc fix (#884)
 
 ## [integrations/chroma-v0.18.0] - 2024-05-31
 
@@ -325,14 +407,16 @@
 
 ## [integrations/chroma-v0.11.0] - 2024-01-18
 
-### 🐛 Bug Fixes
-
-- Chroma DocumentStore creation for pre-existing collection name (#157)
-
 ### 🌀 Miscellaneous
 
 - Mount chroma integration under `haystack_integrations.*` (#193)
 - Remove ChromaSingleQueryRetriever (#240)
+
+## [integrations/chroma-v0.10.0] - 2024-01-17
+
+### 🐛 Bug Fixes
+
+- Chroma DocumentStore creation for pre-existing collection name (#157)
 
 ## [integrations/chroma-v0.9.0] - 2023-12-20
 

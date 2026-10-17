@@ -41,6 +41,7 @@ class OllamaDocumentEmbedder:
         meta_fields_to_embed: list[str] | None = None,
         embedding_separator: str = "\n",
         batch_size: int = 32,
+        dimensions: int | None = None,
     ) -> None:
         """
         Create a new OllamaDocumentEmbedder instance.
@@ -76,6 +77,11 @@ class OllamaDocumentEmbedder:
             Separator used to concatenate the metadata fields to the document text.
         :param batch_size:
             Number of documents to process at once.
+        :param dimensions:
+            The desired number of dimensions in the embedding output. Only supported by models
+            that implement Matryoshka Representation Learning (MRL), such as nomic-embed-text-v1.5,
+            mxbai-embed-large, and qwen3-embedding. If None (default), the full vector is returned.
+            Requires ollama-python >= 0.6.2.
         """
         self.keep_alive = keep_alive
         self.timeout = timeout
@@ -88,9 +94,32 @@ class OllamaDocumentEmbedder:
         self.embedding_separator = embedding_separator
         self.suffix = suffix
         self.prefix = prefix
+        self.dimensions = dimensions
 
-        self._client = Client(host=self.url, timeout=self.timeout)
-        self._async_client = AsyncClient(host=self.url, timeout=self.timeout)
+        self._client: Client | None = None
+        self._async_client: AsyncClient | None = None
+
+    def warm_up(self) -> None:
+        """Create the synchronous Ollama client."""
+        if self._client is None:
+            self._client = Client(host=self.url, timeout=self.timeout)
+
+    async def warm_up_async(self) -> None:
+        """Create the asynchronous Ollama client."""
+        if self._async_client is None:
+            self._async_client = AsyncClient(host=self.url, timeout=self.timeout)
+
+    def close(self) -> None:
+        """Close the synchronous Ollama client."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    async def close_async(self) -> None:
+        """Close the asynchronous Ollama client."""
+        if self._async_client is not None:
+            await self._async_client.close()
+            self._async_client = None
 
     def _prepare_input(self, documents: list[Document]) -> list[Document]:
         """
@@ -134,6 +163,7 @@ class OllamaDocumentEmbedder:
         Internal method to embed a batch of texts.
         """
 
+        assert self._client is not None  # noqa: S101
         all_embeddings = []
 
         for i in tqdm(
@@ -145,6 +175,7 @@ class OllamaDocumentEmbedder:
                 input=batch,
                 options=generation_kwargs,
                 keep_alive=self.keep_alive,
+                dimensions=self.dimensions,
             )
             all_embeddings.extend(result["embeddings"])
 
@@ -156,6 +187,7 @@ class OllamaDocumentEmbedder:
         """
         Internal method to embed a batch of texts asynchronously.
         """
+        assert self._async_client is not None  # noqa: S101
         all_embeddings = []
 
         batches = [texts_to_embed[i : i + batch_size] for i in range(0, len(texts_to_embed), batch_size)]
@@ -166,6 +198,7 @@ class OllamaDocumentEmbedder:
                 input=batch,
                 options=generation_kwargs,
                 keep_alive=self.keep_alive,
+                dimensions=self.dimensions,
             )
             for batch in batches
         ]
@@ -197,6 +230,9 @@ class OllamaDocumentEmbedder:
             - `documents`: Documents with embedding information attached
             - `meta`: The metadata collected during the embedding process
         """
+        self.warm_up()
+        assert self._client is not None  # noqa: S101
+
         documents = self._prepare_input(documents=documents)
 
         if not documents:
@@ -231,6 +267,9 @@ class OllamaDocumentEmbedder:
             - `documents`: Documents with embedding information attached
             - `meta`: The metadata collected during the embedding process
         """
+
+        await self.warm_up_async()
+        assert self._async_client is not None  # noqa: S101
 
         documents = self._prepare_input(documents=documents)
 

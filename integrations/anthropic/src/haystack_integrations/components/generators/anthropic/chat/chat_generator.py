@@ -1,11 +1,11 @@
-from datetime import datetime, timezone
+import inspect
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 
 from haystack import component, default_from_dict, default_to_dict, logging
-from haystack.components.generators.utils import _convert_streaming_chunks_to_chat_message
+from haystack.components.generators.utils import _convert_streaming_chunks_to_chat_message, _normalize_messages
 from haystack.dataclasses.chat_message import ChatMessage
 from haystack.dataclasses.streaming_chunk import (
-    AsyncStreamingCallbackT,
     ComponentInfo,
     StreamingCallbackT,
     StreamingChunk,
@@ -19,7 +19,7 @@ from haystack.tools import (
     flatten_tools_or_toolsets,
     serialize_tools_or_toolset,
 )
-from haystack.utils.auth import Secret, deserialize_secrets_inplace
+from haystack.utils.auth import Secret
 from haystack.utils.callable_serialization import deserialize_callable, serialize_callable
 
 from anthropic import Anthropic, AsyncAnthropic
@@ -31,13 +31,19 @@ from anthropic.types import (
 )
 
 from .utils import (
+    _accumulate_raw_content_blocks,
     _convert_anthropic_chunk_to_streaming_chunk,
     _convert_chat_completion_to_chat_message,
     _convert_messages_to_anthropic_format,
+    _extract_citations,
+    _has_server_tool_blocks,
+    _merge_streaming_usage,
     _process_reasoning_contents,
 )
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX_TOKENS = 8192
 
 
 @component
@@ -101,6 +107,7 @@ class AnthropicChatGenerator:
         "tool_choice",
         "max_tokens",
         "metadata",
+        "service_tier",
         "stop_sequences",
         "temperature",
         "top_p",
@@ -111,15 +118,17 @@ class AnthropicChatGenerator:
     ]
 
     SUPPORTED_MODELS: ClassVar[list[str]] = [
+        "claude-fable-5-1",
+        "claude-fable-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
         "claude-opus-4-6",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5-20251001",
-        "claude-sonnet-4-5-20250929",
         "claude-opus-4-5-20251101",
-        "claude-opus-4-1-20250805",
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-        "claude-3-haiku-20240307",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5-20250929",
+        "claude-haiku-4-5-20251001",
     ]
     """A non-exhaustive list of chat models supported by this component. See
      https://platform.claude.com/docs/en/about-claude/models/overview for the full list."""
@@ -132,6 +141,7 @@ class AnthropicChatGenerator:
         generation_kwargs: dict[str, Any] | None = None,
         ignore_tools_thinking_messages: bool = True,
         tools: ToolsType | None = None,
+        anthropic_server_tools: list[dict[str, Any]] | None = None,
         *,
         timeout: float | None = None,
         max_retries: int | None = None,
@@ -149,8 +159,12 @@ class AnthropicChatGenerator:
 
             Supported generation_kwargs parameters are:
             - `system`: The system message to be passed to the model.
-            - `max_tokens`: The maximum number of tokens to generate.
+            - `max_tokens`: The maximum number of tokens to generate. Defaults to 8192. A response that hits
+                this limit is cut off; if the model was writing a tool call at the time, that call is dropped
+                and the reply carries a `length` finish reason.
             - `metadata`: A dictionary of metadata to be passed to the model.
+            - `service_tier`: Whether the request may use priority capacity (`auto`) or standard capacity only
+                (`standard_only`). See [service tiers](https://platform.claude.com/docs/en/api/service-tiers).
             - `stop_sequences`: A list of strings that the model should stop generating at.
             - `temperature`: The temperature to use for sampling.
             - `top_p`: The top_p value to use for nucleus sampling.
@@ -168,6 +182,11 @@ class AnthropicChatGenerator:
             for more details.
         :param tools: A list of Tool and/or Toolset objects, or a single Toolset, that the model can use.
             Each tool should have a unique name.
+        :param anthropic_server_tools: A list of Anthropic server-side tools passed directly to the API.
+            Use this for native Anthropic tools such as web search (`{"type": "web_search_20250305"}`),
+            code execution tool, or other provider-managed tools. Refer to the
+            [Anthropic documentation](https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-search-tool)
+            for the exact dict format each native tool expects.
         :param timeout:
             Timeout for Anthropic client calls. If not set, it defaults to the default set by the Anthropic client.
         :param max_retries:
@@ -184,19 +203,45 @@ class AnthropicChatGenerator:
         self.timeout = timeout
         self.max_retries = max_retries
 
-        client_kwargs: dict[str, Any] = {"api_key": api_key.resolve_value()}
-        # We do this since timeout=None is not the same as not setting it in Anthropic
-        if timeout is not None:
-            client_kwargs["timeout"] = timeout
-        # We do this since max_retries must be an int when passing to Anthropic
-        if max_retries is not None:
-            client_kwargs["max_retries"] = max_retries
-
-        self.client = Anthropic(**client_kwargs)
-        self.async_client = AsyncAnthropic(**client_kwargs)
+        self.client: Anthropic | None = None
+        self.async_client: AsyncAnthropic | None = None
 
         self.ignore_tools_thinking_messages = ignore_tools_thinking_messages
         self.tools = tools
+        self.anthropic_server_tools = anthropic_server_tools
+
+    def _client_kwargs(self) -> dict[str, Any]:
+        """Build the keyword arguments used to create Anthropic clients."""
+        client_kwargs: dict[str, Any] = {"api_key": self.api_key.resolve_value()}
+        # We do this since timeout=None is not the same as not setting it in Anthropic
+        if self.timeout is not None:
+            client_kwargs["timeout"] = self.timeout
+        # We do this since max_retries must be an int when passing to Anthropic
+        if self.max_retries is not None:
+            client_kwargs["max_retries"] = self.max_retries
+        return client_kwargs
+
+    def warm_up(self) -> None:
+        """Create the synchronous Anthropic client."""
+        if self.client is None:
+            self.client = Anthropic(**self._client_kwargs())
+
+    async def warm_up_async(self) -> None:
+        """Create the asynchronous Anthropic client."""
+        if self.async_client is None:
+            self.async_client = AsyncAnthropic(**self._client_kwargs())
+
+    def close(self) -> None:
+        """Close the synchronous Anthropic client."""
+        if self.client is not None:
+            self.client.close()
+            self.client = None
+
+    async def close_async(self) -> None:
+        """Close the asynchronous Anthropic client."""
+        if self.async_client is not None:
+            await self.async_client.close()
+            self.async_client = None
 
     def _get_telemetry_data(self) -> dict[str, Any]:
         """
@@ -220,6 +265,7 @@ class AnthropicChatGenerator:
             api_key=self.api_key.to_dict(),
             ignore_tools_thinking_messages=self.ignore_tools_thinking_messages,
             tools=serialize_tools_or_toolset(self.tools),
+            anthropic_server_tools=self.anthropic_server_tools,
             timeout=self.timeout,
             max_retries=self.max_retries,
         )
@@ -233,7 +279,6 @@ class AnthropicChatGenerator:
         :returns:
             The deserialized component instance.
         """
-        deserialize_secrets_inplace(data["init_parameters"], keys=["api_key"])
         deserialize_tools_or_toolset_inplace(data["init_parameters"], key="tools")
         init_params = data.get("init_parameters", {})
         serialized_callback_handler = init_params.get("streaming_callback")
@@ -247,7 +292,7 @@ class AnthropicChatGenerator:
         messages: list[ChatMessage],
         generation_kwargs: dict[str, Any] | None = None,
         tools: ToolsType | None = None,
-    ) -> tuple[list[TextBlockParam], list[MessageParam], dict[str, Any], list[ToolParam]]:
+    ) -> tuple[list[TextBlockParam], list[MessageParam], dict[str, Any], list[Any]]:
         """
         Prepare the parameters for the Anthropic API request.
 
@@ -280,21 +325,35 @@ class AnthropicChatGenerator:
         # prompt caching
 
         # tools management
-        tools = tools or self.tools
+        tools = tools if tools is not None else self.tools
         flattened_tools = flatten_tools_or_toolsets(tools)
         _check_duplicate_tool_names(flattened_tools)
 
-        anthropic_tools: list[ToolParam] = []
+        anthropic_tools: list[Any] = []
         if flattened_tools:
             for tool in flattened_tools:
                 anthropic_tools.append(
                     ToolParam(name=tool.name, description=tool.description, input_schema=tool.parameters)
                 )
+        if self.anthropic_server_tools:
+            server_tool_names = {st["name"] for st in self.anthropic_server_tools if "name" in st}
+            if duplicates := server_tool_names & {tool.name for tool in flattened_tools}:
+                msg = (
+                    f"Duplicate tool names found: {sorted(duplicates)}. "
+                    "`anthropic_server_tools` cannot reuse a name from `tools`."
+                )
+                raise ValueError(msg)
+            anthropic_tools.extend(self.anthropic_server_tools)
 
         return system_messages, non_system_messages, generation_kwargs, anthropic_tools
 
     def _resolve_flattened_generation_kwargs(self, generation_kwargs: dict[str, Any]) -> dict[str, Any]:
         generation_kwargs = generation_kwargs.copy()
+        # Copy the nested dicts the flattened kwargs write into; a shallow copy would share them with the
+        # component's init-time generation_kwargs, so a per-run flattened kwarg would persist across runs.
+        for key in ("tool_choice", "thinking", "output_config"):
+            if isinstance(generation_kwargs.get(key), dict):
+                generation_kwargs[key] = dict(generation_kwargs[key])
 
         disable_parallel_tool_use = generation_kwargs.pop("disable_parallel_tool_use", None)
         parallel_tool_use = generation_kwargs.pop("parallel_tool_use", None)
@@ -310,16 +369,30 @@ class AnthropicChatGenerator:
             tool_choice["disable_parallel_tool_use"] = disable_parallel_tool_use
             tool_choice.setdefault("type", "auto")  # default value
 
-        tool_choice_type = generation_kwargs.pop("tool_choice_type", None)
-        if tool_choice_type is not None:
-            tool_choice = generation_kwargs.setdefault("tool_choice", {})
-            tool_choice["type"] = tool_choice_type
-
         thinking_budget_tokens = generation_kwargs.pop("thinking_budget_tokens", None)
         if thinking_budget_tokens is not None:
             thinking = generation_kwargs.setdefault("thinking", {})
             thinking["budget_tokens"] = thinking_budget_tokens
             thinking.setdefault("type", "enabled")
+
+        adaptive_thinking_effort = generation_kwargs.pop("adaptive_thinking_effort", None)
+        if adaptive_thinking_effort is not None:
+            thinking = generation_kwargs.setdefault("thinking", {})
+            if adaptive_thinking_effort in ("disabled", "none"):
+                thinking.setdefault("type", "disabled")
+            else:
+                thinking.setdefault("type", "adaptive")
+                output_config = generation_kwargs.setdefault("output_config", {})
+                output_config["effort"] = adaptive_thinking_effort
+
+        for nested_name in ("tool_choice", "thinking", "output_config"):
+            prefix = f"{nested_name}_"
+            for key in [k for k in generation_kwargs if k.startswith(prefix)]:
+                value = generation_kwargs.pop(key)
+                if value is not None:
+                    nested_key = key[len(prefix) :]
+                    nested_dict = generation_kwargs.setdefault(nested_name, {})
+                    nested_dict[nested_key] = value
 
         return generation_kwargs
 
@@ -341,21 +414,24 @@ class AnthropicChatGenerator:
             chunks: list[StreamingChunk] = []
             model: str | None = None
             tool_call_index = -1
-            input_tokens = None
+            in_server_tool_block = False
+            start_usage: dict[str, Any] = {}
             component_info = ComponentInfo.from_component(self)
             for chunk in response:
                 if chunk.type in ["message_start", "content_block_start", "content_block_delta", "message_delta"]:
-                    # Extract model from message_start chunks
+                    # Extract model and full usage from message_start chunks
                     if chunk.type == "message_start":
                         model = chunk.message.model
-                        if chunk.message.usage.input_tokens is not None:
-                            input_tokens = chunk.message.usage.input_tokens
+                        start_usage = chunk.message.usage.model_dump()
 
-                    if chunk.type == "content_block_start" and chunk.content_block.type == "tool_use":
-                        tool_call_index += 1
+                    if chunk.type == "content_block_start":
+                        if chunk.content_block.type == "tool_use":
+                            tool_call_index += 1
+                        # server tools are executed by Anthropic: their streamed input must not become a ToolCall
+                        in_server_tool_block = chunk.content_block.type == "server_tool_use"
 
                     streaming_chunk = _convert_anthropic_chunk_to_streaming_chunk(
-                        chunk, component_info, tool_call_index
+                        chunk, component_info, tool_call_index, in_server_tool_block
                     )
                     chunks.append(streaming_chunk)
                     if streaming_callback:
@@ -365,13 +441,20 @@ class AnthropicChatGenerator:
             reasoning = _process_reasoning_contents(chunks)
 
             completion.meta.update(
-                {"received_at": datetime.now(timezone.utc).isoformat(), "model": model},
+                {"received_at": datetime.now(UTC).isoformat(), "model": model},
             )
 
-            if input_tokens is not None:
-                if "usage" not in completion.meta:
-                    completion.meta["usage"] = {}
-                completion.meta["usage"]["input_tokens"] = input_tokens
+            # `completion.meta["usage"]` is the usage of the last message_delta chunk
+            if usage := _merge_streaming_usage(start_usage=start_usage, delta_usage=completion.meta.get("usage")):
+                completion.meta["usage"] = usage
+
+            # keep the raw content so server-tool blocks can be replayed on later turns
+            if self.anthropic_server_tools:
+                raw_content = _accumulate_raw_content_blocks(chunks)
+                if _has_server_tool_blocks(raw_content):
+                    completion.meta["raw_content_for_server_tools"] = raw_content
+                if citations := _extract_citations(raw_content):
+                    completion.meta["citations"] = citations
 
             return {
                 "replies": [
@@ -393,7 +476,7 @@ class AnthropicChatGenerator:
     async def _process_response_async(
         self,
         response: Any,
-        streaming_callback: AsyncStreamingCallbackT | None = None,
+        streaming_callback: StreamingCallbackT | None = None,
     ) -> dict[str, list[ChatMessage]]:
         """
         Process the response from the Anthropic API asynchronously.
@@ -409,7 +492,8 @@ class AnthropicChatGenerator:
             chunks: list[StreamingChunk] = []
             model: str | None = None
             tool_call_index = -1
-            input_tokens = None
+            in_server_tool_block = False
+            start_usage: dict[str, Any] = {}
             component_info = ComponentInfo.from_component(self)
             async for chunk in response:
                 if chunk.type in [
@@ -418,33 +502,45 @@ class AnthropicChatGenerator:
                     "content_block_delta",
                     "message_delta",
                 ]:
-                    # Extract model from message_start chunks
+                    # Extract model and full usage from message_start chunks
                     if chunk.type == "message_start":
                         model = chunk.message.model
-                        if chunk.message.usage.input_tokens is not None:
-                            input_tokens = chunk.message.usage.input_tokens
+                        start_usage = chunk.message.usage.model_dump()
 
-                    if chunk.type == "content_block_start" and chunk.content_block.type == "tool_use":
-                        tool_call_index += 1
+                    if chunk.type == "content_block_start":
+                        if chunk.content_block.type == "tool_use":
+                            tool_call_index += 1
+                        # server tools are executed by Anthropic: their streamed input must not become a ToolCall
+                        in_server_tool_block = chunk.content_block.type == "server_tool_use"
 
                     streaming_chunk = _convert_anthropic_chunk_to_streaming_chunk(
-                        chunk, component_info, tool_call_index
+                        chunk, component_info, tool_call_index, in_server_tool_block
                     )
                     chunks.append(streaming_chunk)
                     if streaming_callback:
-                        await streaming_callback(streaming_chunk)
+                        # sync callbacks are allowed in async contexts with Haystack >= 3.0, so only await async ones
+                        callback_result = streaming_callback(streaming_chunk)
+                        if inspect.isawaitable(callback_result):
+                            await callback_result
 
             completion = _convert_streaming_chunks_to_chat_message(chunks)
             reasoning = _process_reasoning_contents(chunks)
 
             completion.meta.update(
-                {"received_at": datetime.now(timezone.utc).isoformat(), "model": model},
+                {"received_at": datetime.now(UTC).isoformat(), "model": model},
             )
 
-            if input_tokens is not None:
-                if "usage" not in completion.meta:
-                    completion.meta["usage"] = {}
-                completion.meta["usage"]["input_tokens"] = input_tokens
+            # `completion.meta["usage"]` is the usage of the last message_delta chunk
+            if usage := _merge_streaming_usage(start_usage=start_usage, delta_usage=completion.meta.get("usage")):
+                completion.meta["usage"] = usage
+
+            # keep the raw content so server-tool blocks can be replayed on later turns
+            if self.anthropic_server_tools:
+                raw_content = _accumulate_raw_content_blocks(chunks)
+                if _has_server_tool_blocks(raw_content):
+                    completion.meta["raw_content_for_server_tools"] = raw_content
+                if citations := _extract_citations(raw_content):
+                    completion.meta["citations"] = citations
 
             return {
                 "replies": [
@@ -465,7 +561,7 @@ class AnthropicChatGenerator:
     @component.output_types(replies=list[ChatMessage])
     def run(
         self,
-        messages: list[ChatMessage],
+        messages: list[ChatMessage] | str,
         streaming_callback: StreamingCallbackT | None = None,
         generation_kwargs: dict[str, Any] | None = None,
         tools: ToolsType | None = None,
@@ -474,14 +570,21 @@ class AnthropicChatGenerator:
         Invokes the Anthropic API with the given messages and generation kwargs.
 
         :param messages: A list of ChatMessage instances representing the input messages.
+            If a string is provided, it is converted to a list containing a ChatMessage with user role.
         :param streaming_callback: A callback function that is called when a new token is received from the stream.
-        :param generation_kwargs: Optional arguments to pass to the Anthropic generation endpoint.
+        :param generation_kwargs: Optional arguments to pass to the Anthropic generation endpoint. These are merged
+        per key with the `generation_kwargs` passed at initialization: keys provided here take precedence, keys set
+        only at initialization are kept.
         :param tools: A list of Tool and/or Toolset objects, or a single Toolset, that the model can use.
         Each tool should have a unique name. If set, it will override the `tools` parameter set during component
         initialization.
         :returns: A dictionary with the following keys:
             - `replies`: The responses from the model
         """
+        self.warm_up()
+        assert self.client is not None  # noqa: S101
+
+        messages = _normalize_messages(messages)
         system_messages, non_system_messages, generation_kwargs, anthropic_tools = self._prepare_request_params(
             messages, generation_kwargs, tools
         )
@@ -498,7 +601,7 @@ class AnthropicChatGenerator:
             system=system_messages,
             tools=anthropic_tools,
             stream=streaming_callback is not None,
-            max_tokens=generation_kwargs.pop("max_tokens", 1024),
+            max_tokens=generation_kwargs.pop("max_tokens", _DEFAULT_MAX_TOKENS),
             **generation_kwargs,
         )
 
@@ -507,7 +610,7 @@ class AnthropicChatGenerator:
     @component.output_types(replies=list[ChatMessage])
     async def run_async(
         self,
-        messages: list[ChatMessage],
+        messages: list[ChatMessage] | str,
         streaming_callback: StreamingCallbackT | None = None,
         generation_kwargs: dict[str, Any] | None = None,
         tools: ToolsType | None = None,
@@ -516,14 +619,21 @@ class AnthropicChatGenerator:
         Async version of the run method. Invokes the Anthropic API with the given messages and generation kwargs.
 
         :param messages: A list of ChatMessage instances representing the input messages.
+            If a string is provided, it is converted to a list containing a ChatMessage with user role.
         :param streaming_callback: A callback function that is called when a new token is received from the stream.
-        :param generation_kwargs: Optional arguments to pass to the Anthropic generation endpoint.
+        :param generation_kwargs: Optional arguments to pass to the Anthropic generation endpoint. These are merged
+        per key with the `generation_kwargs` passed at initialization: keys provided here take precedence, keys set
+        only at initialization are kept.
         :param tools: A list of Tool and/or Toolset objects, or a single Toolset, that the model can use.
         Each tool should have a unique name. If set, it will override the `tools` parameter set during component
         initialization.
         :returns: A dictionary with the following keys:
             - `replies`: The responses from the model
         """
+        await self.warm_up_async()
+        assert self.async_client is not None  # noqa: S101
+
+        messages = _normalize_messages(messages)
         system_messages, non_system_messages, generation_kwargs, anthropic_tools = self._prepare_request_params(
             messages, generation_kwargs, tools
         )
@@ -540,7 +650,7 @@ class AnthropicChatGenerator:
             system=system_messages,
             tools=anthropic_tools,
             stream=streaming_callback is not None,
-            max_tokens=generation_kwargs.pop("max_tokens", 1024),
+            max_tokens=generation_kwargs.pop("max_tokens", _DEFAULT_MAX_TOKENS),
             **generation_kwargs,
         )
 

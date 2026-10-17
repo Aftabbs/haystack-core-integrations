@@ -1,5 +1,35 @@
 # Changelog
 
+## [integrations/kreuzberg-v1.0.2] - 2026-08-20
+
+### 🐛 Bug Fixes
+
+- Standardize license files (#3771)
+- KreuzbergConverter config round-trips as YAML dict instead of JSON string (#3807)
+
+### 🧹 Chores
+
+- Re-standardize READMEs (#3768)
+
+
+## [integrations/kreuzberg-v1.0.1] - 2026-07-29
+
+### 🚀 Features
+
+- Update kreuzberg pin to only block non-MIT licenses (#3690)
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+
+
+## [integrations/kreuzberg-v1.0.0] - 2026-04-21
+
+### 🧹 Chores
+
+- Exclude newer kreuzberg dependency versions due to license change (#3189)
+
+
 ## [integrations/kreuzberg-v0.1.1] - 2026-04-07
 
 ### 🐛 Bug Fixes

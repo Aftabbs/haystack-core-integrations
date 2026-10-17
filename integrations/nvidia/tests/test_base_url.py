@@ -7,7 +7,6 @@ from typing import Any
 import pytest
 
 from haystack_integrations.components.embedders.nvidia import NvidiaDocumentEmbedder, NvidiaTextEmbedder
-from haystack_integrations.components.generators.nvidia import NvidiaGenerator
 from haystack_integrations.components.rankers.nvidia import NvidiaRanker
 
 
@@ -23,17 +22,18 @@ from haystack_integrations.components.rankers.nvidia import NvidiaRanker
 )
 @pytest.mark.parametrize(
     "component",
-    [NvidiaDocumentEmbedder, NvidiaTextEmbedder, NvidiaRanker, NvidiaGenerator],
+    [NvidiaDocumentEmbedder, NvidiaTextEmbedder, NvidiaRanker],
 )
 def test_base_url_invalid_not_hosted(base_url: str, component) -> None:
     with pytest.warns(UserWarning) as msg:
         component(api_url=base_url, model="x")
-    assert "you may have inference and listing issues" in str(msg[0].message)
+    user_warnings = [w for w in msg if issubclass(w.category, UserWarning)]
+    assert any("you may have inference and listing issues" in str(w.message) for w in user_warnings)
 
 
 @pytest.mark.parametrize(
     "component",
-    [NvidiaDocumentEmbedder, NvidiaTextEmbedder, NvidiaRanker, NvidiaGenerator],
+    [NvidiaDocumentEmbedder, NvidiaTextEmbedder, NvidiaRanker],
 )
 def test_create_without_base_url(component: type, monkeypatch) -> None:
     monkeypatch.setenv("NVIDIA_API_KEY", "valid_api_key")
@@ -44,7 +44,7 @@ def test_create_without_base_url(component: type, monkeypatch) -> None:
 
 @pytest.mark.parametrize(
     "component",
-    [NvidiaDocumentEmbedder, NvidiaTextEmbedder, NvidiaRanker, NvidiaGenerator],
+    [NvidiaDocumentEmbedder, NvidiaTextEmbedder, NvidiaRanker],
 )
 def test_base_url_priority(component: type) -> None:
     param_url = "https://PARAM/v1"
@@ -58,7 +58,7 @@ def test_base_url_priority(component: type) -> None:
 
 @pytest.mark.parametrize(
     "component",
-    [NvidiaDocumentEmbedder, NvidiaTextEmbedder, NvidiaRanker, NvidiaGenerator],
+    [NvidiaDocumentEmbedder, NvidiaTextEmbedder, NvidiaRanker],
 )
 @pytest.mark.parametrize(
     "api_url",
@@ -77,7 +77,7 @@ def test_param_api_url_negative(component: type, api_url: str) -> None:
 
 @pytest.mark.parametrize(
     "component",
-    [NvidiaDocumentEmbedder, NvidiaTextEmbedder, NvidiaRanker, NvidiaGenerator],
+    [NvidiaDocumentEmbedder, NvidiaTextEmbedder, NvidiaRanker],
 )
 @pytest.mark.parametrize(
     "api_url",

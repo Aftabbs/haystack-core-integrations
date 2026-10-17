@@ -1,5 +1,95 @@
 # Changelog
 
+## [integrations/ollama-v7.0.2] - 2026-10-16
+
+### 🐛 Bug Fixes
+
+- *(ollama)* Allow contentless assistant messages in the chat message converter (#4106)
+
+### 🧪 Testing
+
+- Test compatible integrations with Python 3.15; update pyproject (#4104)
+
+### 🧹 Chores
+
+- [**breaking**] Drop Python 3.10 support (#4105)
+
+
+## [integrations/ollama-v7.0.1] - 2026-09-24
+
+### 🐛 Bug Fixes
+
+- Ollama - respect an empty runtime tools list (#3976)
+
+
+## [integrations/ollama-v7.0.0] - 2026-09-10
+
+### 🚀 Features
+
+- [**breaking**] Ollama - add lifecycle handling (#3931)
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+### 🧹 Chores
+
+- Clarify how generation_kwargs passed in run are handled (#3805)
+- [**breaking**] Remove deprecated `OllamaGenerator` (use `OllamaChatGenerator` instead) (#3886)
+
+
+## [integrations/ollama-v6.8.0] - 2026-07-09
+
+### 🐛 Bug Fixes
+
+- Replace in-place dataclass mutations in anthropic, llama_cpp, olama, pinecone tests (#3551)
+
+### 🧪 Testing
+
+- Guard ToolInvoker imports so chat-generator tests run under Haystack 3.0 (#3535)
+- Fix cohere, amazon_bedrock, mirage, and ollama tests under Haystack 3.0 (#3566)
+
+### 🧹 Chores
+
+- Support sync streaming callbacks in async contexts for Haystack 2.x/3.x compatibility (#3534)
+
+
+## [integrations/ollama-v6.7.0] - 2026-06-19
+
+### 🐛 Bug Fixes
+
+- Serialize OllamaChatGenerator think parameter (#3455)
+
+### 🧪 Testing
+
+- Add system prompts to ollama tests (#3415)
+
+
+## [integrations/ollama-v6.6.0] - 2026-06-03
+
+### 🚀 Features
+
+- Ollama - accept str as ChatGenerator input; deprecate generator; rm generator example (#3388)
+
+
+## [integrations/ollama-v6.5.0] - 2026-05-21
+
+### 🚀 Features
+
+- *(ollama)* Add dimensions parameter to OllamaDocumentEmbedder and OllamaTextEmbedder (#3322)
+
+
+## [integrations/ollama-v6.4.0] - 2026-05-21
+
+### 🐛 Bug Fixes
+
+- *(ollama)* Preserve tool call IDs to fix repeated same-tool calls (#3321)
+
+
 ## [integrations/ollama-v6.3.0] - 2026-04-10
 
 ### 🐛 Bug Fixes
@@ -255,7 +345,6 @@
 
 ### 🌀 Miscellaneous
 
-- Chore: update changelog for `ollama-haystack==2.0.0` (#1214)
 - Chore: use class methods to create `ChatMessage` (#1222)
 
 ## [integrations/ollama-v2.0.0] - 2024-11-22
@@ -375,11 +464,16 @@
 
 ### 🌀 Miscellaneous
 
+- Ollama: improve test (#191)
+- Mount Ollama in haystack_integrations (#216)
+
+## [integrations/ollama-v0.0.2] - 2024-01-09
+
+### 🌀 Miscellaneous
+
 - Docs: Ollama docstrings update (#171)
 - Add example of OllamaGenerator (#170)
 - Ollama Chat Generator (#176)
-- Ollama: improve test (#191)
-- Mount Ollama in haystack_integrations (#216)
 
 ## [integrations/ollama-v0.0.1] - 2024-01-03
 

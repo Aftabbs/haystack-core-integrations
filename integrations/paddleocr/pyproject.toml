@@ -7,7 +7,7 @@ name = "paddleocr-haystack"
 dynamic = ["version"]
 description = 'An integration of PaddleOCR with Haystack'
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 keywords = []
 authors = [
@@ -16,7 +16,6 @@ authors = [
 classifiers = [
   "Development Status :: 4 - Beta",
   "Programming Language :: Python",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: Implementation :: CPython",
@@ -24,9 +23,7 @@ classifiers = [
 ]
 dependencies = [
   "haystack-ai>=2.22.0",
-  "paddleocr>=3.4.0",
-  "paddlex[serving]>=3.4.0",
-  "requests>=2.25.0",
+  "paddleocr>=3.7.0",
 ]
 
 [project.urls]
@@ -132,6 +129,7 @@ ignore = [
   "PLR0912",
   "PLR0913",
   "PLR0915",
+  "PLR0917",
   # Misc
   "B008",
   "S101",

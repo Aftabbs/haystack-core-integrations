@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2023-present deepset GmbH <info@deepset.ai>
 #
 # SPDX-License-Identifier: Apache-2.0
+
 from typing import Any
 
 from haystack import component, default_from_dict, default_to_dict
@@ -115,6 +116,18 @@ class ElasticsearchBM25Retriever:
         if filter_policy := data["init_parameters"].get("filter_policy"):
             data["init_parameters"]["filter_policy"] = FilterPolicy.from_str(filter_policy)
         return default_from_dict(cls, data)
+
+    def close(self) -> None:
+        """
+        Release the synchronous resources of the underlying Document Store.
+        """
+        self._document_store.close()
+
+    async def close_async(self) -> None:
+        """
+        Release the asynchronous resources of the underlying Document Store.
+        """
+        await self._document_store.close_async()
 
     @component.output_types(documents=list[Document])
     def run(

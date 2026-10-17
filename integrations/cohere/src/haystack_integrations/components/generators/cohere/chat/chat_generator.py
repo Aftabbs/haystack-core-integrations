@@ -1,12 +1,12 @@
+import inspect
 import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, ClassVar, Literal, get_args
 
 from haystack import component, default_from_dict, default_to_dict, logging
-from haystack.components.generators.utils import _convert_streaming_chunks_to_chat_message
+from haystack.components.generators.utils import _convert_streaming_chunks_to_chat_message, _normalize_messages
 from haystack.dataclasses import ChatMessage, ComponentInfo, ImageContent, TextContent, ToolCall
 from haystack.dataclasses.streaming_chunk import (
-    AsyncStreamingCallbackT,
     FinishReason,
     StreamingCallbackT,
     StreamingChunk,
@@ -29,6 +29,7 @@ from httpx import AsyncHTTPTransport, HTTPTransport
 from httpx import Client as HTTPXClient
 
 from cohere import AsyncClientV2, ChatResponse, ClientV2, StreamedChatResponseV2
+from haystack_integrations.utils.cohere import validate_api_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +276,17 @@ def _convert_cohere_chunk_to_streaming_chunk(
             arguments = chunk.delta.message.tool_calls.function.arguments
             tool_calls = [ToolCallDelta(index=global_index, arguments=arguments)]
 
+    elif chunk.type == "citation-start":
+        # Each citation-start chunk carries one Citation object in delta.message.citations.
+        # Collect it here so _parse_streaming_response can aggregate them into the final message
+        # meta, matching the behavior of the non-streaming path which returns citations via
+        # chat_response.message.citations.
+        delta = getattr(chunk, "delta", None)
+        if delta and delta.message:
+            citation = getattr(delta.message, "citations", None)
+            if citation is not None:
+                meta["citations"] = [citation]
+
     elif chunk.type == "message-end":
         finish_reason_raw = getattr(chunk.delta, "finish_reason", None)
         finish_reason = FINISH_REASON_MAPPING.get(finish_reason_raw) if finish_reason_raw else None
@@ -345,13 +357,20 @@ def _parse_streaming_response(
         chunks.append(streaming_chunk)
         streaming_callback(streaming_chunk)
 
-    return _convert_streaming_chunks_to_chat_message(chunks=chunks)
+    message = _convert_streaming_chunks_to_chat_message(chunks=chunks)
+
+    # Aggregate citations collected from citation-start chunks into the message meta,
+    # mirroring the non-streaming path which sets meta["citations"] from chat_response.message.citations.
+    citations = [c for sc in chunks for c in (sc.meta.get("citations") or [])]
+    message.meta["citations"] = citations if citations else None
+
+    return message
 
 
 async def _parse_async_streaming_response(
     response: AsyncIterator[StreamedChatResponseV2],
     model: str,
-    streaming_callback: AsyncStreamingCallbackT,
+    streaming_callback: StreamingCallbackT,
     component_info: ComponentInfo,
 ) -> ChatMessage:
     """
@@ -375,9 +394,17 @@ async def _parse_async_streaming_response(
 
         original_chunks.append(chunk)
         chunks.append(streaming_chunk)
-        await streaming_callback(streaming_chunk)
+        # sync callbacks are allowed in async contexts with Haystack >= 3.0, so only await async ones
+        callback_result = streaming_callback(streaming_chunk)
+        if inspect.isawaitable(callback_result):
+            await callback_result
 
-    return _convert_streaming_chunks_to_chat_message(chunks=chunks)
+    message = _convert_streaming_chunks_to_chat_message(chunks=chunks)
+
+    citations = [c for sc in chunks for c in (sc.meta.get("citations") or [])]
+    message.meta["citations"] = citations if citations else None
+
+    return message
 
 
 @component
@@ -433,13 +460,11 @@ class CohereChatGenerator:
 
     ### Advanced example
 
-    CohereChatGenerator can be integrated into pipelines and supports Haystack's tooling
-    architecture, enabling tools to be invoked seamlessly across various generators.
+    CohereChatGenerator supports Haystack's tooling architecture, so it can drive tool calls in an `Agent`.
 
     ```python
-    from haystack import Pipeline
+    from haystack.components.agents import Agent
     from haystack.dataclasses import ChatMessage
-    from haystack.components.tools import ToolInvoker
     from haystack.tools import Tool
     from haystack_integrations.components.generators.cohere import CohereChatGenerator
 
@@ -463,20 +488,12 @@ class CohereChatGenerator:
         function=weather,
     )
 
-    # Create and set up the pipeline
-    pipeline = Pipeline()
-    pipeline.add_component("generator", CohereChatGenerator(tools=[weather_tool]))
-    pipeline.add_component("tool_invoker", ToolInvoker(tools=[weather_tool]))
-    pipeline.connect("generator", "tool_invoker")
+    # The Agent calls the tool and feeds the result back to the model
+    agent = Agent(chat_generator=CohereChatGenerator(), tools=[weather_tool])
+    result = agent.run(messages=[ChatMessage.from_user("What's the weather like in Paris?")])
 
-    # Run the pipeline with a weather query
-    results = pipeline.run(
-        data={"generator": {"messages": [ChatMessage.from_user("What's the weather like in Paris?")]}}
-    )
-
-    # The tool result will be available in the pipeline output
-    print(results["tool_invoker"]["tool_messages"][0].tool_call_result.result)
-    # Output: "The weather in Paris is sunny and 32°C"
+    print(result["last_message"].text)
+    # Output: "The weather in Paris is sunny and 32°C."
     ```
     """
 
@@ -518,7 +535,7 @@ class CohereChatGenerator:
         :param streaming_callback: A callback function that is called when a new token is received from the stream.
             The callback function accepts [StreamingChunk](https://docs.haystack.deepset.ai/docs/data-classes#streamingchunk)
             as an argument.
-        :param api_base_url: The base URL of the Cohere API.
+        :param api_base_url: The base URL of the Cohere API. The Cohere client appends the endpoint path to it.
         :param generation_kwargs: Other parameters to use for the model during generation. For a list of parameters,
             see [Cohere Chat endpoint](https://docs.cohere.com/reference/chat).
             Some of the parameters are:
@@ -538,11 +555,13 @@ class CohereChatGenerator:
             Maximum number of retries to attempt for failed requests. If not set, it defaults to the default set by
             the Cohere client.
 
+        :raises ValueError: If `api_base_url` is a full endpoint URL rather than a base URL.
         """
         _check_duplicate_tool_names(flatten_tools_or_toolsets(tools))
 
         if not api_base_url:
             api_base_url = "https://api.cohere.com"
+        validate_api_base_url(api_base_url)
 
         self.api_key = api_key
         self.model = model
@@ -553,22 +572,35 @@ class CohereChatGenerator:
         self.timeout = timeout
         self.max_retries = max_retries
 
+        self.client: ClientV2 | None = None
+        self.async_client: AsyncClientV2 | None = None
+
+    def _client_kwargs(self, *, async_client: bool) -> dict[str, Any]:
+        """Build the keyword arguments used to create a Cohere client."""
         client_kwargs: dict[str, Any] = {
             "api_key": self.api_key.resolve_value(),
             "base_url": self.api_base_url,
             "client_name": "haystack",
         }
-        if timeout is not None:
-            client_kwargs["timeout"] = timeout
+        if self.timeout is not None:
+            client_kwargs["timeout"] = self.timeout
 
-        sync_kwargs = {**client_kwargs}
-        async_kwargs = {**client_kwargs}
-        if max_retries is not None:
-            sync_kwargs["httpx_client"] = HTTPXClient(transport=HTTPTransport(retries=max_retries))
-            async_kwargs["httpx_client"] = AsyncHTTPXClient(transport=AsyncHTTPTransport(retries=max_retries))
+        if self.max_retries is not None:
+            if async_client:
+                client_kwargs["httpx_client"] = AsyncHTTPXClient(transport=AsyncHTTPTransport(retries=self.max_retries))
+            else:
+                client_kwargs["httpx_client"] = HTTPXClient(transport=HTTPTransport(retries=self.max_retries))
+        return client_kwargs
 
-        self.client = ClientV2(**sync_kwargs)
-        self.async_client = AsyncClientV2(**async_kwargs)
+    def warm_up(self) -> None:
+        """Create the synchronous Cohere client."""
+        if self.client is None:
+            self.client = ClientV2(**self._client_kwargs(async_client=False))
+
+    async def warm_up_async(self) -> None:
+        """Create the asynchronous Cohere client."""
+        if self.async_client is None:
+            self.async_client = AsyncClientV2(**self._client_kwargs(async_client=True))
 
     def _get_telemetry_data(self) -> dict[str, Any]:
         """
@@ -616,7 +648,7 @@ class CohereChatGenerator:
     @component.output_types(replies=list[ChatMessage])
     def run(
         self,
-        messages: list[ChatMessage],
+        messages: list[ChatMessage] | str,
         generation_kwargs: dict[str, Any] | None = None,
         tools: ToolsType | None = None,
         streaming_callback: StreamingCallbackT | None = None,
@@ -625,8 +657,10 @@ class CohereChatGenerator:
         Invoke the chat endpoint based on the provided messages and generation parameters.
 
         :param messages: list of `ChatMessage` instances representing the input messages.
-        :param generation_kwargs: additional keyword arguments for chat generation. These parameters will
-            potentially override the parameters passed in the __init__ method.
+            If a string is provided, it is converted to a list containing a ChatMessage with user role.
+        :param generation_kwargs: additional keyword arguments for chat generation. These are merged per key
+            with the `generation_kwargs` passed at initialization: keys provided here take precedence, keys set
+            only at initialization are kept.
             For more details on the parameters supported by the Cohere API, refer to the
             Cohere [documentation](https://docs.cohere.com/reference/chat).
         :param tools: A list of Tool and/or Toolset objects, or a single Toolset for which the model can prepare calls.
@@ -637,6 +671,9 @@ class CohereChatGenerator:
         :returns: A dictionary with the following keys:
             - `replies`: a list of `ChatMessage` instances representing the generated responses.
         """
+        self.warm_up()
+        assert self.client is not None
+        messages = _normalize_messages(messages)
 
         # update generation kwargs by merging with the generation kwargs passed to the run method
         generation_kwargs = {**self.generation_kwargs, **(generation_kwargs or {})}
@@ -682,7 +719,7 @@ class CohereChatGenerator:
     @component.output_types(replies=list[ChatMessage])
     async def run_async(
         self,
-        messages: list[ChatMessage],
+        messages: list[ChatMessage] | str,
         generation_kwargs: dict[str, Any] | None = None,
         tools: ToolsType | None = None,
         streaming_callback: StreamingCallbackT | None = None,
@@ -691,8 +728,10 @@ class CohereChatGenerator:
         Asynchronously invoke the chat endpoint based on the provided messages and generation parameters.
 
         :param messages: list of `ChatMessage` instances representing the input messages.
-        :param generation_kwargs: additional keyword arguments for chat generation. These parameters will
-            potentially override the parameters passed in the __init__ method.
+            If a string is provided, it is converted to a list containing a ChatMessage with user role.
+        :param generation_kwargs: additional keyword arguments for chat generation. These are merged per key
+            with the `generation_kwargs` passed at initialization: keys provided here take precedence, keys set
+            only at initialization are kept.
             For more details on the parameters supported by the Cohere API, refer to the
             Cohere [documentation](https://docs.cohere.com/reference/chat).
         :param tools: A list of Tool and/or Toolset objects, or a single Toolset for which the model can prepare calls.
@@ -701,6 +740,9 @@ class CohereChatGenerator:
         :returns: A dictionary with the following keys:
             - `replies`: a list of `ChatMessage` instances representing the generated responses.
         """
+        await self.warm_up_async()
+        assert self.async_client is not None
+        messages = _normalize_messages(messages)
 
         # update generation kwargs by merging with the generation kwargs passed to the run method
         generation_kwargs = {**self.generation_kwargs, **(generation_kwargs or {})}

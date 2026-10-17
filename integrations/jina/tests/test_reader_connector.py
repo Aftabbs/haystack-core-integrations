@@ -1,7 +1,11 @@
-import json
+# SPDX-FileCopyrightText: 2023-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 from unittest.mock import patch
 
+import httpx
 import pytest
 from haystack import Document
 from haystack.utils import Secret
@@ -87,17 +91,20 @@ class TestJinaReaderConnector:
             {"url": "https://example.com", "keyQuote": "Mocked key quote", "isSupportive": False}
         ]
 
-    @patch("requests.get")
-    def test_run_with_mocked_response(self, mock_get, monkeypatch):
+    def test_run_with_mocked_response(self, monkeypatch):
         monkeypatch.setenv("JINA_API_KEY", "test-api-key")
         mock_json_response = {
             "data": {"content": "Mocked content", "title": "Mocked Title", "url": "https://example.com"}
         }
-        mock_get.return_value.content = json.dumps(mock_json_response).encode("utf-8")
-        mock_get.return_value.headers = {"Content-Type": "application/json"}
+        mock_response = httpx.Response(
+            200,
+            json=mock_json_response,
+            headers={"Content-Type": "application/json"},
+        )
 
-        reader = JinaReaderConnector(mode="read")
-        result = reader.run(query="https://example.com")
+        with patch("httpx.Client.get", return_value=mock_response) as mock_get:
+            reader = JinaReaderConnector(mode="read")
+            result = reader.run(query="https://example.com")
 
         assert mock_get.call_count == 1
         assert mock_get.call_args[0][0] == "https://r.jina.ai/https%3A%2F%2Fexample.com"
@@ -113,18 +120,61 @@ class TestJinaReaderConnector:
         assert document.meta["title"] == "Mocked Title"
         assert document.meta["url"] == "https://example.com"
 
+    def test_run_with_raw_response(self, monkeypatch):
+        monkeypatch.setenv("JINA_API_KEY", "test-api-key")
+        mock_response = httpx.Response(
+            200,
+            text="raw page content",
+            headers={"Content-Type": "text/plain"},
+        )
+
+        with patch("httpx.Client.get", return_value=mock_response) as mock_get:
+            reader = JinaReaderConnector(mode="read", json_response=False)
+            result = reader.run(query="https://example.com")
+
+        # no Accept: application/json header when raw response is requested
+        assert "Accept" not in mock_get.call_args[1]["headers"]
+
+        document = result["documents"][0]
+        assert document.content == "raw page content"
+        assert document.meta == {"content_type": "text/plain", "query": "https://example.com"}
+
+    @pytest.mark.asyncio
+    async def test_run_async_with_mocked_response(self, monkeypatch):
+        monkeypatch.setenv("JINA_API_KEY", "test-api-key")
+        mock_json_response = {
+            "data": {"content": "Mocked content", "title": "Mocked Title", "url": "https://example.com"}
+        }
+        mock_response = httpx.Response(
+            200,
+            json=mock_json_response,
+            headers={"Content-Type": "application/json"},
+        )
+
+        with patch("httpx.AsyncClient.get", return_value=mock_response) as mock_get:
+            reader = JinaReaderConnector(mode="read")
+            result = await reader.run_async(query="https://example.com")
+
+        assert mock_get.call_count == 1
+        assert len(result) == 1
+        document = result["documents"][0]
+        assert isinstance(document, Document)
+        assert document.content == "Mocked content"
+        assert document.meta["title"] == "Mocked Title"
+        assert document.meta["url"] == "https://example.com"
+
     @pytest.mark.skipif(not os.environ.get("JINA_API_KEY", None), reason="JINA_API_KEY env var not set")
     @pytest.mark.integration
     def test_run_reader_mode(self):
         reader = JinaReaderConnector(mode="read")
-        result = reader.run(query="https://example.com")
+        result = reader.run(query="https://haystack.deepset.ai/")
 
-        assert len(result) == 1
+        assert len(result["documents"]) == 1
         document = result["documents"][0]
         assert isinstance(document, Document)
-        assert "This domain is for use in documentation examples" in document.content
-        assert document.meta["title"] == "Example Domain"
-        assert document.meta["url"] == "https://example.com/"
+        assert "Haystack" in document.content
+        assert "Haystack" in document.meta["title"]
+        assert document.meta["url"] == "https://haystack.deepset.ai/"
 
     @pytest.mark.skipif(not os.environ.get("JINA_API_KEY", None), reason="JINA_API_KEY env var not set")
     @pytest.mark.integration
@@ -139,3 +189,17 @@ class TestJinaReaderConnector:
             assert "title" in doc.meta
             assert "url" in doc.meta
             assert "description" in doc.meta
+
+    @pytest.mark.skipif(not os.environ.get("JINA_API_KEY", None), reason="JINA_API_KEY env var not set")
+    @pytest.mark.integration
+    @pytest.mark.asyncio
+    async def test_run_async_reader_mode(self):
+        reader = JinaReaderConnector(mode="read")
+        result = await reader.run_async(query="https://haystack.deepset.ai/")
+
+        assert len(result["documents"]) == 1
+        document = result["documents"][0]
+        assert isinstance(document, Document)
+        assert "Haystack" in document.content
+        assert "Haystack" in document.meta["title"]
+        assert document.meta["url"] == "https://haystack.deepset.ai/"

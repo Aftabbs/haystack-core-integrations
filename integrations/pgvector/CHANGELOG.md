@@ -1,5 +1,100 @@
 # Changelog
 
+## [integrations/pgvector-v7.0.0] - 2026-09-29
+
+### 🐛 Bug Fixes
+
+- [**breaking**] Pgvector - an empty filter must not delete every document (#4006)
+
+
+## [integrations/pgvector-v6.6.1] - 2026-09-25
+
+### 🐛 Bug Fixes
+
+- *(pgvector)* Raise FilterError on empty logical conditions (#3946)
+- *(pgvector)* Count every written document in write_documents_async (#3964)
+
+### ⚙️ CI
+
+- Improve changelog generation; fix existing changelogs (#3883)
+
+
+## [integrations/pgvector-v6.6.0] - 2026-08-26
+
+### 🐛 Bug Fixes
+
+- PGVector adding optional parameter `filters` to `get_metadata_field_unique_values()` (#3735)
+- Standardize license files (#3771)
+
+### 🧪 Testing
+
+- `PGVectorDocumentStore` removing duplicated tests already covered by haystack Mixin tests (#3783)
+
+### 🧹 Chores
+
+- Re-standardize READMEs (#3768)
+
+
+## [integrations/pgvector-v6.5.0] - 2026-08-03
+
+### 🚀 Features
+
+- Add array_contains and array_overlaps operators to pgvector filters (#3459)
+
+### 🐛 Bug Fixes
+
+- Fix new issues raised by ruff 0.16.0 (#3670)
+- `PGVectorDocumentStore` get_metadata_field_unique_values setting list of values to return to `Any` (#3709)
+
+
+## [integrations/pgvector-v6.4.1] - 2026-07-23
+
+### 🐛 Bug Fixes
+
+- *(pgvector)* Parenthesize `not in` clause so it does not escape an AND filter (#3586)
+- `PGVectorDocumentStore` match `search_term` against metadata field value, not content (#3648)
+- Fix (pgvector): fix error messages to say pgvector instead of pinecone (#3654)
+
+
+## [integrations/pgvector-v6.4.0] - 2026-07-23
+
+### 🚀 Features
+
+- Pgvector - add closing methods (#3650)
+
+### 🐛 Bug Fixes
+
+- *(pgvector)* NO_VALUE sentinel collides with the literal string 'no_value' (#3593)
+
+### 📚 Documentation
+
+- Replace old haystack core imports with haystack_integrations paths (#3545)
+
+
+## [integrations/pgvector-v6.3.1] - 2026-06-01
+
+### 🐛 Bug Fixes
+
+- Replace in place dataclass mutations for pgvector #11087 (#3142)
+- *(pgvector)* Order retrieval by distance operator (#3370)
+
+### 🚜 Refactor
+
+- *(pgvector)* Use async DocumentStore mixin tests (#3094)
+
+### 🧪 Testing
+
+- `PGVectorDocumentStore`e use Mixin tests (#3003)
+- Test compatible integrations with python 3.14; update pyproject (#3001)
+- Track test coverage for all integrations (#3065)
+- Add tests for pgvector document store (#3156)
+
+### 🧹 Chores
+
+- Add ANN ruff ruleset to optimum, paddleocr, pgvector, pinecone, pyversity, qdrant, ragas, snowflake (#2992)
+- Enforce ruff docstring rules in integrations 31-40 (openrouter, opensearch, optimum, paddleocr, pgvector, pinecone, pyversity, qdrant, ragas, snowflake) (#3011)
+
+
 ## [integrations/pgvector-v6.3.0] - 2026-03-17
 
 ### 🐛 Bug Fixes
@@ -87,8 +182,13 @@
 
 ### 🧹 Chores
 
-- Remove black (#1985)
 - Pgvector - update docker image in examples (#1995)
+
+## [integrations/pgvector-v5.2.0] - 2025-06-26
+
+### 🧹 Chores
+
+- Remove black (#1985)
 
 
 ## [integrations/pgvector-v3.4.1] - 2025-06-20
@@ -193,47 +293,74 @@
 
 ### 🚀 Features
 
-- Add filter_policy to pgvector integration (#820)
 - Add schema support to pgvector document store. (#1095)
 - Pgvector - recreate the connection if it is no longer valid (#1202)
-
-### 🐛 Bug Fixes
-
-- `PgVector` - Fallback to default filter policy when deserializing retrievers without the init parameter (#900)
 
 ### 📚 Documentation
 
 - Explain different connection string formats in the docstring (#1132)
 
-### 🧪 Testing
-
-- Do not retry tests in `hatch run test` command (#954)
-
 ### ⚙️ CI
 
-- Retry tests to reduce flakyness (#836)
 - Adopt uv as installer (#1142)
 
 ### 🧹 Chores
 
-- Update ruff invocation to include check parameter (#853)
-- PgVector - remove legacy filter support (#1068)
 - Update changelog after removing legacy filters (#1083)
 - Update ruff linting scripts and settings (#1105)
+
+## [integrations/pgvector-v1.0.0] - 2024-09-12
+
+### 🧪 Testing
+
+- Do not retry tests in `hatch run test` command (#954)
+
+### 🧹 Chores
+
+- PgVector - remove legacy filter support (#1068)
+
+### 🌀 Miscellaneous
+
+- Chore: Update pgvector test for the new `apply_filter_policy` usage (#970)
+- Chore: pgvector ruff update, don't ruff tests (#984)
+
+## [integrations/pgvector-v0.5.1] - 2024-07-17
+
+### 🐛 Bug Fixes
+
+- `PgVector` - Fallback to default filter policy when deserializing retrievers without the init parameter (#900)
+
+## [integrations/pgvector-v0.5.0] - 2024-07-15
+
+### 🚀 Features
+
+- Add filter_policy to pgvector integration (#820)
+
+### ⚙️ CI
+
+- Retry tests to reduce flakyness (#836)
+
+### 🧹 Chores
+
+- Update ruff invocation to include check parameter (#853)
 
 ### 🌀 Miscellaneous
 
 - Ci: install `pytest-rerunfailures` where needed; add retry config to `test-cov` script (#845)
 - Chore: Minor retriever pydoc fix (#884)
-- Chore: Update pgvector test for the new `apply_filter_policy` usage (#970)
-- Chore: pgvector ruff update, don't ruff tests (#984)
 
 ## [integrations/pgvector-v0.4.0] - 2024-06-20
 
 ### 🚀 Features
 
-- Defer the database connection to when it's needed (#773)
 - Add customizable index names for pgvector (#818)
+
+
+## [integrations/pgvector-v0.3.0] - 2024-05-30
+
+### 🚀 Features
+
+- Defer the database connection to when it's needed (#773)
 
 ### 🌀 Miscellaneous
 
@@ -268,6 +395,14 @@
 
 ## [integrations/pgvector-v0.1.0] - 2024-02-14
 
+### 🌀 Miscellaneous
+
+- Pgvector: generate API docs (#325)
+- Pgvector: add an example (#334)
+- Adopt `Secret` to pgvector (#402)
+
+## [integrations/pgvector-v0.0.1] - 2024-02-02
+
 ### 🐛 Bug Fixes
 
 - Pgvector: fix linting (#328)
@@ -278,8 +413,5 @@
 - Pgvector - filters (#257)
 - Pgvector - embedding retrieval (#298)
 - Pgvector - Embedding Retriever (#320)
-- Pgvector: generate API docs (#325)
-- Pgvector: add an example (#334)
-- Adopt `Secret` to pgvector (#402)
 
 <!-- generated by git-cliff -->

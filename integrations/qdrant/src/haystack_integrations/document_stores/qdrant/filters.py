@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2023-present deepset GmbH <info@deepset.ai>
+#
+# SPDX-License-Identifier: Apache-2.0
+
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
@@ -131,8 +135,14 @@ def _build_comparison_condition(operator: str, key: str, value: Any) -> models.C
 
 
 def _build_eq_condition(key: str, value: models.ValueVariants) -> models.Condition:
-    if isinstance(value, str) and " " in value:
-        return models.FieldCondition(key=key, match=models.MatchText(text=value))
+    # MatchValue does not accept float and only matches int payloads (not float payloads).
+    # A closed Range(gte=v, lte=v) is evaluated numerically and matches both int and float
+    # payloads on the Qdrant server.  Ints > 2**53 lose precision as float64, so those keep
+    # MatchValue for exact equality.
+    if isinstance(value, float) or (
+        isinstance(value, int) and not isinstance(value, bool) and abs(value) <= 2**53
+    ):
+        return models.FieldCondition(key=key, range=models.Range(gte=value, lte=value))
     return models.FieldCondition(key=key, match=models.MatchValue(value=value))
 
 
@@ -140,44 +150,18 @@ def _build_in_condition(key: str, value: list[models.ValueVariants]) -> models.C
     if not isinstance(value, list):
         msg = f"Value {value} is not a list"
         raise FilterError(msg)
-    return models.Filter(
-        should=[
-            (
-                models.FieldCondition(key=key, match=models.MatchText(text=item))
-                if isinstance(item, str) and " " not in item
-                else models.FieldCondition(key=key, match=models.MatchValue(value=item))
-            )
-            for item in value
-        ]
-    )
+    return models.Filter(should=[_build_eq_condition(key, item) for item in value])
 
 
 def _build_ne_condition(key: str, value: models.ValueVariants) -> models.Condition:
-    return models.Filter(
-        must_not=[
-            (
-                models.FieldCondition(key=key, match=models.MatchText(text=value))
-                if isinstance(value, str) and " " not in value
-                else models.FieldCondition(key=key, match=models.MatchValue(value=value))
-            )
-        ]
-    )
+    return models.Filter(must_not=[_build_eq_condition(key, value)])
 
 
 def _build_nin_condition(key: str, value: list[models.ValueVariants]) -> models.Condition:
     if not isinstance(value, list):
         msg = f"Value {value} is not a list"
         raise FilterError(msg)
-    return models.Filter(
-        must_not=[
-            (
-                models.FieldCondition(key=key, match=models.MatchText(text=item))
-                if isinstance(item, str) and " " in item
-                else models.FieldCondition(key=key, match=models.MatchValue(value=item))
-            )
-            for item in value
-        ]
-    )
+    return models.Filter(must_not=[_build_eq_condition(key, item) for item in value])
 
 
 def _build_lt_condition(key: str, value: str | float | int) -> models.Condition:

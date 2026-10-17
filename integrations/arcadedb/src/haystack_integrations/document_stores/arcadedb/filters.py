@@ -4,6 +4,7 @@
 
 """Convert Haystack filter dictionaries to ArcadeDB SQL WHERE clauses."""
 
+import re
 from typing import Any
 
 
@@ -47,8 +48,10 @@ def _parse_condition(condition: dict[str, Any]) -> str:
         conditions = condition.get("conditions", [])
         if not conditions:
             return ""
-        inner = _parse_condition(conditions[0])
-        return f"NOT ({inner})" if inner else ""
+        inner = _parse_condition({"operator": "AND", "conditions": conditions})
+        # We want NOT(number == 100) to also match documents with no number or number=None.
+        # coalesce replaces NULL with false before NOT is applied.
+        return f"NOT coalesce(({inner}), false)" if inner else ""
 
     field = condition.get("field")
     value = condition.get("value")
@@ -64,6 +67,13 @@ def _parse_condition(condition: dict[str, Any]) -> str:
 
 
 def _comparison_to_sql(field: str, operator: str, value: Any) -> str:
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_.\[\]"]*$', field):
+        msg = (
+            f"Invalid field name: {field}. Field names must start with a letter or underscore and can contain "
+            f"letters, digits, underscores, dots, brackets, and quotes."
+        )
+        raise ValueError(msg)
+
     if operator == "==":
         if value is None:
             return f"{field} IS NULL"
@@ -72,7 +82,7 @@ def _comparison_to_sql(field: str, operator: str, value: Any) -> str:
     if operator == "!=":
         if value is None:
             return f"{field} IS NOT NULL"
-        return f"{field} <> {_sql_value(value)}"
+        return f"({field} <> {_sql_value(value)} OR {field} IS NULL)"
 
     if operator in (">", ">=", "<", "<="):
         if value is None:
@@ -97,7 +107,8 @@ def _comparison_to_sql(field: str, operator: str, value: Any) -> str:
             msg = "Operator 'not in' requires value to be a list"
             raise ValueError(msg)
         values = ", ".join(_sql_value(v) for v in value)
-        return f"{field} NOT IN [{values}]"
+        # ArcadeDB's NOT IN excludes records where the property is null/missing
+        return f"({field} NOT IN [{values}] OR {field} IS NULL)"
 
     msg = f"Unsupported filter operator: {operator}"
     raise ValueError(msg)
@@ -106,7 +117,7 @@ def _comparison_to_sql(field: str, operator: str, value: Any) -> str:
 def _sql_value(value: Any) -> str:
     """Format a Python value as an ArcadeDB SQL literal."""
     if isinstance(value, str):
-        escaped = value.replace("'", "\\'")
+        escaped = value.replace("\\", "\\\\").replace("'", "\\'")
         return f"'{escaped}'"
     if isinstance(value, bool):
         return "true" if value else "false"
